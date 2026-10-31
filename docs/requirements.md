@@ -267,8 +267,11 @@ explicitly unstable.
   the unique constraint actually bites — multiple NULLs pass a unique index on both SQLite and
   Postgres. Uniqueness is `(lemma, reading, part_of_speech)` on the **shared** `lexemes` table, not per
   user; see §6.3.
-- **Encounter identity is a hash of normalized page text**, scoped per user and per source. A page
-  re-uploaded creates nothing new; the same line in two different games counts twice.
+- **Page identity is a hash of its normalized text**, unique per user. Re-uploading the same screen
+  creates nothing new.
+- **Encounter identity is `(user, word, page-text hash)`** — one encounter per word per page. A single
+  page yields many word encounters, so the page hash alone would collapse them into one. (Writing the
+  constraint as `(user, text_hash)` was wrong; the ERD caught it.)
 - **Kanji identity is the glyph.** Name the column `glyph`, not `character` — the latter is a
   reserved type name on Postgres and needs quoting.
 

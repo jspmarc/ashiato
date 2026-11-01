@@ -16,6 +16,21 @@ defmodule Ashiato.Ledger do
   alias Ashiato.Pages
   alias Ashiato.Repo
 
+  # Forward edges of the ingest pipeline (§7.4):
+  #
+  #     uploaded -> detecting -> text_ready -> translating -> ready
+  #
+  # `:failed` is reachable from every non-terminal state; `:ready` and
+  # `:failed` are terminal, so nothing moves out of them.
+  @forward %{
+    uploaded: [:detecting],
+    detecting: [:text_ready],
+    text_ready: [:translating],
+    translating: [:ready]
+  }
+
+  @non_terminal [:uploaded, :detecting, :text_ready, :translating]
+
   @doc """
   Finds the lexeme matching `(lemma, reading, part_of_speech)` or creates it.
 
@@ -142,5 +157,112 @@ defmodule Ashiato.Ledger do
       |> Repo.all()
       |> Map.new(fn {word_id, occurrences} -> {word_id, occurrences / pages} end)
     end
+  end
+
+  # Page lifecycle: the ingest state machine and the revision fence (§6.7,
+  # §7.4). `revision` is a fencing token, not a history — it starts at 1 and is
+  # bumped by anything that changes what processing would produce. A
+  # background job reads it at the start of its work and carries it; its final
+  # write is conditional on that revision, so a late result can never clobber a
+  # correction the user made meanwhile.
+
+  @doc """
+  Creates a page. `attrs` is a map (or keyword list) that must include
+  `user_id`, `source_id`, `image_key`, and `text_hash`; `document_id`,
+  `page_index`, `text_origin`, `image_store`, and `status` are optional, with
+  `status` defaulting to `:uploaded`.
+
+  `user_id` is set on the struct, never cast. Returns `{:ok, %Pages{}}`. A
+  duplicate `(user_id, text_hash)` — re-uploading the same screen — is a no-op
+  insert and returns `{:error, changeset}`.
+  """
+  @spec create_page(map() | keyword()) :: {:ok, Pages.t()} | {:error, Ecto.Changeset.t()}
+  def create_page(attrs) do
+    attrs = Map.new(attrs)
+    # user_id is set programmatically, never cast (AGENTS Ecto house rule)
+    user_id = Map.fetch!(attrs, :user_id)
+    attrs = attrs |> Map.delete(:user_id) |> Map.put_new(:status, :uploaded)
+
+    %Pages{user_id: user_id}
+    |> Pages.changeset(attrs)
+    |> Repo.insert()
+  end
+
+  @doc """
+  Accepts corrected text for a page (R1.3). Sets `accepted_text` and bumps
+  `revision` in one transaction.
+
+  The bump is the whole point of the column: the accepted text is what
+  tokenization, validation, and translation all produce from, so changing it
+  changes what processing would produce. Bumping is what makes an in-flight
+  job's fenced write see a newer revision and discard itself (§6.7).
+  Returns `{:ok, %Pages{}}` or `{:error, changeset}`.
+  """
+  @spec accept_text(Pages.t(), String.t()) :: {:ok, Pages.t()} | {:error, Ecto.Changeset.t()}
+  def accept_text(%Pages{} = page, text) do
+    # accepted_text is what tokenization, validation, and translation produce
+    # from, so changing it bumps revision (§6.7). Both columns are written by
+    # the same UPDATE statement — one atomic write.
+    page
+    |> Pages.changeset(%{accepted_text: text, revision: page.revision + 1})
+    |> Repo.update()
+  end
+
+  @doc """
+  The conditional write from §6.7:
+
+      UPDATE pages
+         SET status = :status
+      WHERE id = :page_id AND revision = :page.revision
+
+  The job read `revision` at the start of its work and carries it; if the page
+  moved on meanwhile (a correction bumped `revision`), the update matches zero
+  rows and this returns `{:error, :superseded}` — a normal outcome, not an
+  exception, and it never raises. On a matching revision it sets the status and
+  returns `{:ok, %Pages{}}`. An invalid transition returns
+  `{:error, :invalid_transition}`.
+  """
+  @spec finish_page(Pages.t(), atom()) ::
+          {:ok, Pages.t()} | {:error, :superseded | :invalid_transition}
+  def finish_page(%Pages{} = page, status) do
+    unless valid_transition?(page.status, status) do
+      {:error, :invalid_transition}
+    else
+      query = from(p in Pages, where: p.id == ^page.id and p.revision == ^page.revision)
+
+      {count, _} =
+        Repo.update_all(query, set: [status: status, updated_at: DateTime.utc_now()])
+
+      case count do
+        0 -> {:error, :superseded}
+        1 -> {:ok, Repo.get!(Pages, page.id)}
+      end
+    end
+  end
+
+  @doc """
+  Moves a page to a new status, enforcing the ingest pipeline order (§7.4):
+
+      uploaded -> detecting -> text_ready -> translating -> ready
+
+  plus `:failed` from any non-terminal state. `:ready` and `:failed` are
+  terminal, so nothing moves out of them. Backward moves, skipped states, and
+  moves out of a terminal state are rejected with `{:error, :invalid_transition}`.
+  On success returns `{:ok, %Pages{}}`.
+  """
+  @spec transition(Pages.t(), atom()) :: {:ok, Pages.t()} | {:error, :invalid_transition}
+  def transition(%Pages{} = page, status) do
+    unless valid_transition?(page.status, status) do
+      {:error, :invalid_transition}
+    else
+      page
+      |> Pages.changeset(%{status: status})
+      |> Repo.update()
+    end
+  end
+
+  defp valid_transition?(from, to) do
+    to in Map.get(@forward, from, []) or
+      (to == :failed and from in @non_terminal)
   end
 end

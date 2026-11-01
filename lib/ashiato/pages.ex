@@ -16,6 +16,8 @@ defmodule Ashiato.Pages do
 
   use Ecto.Schema
 
+  import Ecto.Changeset
+
   schema "pages" do
     belongs_to :user, Ashiato.Users
     # never null: a default source exists from day one
@@ -40,5 +42,36 @@ defmodule Ashiato.Pages do
     timestamps(type: :utc_datetime)
 
     has_many :encounters, Ashiato.Encounters, foreign_key: :page_id
+  end
+
+  @doc """
+  Changeset used by `Ashiato.Ledger.create_page/1` (and the status / revision
+  updates).
+
+  `user_id` is NOT cast: it is set programmatically on the struct (AGENTS Ecto
+  house rule — fields set programmatically are never cast). The
+  `one_page_per_distinct_text` unique constraint is declared so a re-upload of
+  the same screen arrives as `{:error, changeset}` rather than a raised
+  `Ecto.ConstraintError`. Two declarations: Postgres reports the index by its
+  name, `ecto_sqlite3` derives one from the columns and ignores `name:`.
+  """
+  def changeset(page, attrs) do
+    page
+    |> cast(attrs, [
+      :source_id,
+      :document_id,
+      :page_index,
+      :image_key,
+      :image_store,
+      :image_expires_at,
+      :text_origin,
+      :accepted_text,
+      :text_hash,
+      :revision,
+      :status
+    ])
+    |> validate_required([:source_id, :image_key, :text_hash, :status])
+    |> unique_constraint([:user_id, :text_hash], name: :one_page_per_distinct_text)
+    |> unique_constraint([:user_id, :text_hash])
   end
 end

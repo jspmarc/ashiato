@@ -7,6 +7,10 @@ defmodule Ashiato.Ledger do
   Identity is global (`Ashiato.Lexemes`, shared by all users); everything this
   module writes downstream of it is per user, carried explicitly via `user_id`
   on the arguments.
+
+  The derived, per-user questions — coverage (R4.1) and the kanji map (R4.2) —
+  are answered here too, always as queries over the event log and never as
+  stored counters (P6). The SQL they port lives in `docs/kanji-review.md`.
   """
 
   import Ecto.Query
@@ -15,6 +19,17 @@ defmodule Ashiato.Ledger do
   alias Ashiato.Lexemes
   alias Ashiato.Pages
   alias Ashiato.Repo
+  alias Ashiato.Sources
+  alias Ashiato.WordStates
+  alias Ashiato.Words
+
+  # The §6.6/§8 maturity default (21 days): mature(word) ⇔ stability ≥
+  # maturity_threshold. Stability and not interval, because the interval is
+  # clamped by the band caps (R3.5) — with a cap set below the threshold no
+  # word could ever mature — while stability is FSRS's own measure of memory
+  # strength and is unaffected by the clamp. Every kanji/coverage query below
+  # pins this attribute; §8 makes it configurable, so it stays in one place.
+  @maturity_days 21
 
   @doc """
   Finds the lexeme matching `(lemma, reading, part_of_speech)` or creates it.
@@ -141,6 +156,273 @@ defmodule Ashiato.Ledger do
       )
       |> Repo.all()
       |> Map.new(fn {word_id, occurrences} -> {word_id, occurrences / pages} end)
+    end
+  end
+
+  @doc """
+  Per-source coverage (R4.1, kanji-review.md §5): for one source, how many of
+  the tokens the user has met there are known, and the resulting ratio.
+
+  Known means `words.known` OR the word's FSRS stability has reached the
+  §6.6/§8 maturity default (21 days) — a word the user marked, or one the
+  scheduler says has stuck, both count. Unconfirmed and discarded encounters
+  count toward nothing (R2.8). `tokens` is the raw count of encounter rows
+  (§6.5 depth): one row per `(user, word, text_hash)`, so a re-uploaded page
+  cannot inflate it.
+
+  Returns `%{tokens: n, known_tokens: n, ratio: f}` with
+  `ratio = known_tokens / tokens`; a source with no confirmed, non-discarded
+  encounters returns `%{tokens: 0, known_tokens: 0, ratio: 0.0}`. This is the
+  number that predicts whether the next chapter is readable, computed over the
+  user's own material — the one number no prebuilt tool supplies.
+
+  §5's `SUM(CASE WHEN w.known = 1 OR ws.stability >= :maturity_days THEN 1
+  ELSE 0 END)` runs here as an aggregate FILTER over the identical predicate
+  and rows: Ecto has no CASE expression and this module writes no fragments,
+  and `COUNT(...) FILTER (WHERE ...)` is the same number of rows (SQLite 3.30+
+  and Postgres both speak FILTER).
+  """
+  @spec coverage(integer(), integer()) :: %{
+          tokens: integer(),
+          known_tokens: integer(),
+          ratio: float()
+        }
+  def coverage(user_id, source_id) do
+    row =
+      from(e in Encounters,
+        join: w in Words,
+        on: w.id == e.word_id,
+        join: s in Sources,
+        on: s.id == e.source_id,
+        left_join: ws in WordStates,
+        on: ws.word_id == w.id,
+        where: e.user_id == ^user_id and e.source_id == ^source_id,
+        where: e.confirmed and is_nil(e.discarded_at),
+        select: %{
+          tokens: count(e.id),
+          known_tokens: filter(count(e.id), w.known or ws.stability >= ^@maturity_days)
+        }
+      )
+      |> Repo.one()
+
+    tokens = row.tokens
+    # COUNT over an empty set is 0, never NULL — the `|| 0` is belt and braces.
+    known_tokens = row.known_tokens || 0
+
+    ratio = if tokens == 0, do: 0.0, else: known_tokens / tokens
+    %{tokens: tokens, known_tokens: known_tokens, ratio: ratio}
+  end
+
+  @doc """
+  The words a user has met that contain a given character (kanji-review.md
+  §1): filtered with `LIKE '%生%'`, exact for CJK because a glyph is one
+  character and cannot be a substring of another. It is a scan rather than an
+  index lookup — the price of staying portable between SQLite and Postgres.
+
+  `occurrences` counts distinct pages, not tokens, so one screen repeating a
+  word ten times cannot promote it (§6.5); `days_seen` counts distinct days.
+  Unconfirmed and discarded encounters count toward nothing (R2.8). Ordered
+  occurrences DESC, days_seen DESC — breadth first, then spacing. This is the
+  core query the discrimination drill (§4) builds its cards on.
+  """
+  @spec kanji_met_words(integer(), String.t()) :: [map()]
+  def kanji_met_words(user_id, glyph) do
+    from(l in Lexemes,
+      join: w in Words,
+      on: w.lexeme_id == l.id and w.user_id == ^user_id,
+      join: e in Encounters,
+      on: e.word_id == w.id and e.confirmed and is_nil(e.discarded_at),
+      where: like(l.lemma, ^"%#{glyph}%"),
+      group_by: [l.id, l.lemma, l.reading, l.part_of_speech],
+      order_by: [desc: count(e.page_id, :distinct), desc: count(e.seen_on, :distinct)],
+      select: %{
+        lexeme_id: l.id,
+        lemma: l.lemma,
+        reading: l.reading,
+        part_of_speech: l.part_of_speech,
+        occurrences: count(e.page_id, :distinct),
+        days_seen: count(e.seen_on, :distinct),
+        first_seen: min(e.seen_on),
+        last_seen: max(e.seen_on)
+      }
+    )
+    |> Repo.all()
+  end
+
+  @doc """
+  P3: a kanji is known when at least one word containing it is mature AND it
+  appears in at least two distinct words (kanji-review.md §2).
+
+  One aggregate over the whole filtered set — no GROUP BY and no CTE, because
+  `COUNT(DISTINCT l.id)` already absorbs the row multiplication the encounters
+  join introduces. Maturity rides on stability, never the cap-clamped interval
+  (§6.6), expressed as the §2 `MAX(CASE WHEN ws.stability >= threshold THEN 1
+  ELSE 0 END)` form: Ecto has no CASE expression, so the identical predicate
+  runs as `FILTER(MAX(ws.stability), ws.stability >= threshold)`, which is
+  non-nil exactly when that MAX(CASE) is 1 — NULL-safe on both the missing
+  word_states row and the not-yet-reviewed one.
+
+  The `>= 2` clause is load-bearing: knowing 生簀 alone is word knowledge
+  wearing a character's costume.
+  """
+  @spec kanji_known?(integer(), String.t()) :: boolean()
+  def kanji_known?(user_id, glyph) do
+    row =
+      from(l in Lexemes,
+        join: w in Words,
+        on: w.lexeme_id == l.id and w.user_id == ^user_id,
+        join: e in Encounters,
+        on: e.word_id == w.id and e.confirmed and is_nil(e.discarded_at),
+        left_join: ws in WordStates,
+        on: ws.word_id == w.id,
+        where: like(l.lemma, ^"%#{glyph}%"),
+        select: %{
+          distinct_words: count(l.id, :distinct),
+          has_mature_word: filter(max(ws.stability), ws.stability >= ^@maturity_days)
+        }
+      )
+      |> Repo.one()
+
+    row.distinct_words >= 2 and row.has_mature_word != nil
+  end
+
+  @doc """
+  The dashboard (Epic 4, R4.2, kanji-review.md §3): one entry per distinct CJK
+  glyph the user has met, ordered by distinct pages DESC then glyph ASC.
+
+  Per-glyph counts cannot be one portable SQL aggregate — splitting a lemma
+  into characters has no cross-dialect spelling — so §3b supplies distinct
+  `(page, day, lemma)` rows and the fold below expands each lemma's CJK
+  codepoints (a codepoint filter, not a byte regex, so UTF-8 cannot be
+  mis-split). Building over (page, lemma) pairs rather than summing per-word
+  counts is what keeps a page carrying two different words with the same kanji
+  from being counted twice, and the fold credits a glyph repeated inside one
+  lemma (日日) once, not twice.
+
+  `distinct_words` and `has_mature_word` are the §3a per-word facts folded in
+  per glyph; every glyph of a §3a lemma is necessarily already a key of the
+  §3b fold, both queries sharing the same confirmed, non-discarded join base.
+  Maturity is the §6.6/§8 default (21 days) via the same FILTER(MAX(...))
+  stand-in for §2's MAX(CASE ...) described in `kanji_known?/2`.
+  """
+  @spec kanji_map(integer()) :: [map()]
+  def kanji_map(user_id) do
+    # §3b: distinct (page, day, lemma) rows — the exact per-glyph evidence.
+    sightings =
+      from(l in Lexemes,
+        join: w in Words,
+        on: w.lexeme_id == l.id and w.user_id == ^user_id,
+        join: e in Encounters,
+        on: e.word_id == w.id and e.confirmed and is_nil(e.discarded_at),
+        distinct: true,
+        select: %{page_id: e.page_id, seen_on: e.seen_on, lemma: l.lemma}
+      )
+      |> Repo.all()
+
+    # §3a: one row per met word. Only distinct_words and has_mature_word are
+    # selected: the fold's per-glyph days and dates come from §3b, since
+    # summing per-word counts would double-count across words sharing a kanji.
+    word_facts =
+      from(l in Lexemes,
+        join: w in Words,
+        on: w.lexeme_id == l.id and w.user_id == ^user_id,
+        join: e in Encounters,
+        on: e.word_id == w.id and e.confirmed and is_nil(e.discarded_at),
+        left_join: ws in WordStates,
+        on: ws.word_id == w.id,
+        group_by: [l.id, l.lemma],
+        select: %{
+          lexeme_id: l.id,
+          lemma: l.lemma,
+          has_mature_word: filter(max(ws.stability), ws.stability >= ^@maturity_days)
+        }
+      )
+      |> Repo.all()
+
+    # The fold: glyph => stats. distinct/1 on the codepoints is what credits a
+    # repeated glyph (日日) once per page, and the (page, lemma) rows above are
+    # what credits a page shared by two words with the same kanji once.
+    stats =
+      Enum.reduce(sightings, %{}, fn sighting, acc ->
+        Enum.reduce(cjk_codepoints(sighting.lemma), acc, fn glyph, acc ->
+          Map.update(acc, glyph, new_stats(sighting), &add_sighting(&1, sighting))
+        end)
+      end)
+
+    stats
+    |> fold_word_facts(word_facts)
+    |> Enum.map(&glyph_entry/1)
+    |> Enum.sort_by(&{-&1.occurrences, &1.glyph})
+  end
+
+  # §3a fold: merges each met word's facts into the glyphs of its lemma. Every
+  # glyph here is already a key of the §3b fold (same join base), so the merge
+  # is strictly in place.
+  defp fold_word_facts(stats, word_facts) do
+    Enum.reduce(word_facts, stats, fn fact, acc ->
+      Enum.reduce(cjk_codepoints(fact.lemma), acc, fn glyph, acc ->
+        Map.update!(acc, glyph, &add_word_fact(&1, fact))
+      end)
+    end)
+  end
+
+  defp new_stats(sighting) do
+    %{
+      pages: MapSet.new([sighting.page_id]),
+      days: MapSet.new([sighting.seen_on]),
+      word_ids: MapSet.new(),
+      mature?: false
+    }
+  end
+
+  defp add_sighting(stats, sighting) do
+    %{
+      stats
+      | pages: MapSet.put(stats.pages, sighting.page_id),
+        days: MapSet.put(stats.days, sighting.seen_on)
+    }
+  end
+
+  defp add_word_fact(stats, fact) do
+    %{
+      stats
+      | word_ids: MapSet.put(stats.word_ids, fact.lexeme_id),
+        # has_mature_word is non-nil exactly when §2's MAX(CASE ...) is 1.
+        mature?: stats.mature? or fact.has_mature_word != nil
+    }
+  end
+
+  defp glyph_entry({glyph, stats}) do
+    %{
+      glyph: glyph,
+      # occurrences is §6.5 breadth: distinct pages, counted once per page.
+      occurrences: MapSet.size(stats.pages),
+      days_seen: MapSet.size(stats.days),
+      first_seen: Enum.min(stats.days, Date),
+      last_seen: Enum.max(stats.days, Date),
+      distinct_words: MapSet.size(stats.word_ids),
+      has_mature_word: stats.mature?
+    }
+  end
+
+  # kanji-review.md §3b: the distinct CJK codepoints of a string, in string
+  # order. Filtering codepoints rather than regexing bytes means UTF-8 cannot
+  # be mis-split, and the dedupe is what makes a glyph repeated inside one
+  # lemma credit its page once rather than once per occurrence.
+  defp cjk_codepoints(string) do
+    string
+    |> String.codepoints()
+    |> Enum.filter(&cjk_codepoint?/1)
+    |> Enum.uniq()
+  end
+
+  # U+4E00..U+9FFF: the CJK Unified Ideographs block. Hiragana, katakana,
+  # latin and punctuation all fall outside it, so kana-only lemmas contribute
+  # no kanji.
+  defp cjk_codepoint?(codepoint) do
+    case String.to_charlist(codepoint) do
+      [cp] when cp in 0x4E00..0x9FFF -> true
+      _ -> false
     end
   end
 end

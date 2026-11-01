@@ -1,0 +1,69 @@
+name: CI
+
+# One job, deliberately ordered: the migration chain must apply *and reverse*
+# before the test suite means anything.
+#
+# Test env uses SQLite, so no service container is needed. If this project moves
+# to Postgres, add a `services:` block here and set DATABASE_URI -- the migration
+# steps are what will catch the dialect differences first.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Migrations and tests
+    runs-on: ubuntu-latest
+    env:
+      MIX_ENV: test
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Elixir
+        uses: erlef/setup-beam@v1
+        with:
+          # Pinned to what the code was verified against. mix.exs allows ~> 1.17,
+          # so bumping these is safe as long as the lockfile still resolves.
+          otp-version: "27"
+          elixir-version: "1.18"
+
+      - name: Cache deps and build
+        uses: actions/cache@v4
+        with:
+          path: |
+            deps
+            _build
+          key: mix-${{ runner.os }}-${{ hashFiles('mix.lock') }}
+          restore-keys: mix-${{ runner.os }}-
+
+      - name: Install dependencies
+        run: mix deps.get
+
+      - name: Compile with warnings as errors
+        run: mix compile --warnings-as-errors
+
+      - name: Migrations apply from empty
+        run: |
+          mix ecto.create
+          mix ecto.migrate
+
+      # A migration that cannot roll back cannot be deployed safely. This also
+      # proves every migration is `change/0`-reversible or has an explicit
+      # `down/0`.
+      - name: Migrations reverse and re-apply
+        run: |
+          mix ecto.rollback --all
+          mix ecto.migrate
+
+      # Includes the schema<->database agreement test: every schema field must
+      # exist as a column. `mix test` also runs ecto.setup's quiet create and
+      # migrate via the alias in mix.exs.
+      - name: Tests
+        run: mix test

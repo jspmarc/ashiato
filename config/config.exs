@@ -16,7 +16,6 @@ config :ashiato, Oban,
   repo: Ashiato.Repo
 
 config :ashiato,
-  migration_primary_key: [type: :serial],
   ecto_repos: [Ashiato.Repo],
   generators: [timestamp_type: :utc_datetime]
 

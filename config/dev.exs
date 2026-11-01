@@ -2,7 +2,6 @@ import Config
 
 # Configure your database
 config :ashiato, Ashiato.Repo,
-  # TODO: use Postgres if database URI starts with `sqlite://`
   adapter: Ecto.Adapters.SQLite3,
   database: Path.expand("../ashiato_dev.db", __DIR__),
   pool_size: 5,

@@ -1,0 +1,202 @@
+// Ashiato — entity relationship diagram
+// DBML. Paste at https://dbdiagram.io/d
+//
+// Table names are plural.
+//
+// There is no `kanji` table and no `kanji_lexemes` table. The kanji of a word are
+// the CJK codepoints already in its `lemma`, in order. Storing that relation is a
+// denormalisation of a value we hold, and it is derived data, which P6 forbids
+// storing. Deriving it also credits only characters actually seen: a word written
+// in kana contributes no kanji, which is the correct answer.
+//
+// Two scopes:
+//   GLOBAL  (no user_id): kanji, lexemes, kanji_lexemes, dict_cache_entries
+//   PER USER           : sources, documents, pages, words, encounters,
+//                        review_events, word_states
+//
+// Enumerated columns hold a short string, validated by Ecto.Enum in the app and a
+// CHECK constraint in the database. Never a Postgres enum type: SQLite has no
+// equivalent, and native enums make migrations painful.
+
+Table users {
+  id int [pk, increment]
+  created_at timestamptz
+}
+
+// ───────────────────────────── global: lexical ─────────────────────────────
+
+Table lexemes {
+  id int [pk, increment]
+  lemma varchar [not null, note: 'dictionary form: 食べた / 食べます / 食べる all land on 食べる']
+  reading varchar [not null, default: '', note: '"" not NULL, so the unique index actually bites']
+  part_of_speech varchar [note: 'from the tokenizer; drops particles, finds mimetics']
+  created_at timestamptz
+
+  indexes {
+    (lemma, reading, part_of_speech) [unique, name: 'lexemes_identity']
+  }
+}
+
+Table dict_cache_entries {
+  id int [pk, increment]
+  kind varchar [not null, note: 'word | kanji']
+  cache_key varchar [not null]
+  dict_version varchar [not null, note: 'JMdict release. No TTL: entries are immutable within a version.']
+  payload text [note: 'JSON as TEXT, for dialect portability']
+  fetched_at timestamptz
+
+  indexes {
+    (kind, cache_key, dict_version) [unique]
+  }
+}
+
+// ───────────────────────────── per user: the ledger ─────────────────────────────
+
+Table sources {
+  id int [pk, increment, note: 'A default source is created per user at registration, so nothing is ever unsourced']
+  user_id int [not null]
+  name varchar [note: 'NULL means the catch-all bucket, displayed as 現実世界. Unique only where present.']
+  kind varchar [not null, note: 'game | manga | book | signage | other']
+  chapter varchar
+  created_at timestamptz
+
+  indexes {
+    (user_id, name, chapter) [unique, name: 'sources_identity', note: 'partial: WHERE name IS NOT NULL']
+  }
+}
+
+Table settings {
+  id int [pk, increment]
+  user_id int [not null]
+  key varchar [not null, note: 'e.g. translation_provider, new_cards_per_day, user_jlpt_level']
+  value text [note: 'JSON-encoded, so one row per setting and no migration per option']
+  secret bool [not null, default: false, note: 'true for API keys: encrypted at rest with a key derived from SECRET_KEY_BASE, never logged']
+  updated_at timestamptz
+
+  indexes {
+    (user_id, key) [unique]
+  }
+
+  Note: 'Key-value rather than a column per setting: this schema is still moving, and a settings UI would otherwise mean a migration per toggle. Typed access in one Elixir module that validates against Ecto.Enum, so the looseness stops at one boundary.'
+}
+
+Table documents {
+  id int [pk, increment, note: 'a PDF upload; its pages are ordinary pages rows']
+  user_id int [not null]
+  filename varchar [not null]
+  page_count int [not null]
+  has_text_layer bool [not null, note: 'when true the text is extracted, not OCRed']
+  created_at timestamptz
+}
+
+Table pages {
+  id int [pk, increment]
+  user_id int [not null]
+  source_id int [not null, note: 'never null: a default source exists from day one']
+  document_id int [note: 'set when this page came from a PDF']
+  page_index int [note: 'zero-based index within that document']
+  image_key varchar [not null, note: 'object key in S3-compatible storage, not a filesystem path']
+  image_store varchar [not null, default: 'local', note: 'local | s3: which backend holds image_key']
+  image_expires_at timestamptz [note: 'sweeper deletes the object after this. Line crops are permanent; this is the full page only.']
+  text_origin varchar [not null, note: 'ocr | embedded: PDFs with a text layer skip OCR entirely']
+  accepted_text text [note: 'user-corrected text; everything downstream uses this']
+  text_hash varchar [not null]
+  revision int [not null, default: 1, note: 'bumped on re-photograph or correction; stale job results are discarded']
+  status varchar [not null, note: 'uploaded | detecting | text_ready | translating | ready | failed']
+  created_at timestamptz
+
+  indexes {
+    (user_id, text_hash) [unique, name: 'one_page_per_distinct_text']
+    (user_id, status)
+    (document_id, page_index)
+  }
+
+  Note: 'Indexes. (user_id, text_hash) unique: kills a re-upload of the same screen. (user_id, status): the ingest queue. (document_id, page_index): ordered pages of a PDF.'
+}
+
+Table words {
+  id int [pk, increment, note: 'the reviewable unit: one card per row']
+  user_id int [not null]
+  lexeme_id int [not null]
+  known bool [not null, default: false]
+  suspended bool [not null, default: false]
+  suspended_reason varchar [note: 'manual | chrome | mastered | leech. Needed so unsuspending cannot clobber a different reason.']
+  mastered_at timestamptz
+  chrome_like bool [not null, default: false, note: 'true only when the word clears the chrome ratio in EVERY source it appears in, so HUD-in-one-game does not kill real vocabulary elsewhere']
+  created_at timestamptz
+
+  indexes {
+    (user_id, lexeme_id) [unique]
+  }
+
+  Note: 'Index (user_id, lexeme_id) unique: one card per word per user, and the queue lookup.'
+}
+
+Table encounters {
+  id int [pk, increment]
+  user_id int [not null]
+  word_id int [not null]
+  page_id int [not null]
+  source_id int [not null]
+  text_hash varchar [not null]
+  crop_key varchar [not null, note: 'per-line crop, permanent: card front and OCR audit trail']
+  crop_store varchar [not null, default: 'local']
+  bbox varchar [note: 'normalised 0-1000 x1 y1 x2 y2, so a crop can be re-cut from the page']
+  seen_on date [not null]
+  confirmed bool [not null, default: false, note: 'R2.8: unconfirmed counts toward nothing']
+  discarded_at timestamptz
+
+  indexes {
+    (user_id, word_id, text_hash) [unique, name: 'one_encounter_per_word_per_page']
+    (word_id, seen_on)
+    (user_id, source_id)
+  }
+
+  Note: 'Indexes. (user_id, word_id, text_hash) unique: one encounter per word per page. (word_id, seen_on): the occurrence rotation and the ghost signal. (user_id, source_id): per-source coverage and the chrome ratio.'
+}
+
+Table review_events {
+  id int [pk, increment, note: 'append-only; the source of truth for scheduling']
+  user_id int [not null]
+  word_id int [not null]
+  grade int [not null, note: 'FSRS grade 1..4']
+  reviewed_at timestamptz [not null]
+  stability_after float [not null, note: 'every review yields a new state; null would mean "not computed", which must not happen']
+  difficulty_after float [not null]
+  interval_after int [not null, note: '0 is valid: a lapse resets the interval']
+
+  indexes {
+    (word_id, reviewed_at)
+  }
+
+  Note: '(word_id, reviewed_at): replay a word\'s history in order and rebuild word_states.'
+}
+
+Table word_states {
+  word_id int [pk, note: 'user is word.user_id. Materialised from review_events and rebuildable.']
+  state int [not null, default: 0, note: '0 new | 1 learning | 2 review | 3 relearning']
+  stability float [note: 'NULL until the first review: undefined, not zero']
+  difficulty float [note: 'NULL until the first review']
+  reps int [not null, default: 0]
+  lapses int [not null, default: 0]
+  due_at timestamptz [not null, note: 'set when the word is introduced']
+  last_reviewed_at timestamptz [note: 'NULL until the first review']
+}
+
+// ───────────────────────────── references ─────────────────────────────
+
+Ref: sources.user_id > users.id
+Ref: settings.user_id > users.id
+Ref: documents.user_id > users.id
+Ref: pages.user_id > users.id
+Ref: pages.source_id > sources.id
+Ref: pages.document_id > documents.id
+Ref: words.user_id > users.id
+Ref: words.lexeme_id > lexemes.id
+Ref: encounters.user_id > users.id
+Ref: encounters.word_id > words.id
+Ref: encounters.page_id > pages.id
+Ref: encounters.source_id > sources.id
+Ref: review_events.user_id > users.id
+Ref: review_events.word_id > words.id
+Ref: word_states.word_id - words.id

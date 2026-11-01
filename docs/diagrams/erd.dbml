@@ -71,6 +71,7 @@ Table settings {
   key varchar [not null, note: 'e.g. translation_provider, new_cards_per_day, user_jlpt_level']
   value text [note: 'JSON-encoded, so one row per setting and no migration per option']
   secret bool [not null, default: false, note: 'true for API keys: encrypted at rest with a key derived from SECRET_KEY_BASE, never logged']
+  inserted_at timestamptz
   updated_at timestamptz
 
   indexes {

@@ -864,12 +864,11 @@ switch means no translate affordance anywhere in the UI — hidden, not failing.
 
 | Setting | Default | Purpose |
 |---|---|---|
-| `ai_features_enabled` | **false** | The switch for Epic 7. Not implied by credentials |
 | `ai_features_enabled` | `false` | The switch for mnemonics and example sentences. Does not imply credentials exist |
 | `translation_enabled` | `false` | UI-editable. Off by default so nothing is sent off-host until opted in |
 | `translation_provider` | `google_free` | UI-editable. `google_free`, `llm`, `deepl`, `google_cloud`, `libretranslate`, `off` |
 | `deepl_api_key` | unset | Only read for the `deepl` provider |
-| `google_translate_api_key` | unset | Only read for the `google` provider |
+| `google_cloud_api_key` | unset | Only read for the `google_cloud` provider |
 | `libretranslate_url` | unset | Only read for the `libretranslate` provider; the key is optional (self-hosted) |
 | `OPENAI_BASE_URL` | `https://api.openai.com/v1` | Any OpenAI-compatible endpoint: llama.cpp, vLLM, proxy |
 | `OPENAI_API_KEY` | unset | Credentials only. No default; empty means AI features are unavailable |

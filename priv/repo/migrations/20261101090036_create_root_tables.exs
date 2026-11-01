@@ -16,7 +16,10 @@ defmodule Ashiato.Repo.Migrations.CreateRootTables do
         default: "",
         comment: "\"\" not NULL, so the unique index actually bites"
 
-      add :part_of_speech, :string, null: false, default: "", comment: "from the tokenizer; drops particles, finds mimetics"
+      add :part_of_speech, :string,
+        null: false,
+        default: "",
+        comment: "from the tokenizer; drops particles, finds mimetics"
 
       timestamps(type: :utc_datetime)
     end

@@ -7,6 +7,14 @@
 # General application configuration
 import Config
 
+config :ashiato, Oban,
+  engine: Oban.Engines.Lite,
+  notifier: Oban.Notifiers.PG,
+  queues: [default: 10],
+  lifeline: [rescue_after: {2, :hours}],
+  pruner: [max_age: {1, :day}],
+  repo: Ashiato.Repo
+
 config :ashiato,
   ecto_repos: [Ashiato.Repo],
   generators: [timestamp_type: :utc_datetime]

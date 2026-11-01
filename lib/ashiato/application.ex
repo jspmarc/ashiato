@@ -10,6 +10,7 @@ defmodule Ashiato.Application do
     children = [
       AshiatoWeb.Telemetry,
       Ashiato.Repo,
+      {Oban, Application.fetch_env!(:ashiato, Oban)},
       {Ecto.Migrator,
        repos: Application.fetch_env!(:ashiato, :ecto_repos), skip: skip_migrations?()},
       {DNSCluster, query: Application.get_env(:ashiato, :dns_cluster_query) || :ignore},

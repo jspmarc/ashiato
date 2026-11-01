@@ -9,13 +9,22 @@ defmodule Ashiato.LedgerTest do
   Both are enforced by unique indexes, and both are easy to get subtly wrong —
   `find_or_create_lexeme` has to survive a race, and `record_encounter` has to
   turn a duplicate into a value rather than an exception.
+
+  The queue boundary layered on top has contracts of its own:
+
+    * introduction is one `word_states` row per word — the threshold is
+      respected, `force: true` bypasses it, and introducing twice never
+      duplicates
+    * `chrome_like` is derived, never stored truth: it lands only when the word
+      is chrome-like in *every* source it appears in (§6.5), and the R2.9
+      suspension hand-off never clobbers a suspension that is not `:chrome`
   """
 
   use Ashiato.DataCase, async: false
 
   import Ashiato.Fixtures
 
-  alias Ashiato.{Encounters, Ledger, Lexemes, Repo}
+  alias Ashiato.{Encounters, Ledger, Lexemes, Repo, WordStates}
 
   describe "find_or_create_lexeme/3" do
     test "creates the lexeme the first time and returns the same row the second" do
@@ -153,16 +162,336 @@ defmodule Ashiato.LedgerTest do
     end
   end
 
-  defp record(user, source, word, page, confirmed) do
-    Ledger.record_encounter(%{
-      user_id: user.id,
-      word_id: word.id,
-      page_id: page.id,
-      source_id: source.id,
-      text_hash: page.text_hash,
-      crop_key: "crops/#{page.id}.jpg",
-      seen_on: ~D[2026-11-01],
-      confirmed: confirmed
-    })
+  describe "introduce_words/3" do
+    setup do
+      user = user_fixture()
+      source = source_fixture(user_id: user.id)
+
+      {:ok, %{user: user, source: source}}
+    end
+
+    test "a word below the threshold is not introduced", %{user: user, source: source} do
+      %{lexeme: lexeme} = met_word(user, source, 1)
+
+      assert {:ok, []} = Ledger.introduce_words(user.id, [lexeme.id])
+      assert Repo.aggregate(WordStates, :count) == 0
+    end
+
+    test "a word at the threshold is introduced, due immediately and new",
+         %{user: user, source: source} do
+      %{lexeme: lexeme, word: word} = met_word(user, source)
+
+      assert {:ok, [introduced]} = Ledger.introduce_words(user.id, [lexeme.id])
+      assert introduced.id == word.id
+
+      assert [%WordStates{} = state] = Repo.all(WordStates)
+      assert state.word_id == word.id
+      assert state.state == 0
+      assert %DateTime{} = state.due_at
+    end
+
+    test "unconfirmed and discarded encounters do not count toward the threshold",
+         %{user: user, source: source} do
+      lexeme = lexeme_fixture()
+      word = word_fixture(user_id: user.id, lexeme_id: lexeme.id)
+
+      [met, unconfirmed, discarded] =
+        for _ <- 1..3, do: page_fixture(user_id: user.id, source_id: source.id)
+
+      record(user, source, word, met, true)
+      # R2.8: both count toward nothing
+      record(user, source, word, unconfirmed, false)
+
+      record(user, source, word, discarded, true, %{
+        discarded_at: DateTime.utc_now() |> DateTime.truncate(:second)
+      })
+
+      assert {:ok, []} = Ledger.introduce_words(user.id, [lexeme.id])
+      assert Repo.aggregate(WordStates, :count) == 0
+    end
+
+    test "force: true bypasses the threshold", %{user: user, source: source} do
+      %{lexeme: lexeme} = met_word(user, source, 1)
+
+      assert {:ok, [_introduced]} = Ledger.introduce_words(user.id, [lexeme.id], force: true)
+      assert Repo.aggregate(WordStates, :count) == 1
+    end
+
+    test "force bypasses only the threshold, not the other filters",
+         %{user: user, source: source} do
+      known = met_word(user, source, 1)
+      Repo.update!(change(known.word, known: true))
+
+      chrome = met_word(user, source, 1)
+      Repo.update!(change(chrome.word, chrome_like: true))
+
+      suspended = met_word(user, source, 1)
+      assert {:ok, _} = Ledger.mark_suspended(user.id, suspended.lexeme.id, :manual)
+
+      lexeme_ids = [known.lexeme.id, chrome.lexeme.id, suspended.lexeme.id]
+
+      assert {:ok, []} = Ledger.introduce_words(user.id, lexeme_ids, force: true)
+      assert Repo.aggregate(WordStates, :count) == 0
+    end
+
+    test "the threshold is overridable per call", %{user: user, source: source} do
+      %{lexeme: lexeme} = met_word(user, source, 3)
+
+      assert {:ok, []} = Ledger.introduce_words(user.id, [lexeme.id], min_encounters: 4)
+      assert {:ok, [_]} = Ledger.introduce_words(user.id, [lexeme.id], min_encounters: 3)
+    end
+
+    test "a word already introduced is not duplicated", %{user: user, source: source} do
+      %{lexeme: lexeme} = met_word(user, source)
+
+      assert {:ok, [_first]} = Ledger.introduce_words(user.id, [lexeme.id])
+
+      # a second call, and a repeated id within one call, both find the
+      # word_states row already there
+      assert {:ok, []} = Ledger.introduce_words(user.id, [lexeme.id])
+      assert {:ok, []} = Ledger.introduce_words(user.id, [lexeme.id, lexeme.id])
+
+      assert Repo.aggregate(WordStates, :count) == 1
+    end
+
+    test "a lexeme with no words row is skipped unless forced", %{user: user} do
+      lexeme = lexeme_fixture()
+
+      assert {:ok, []} = Ledger.introduce_words(user.id, [lexeme.id])
+
+      assert {:ok, [minted]} = Ledger.introduce_words(user.id, [lexeme.id], force: true)
+      assert minted.lexeme_id == lexeme.id
+      assert Repo.aggregate(WordStates, :count) == 1
+    end
+
+    test "returns only the introduced words, in the order given",
+         %{user: user, source: source} do
+      below = met_word(user, source, 1)
+      first = met_word(user, source)
+      second = met_word(user, source)
+
+      ids = [below.lexeme.id, second.lexeme.id, first.lexeme.id]
+      assert {:ok, [w1, w2]} = Ledger.introduce_words(user.id, ids)
+
+      assert w1.id == second.word.id
+      assert w2.id == first.word.id
+    end
+  end
+
+  describe "mark_known/2" do
+    test "marks the user's copy of the lexeme known" do
+      user = user_fixture()
+      word = word_fixture(user_id: user.id)
+
+      assert {:ok, known} = Ledger.mark_known(user.id, word.lexeme_id)
+      assert known.known
+      assert Repo.reload!(word).known
+    end
+
+    test "a lexeme the user has no words row for is an error" do
+      user = user_fixture()
+      lexeme = lexeme_fixture()
+
+      assert {:error, :not_found} = Ledger.mark_known(user.id, lexeme.id)
+    end
+  end
+
+  describe "mark_suspended/3" do
+    setup do
+      user = user_fixture()
+      word = word_fixture(user_id: user.id)
+
+      {:ok, %{user: user, word: word}}
+    end
+
+    test "suspends with the given reason", %{user: user, word: word} do
+      assert {:ok, suspended} = Ledger.mark_suspended(user.id, word.lexeme_id, :manual)
+      assert suspended.suspended
+      assert suspended.suspended_reason == :manual
+    end
+
+    test "mastering also stamps mastered_at", %{user: user, word: word} do
+      assert {:ok, mastered} = Ledger.mark_suspended(user.id, word.lexeme_id, :mastered)
+      assert %DateTime{} = mastered.mastered_at
+    end
+
+    test "the reason must come from the Ecto.Enum", %{user: user, word: word} do
+      assert {:error, changeset} = Ledger.mark_suspended(user.id, word.lexeme_id, :bogus)
+      assert %{suspended_reason: ["is invalid"]} = errors_on(changeset)
+
+      refute Repo.reload!(word).suspended
+    end
+
+    test "suspending again never clobbers an existing reason (R2.9)", %{user: user, word: word} do
+      assert {:ok, first} = Ledger.mark_suspended(user.id, word.lexeme_id, :manual)
+      assert {:ok, second} = Ledger.mark_suspended(user.id, word.lexeme_id, :chrome)
+
+      # a manual suspension survives the chrome re-mark, so clearing the flag
+      # later can never wipe it
+      assert first.suspended_reason == :manual
+      assert second.suspended_reason == :manual
+    end
+
+    test "a lexeme the user has no words row for is an error" do
+      user = user_fixture()
+      lexeme = lexeme_fixture()
+
+      assert {:error, :not_found} = Ledger.mark_suspended(user.id, lexeme.id, :manual)
+    end
+  end
+
+  describe "update_chrome_like/1" do
+    setup do
+      {:ok, %{user: user_fixture()}}
+    end
+
+    test "flags a word chrome-like in every source it appears in", %{user: user} do
+      %{word: word} = chrome_word(user)
+
+      assert {:ok, [flagged]} = Ledger.update_chrome_like(user.id)
+      assert flagged.id == word.id
+      assert Repo.reload!(word).chrome_like
+    end
+
+    test "a word chrome in one game but rare in a manga stays unflagged (§6.5)", %{user: user} do
+      game = source_fixture(user_id: user.id)
+      game_pages = for _ <- 1..2, do: page_fixture(user_id: user.id, source_id: game.id)
+
+      # both words are on every game page; only one of them is also met in a manga
+      hud = word_fixture(user_id: user.id)
+      real = word_fixture(user_id: user.id)
+      Enum.each(game_pages, &record(user, game, hud, &1, true))
+      Enum.each(game_pages, &record(user, game, real, &1, true))
+
+      manga = source_fixture(user_id: user.id, kind: :manga)
+      manga_pages = for _ <- 1..3, do: page_fixture(user_id: user.id, source_id: manga.id)
+      Enum.each(Enum.take(manga_pages, 1), &record(user, manga, real, &1, true))
+
+      # the HUD word is chrome-like in its only source; the real word is not
+      # chrome-like everywhere it appears, so the flag may not land on either
+      # of them wrongly
+      assert {:ok, [flagged]} = Ledger.update_chrome_like(user.id)
+      assert flagged.id == hud.id
+      refute Repo.reload!(real).chrome_like
+    end
+
+    test "when the flag lands, an existing card is suspended with reason chrome (R2.9)",
+         %{user: user} do
+      %{lexeme: lexeme, word: word} = chrome_word(user)
+
+      assert {:ok, [_]} = Ledger.introduce_words(user.id, [lexeme.id])
+      assert {:ok, [_]} = Ledger.update_chrome_like(user.id)
+
+      reloaded = Repo.reload!(word)
+      assert reloaded.chrome_like
+      assert reloaded.suspended and reloaded.suspended_reason == :chrome
+
+      # suspended, never deleted: the card and its history survive
+      assert Repo.get!(WordStates, word.id)
+    end
+
+    test "when the flag lands on a suspended word, its reason is not clobbered", %{user: user} do
+      %{lexeme: lexeme, word: word} = chrome_word(user)
+
+      assert {:ok, _} = Ledger.mark_suspended(user.id, lexeme.id, :manual)
+      assert {:ok, [_flagged]} = Ledger.update_chrome_like(user.id)
+
+      reloaded = Repo.reload!(word)
+      assert reloaded.chrome_like
+      assert reloaded.suspended and reloaded.suspended_reason == :manual
+    end
+
+    test "clearing the flag un-suspends a chrome suspension (R2.9)", %{user: user} do
+      %{word: word} = chrome_word(user)
+
+      assert {:ok, [_]} = Ledger.update_chrome_like(user.id)
+      assert Repo.reload!(word).suspended
+
+      # no longer chrome-like everywhere: met on one of two manga pages
+      meet_rarely_elsewhere(user, word)
+      assert {:ok, []} = Ledger.update_chrome_like(user.id)
+
+      reloaded = Repo.reload!(word)
+      refute reloaded.chrome_like
+      refute reloaded.suspended
+      assert reloaded.suspended_reason == nil
+    end
+
+    for reason <- [:manual, :mastered, :leech] do
+      test "clearing the flag leaves a #{reason} suspension intact (R2.9)", %{user: user} do
+        reason = unquote(reason)
+        %{lexeme: lexeme, word: word} = chrome_word(user)
+
+        # the flag lands on an already-suspended word without touching it…
+        assert {:ok, _} = Ledger.mark_suspended(user.id, lexeme.id, reason)
+        assert {:ok, [_]} = Ledger.update_chrome_like(user.id)
+
+        reloaded = Repo.reload!(word)
+        assert reloaded.chrome_like
+        assert reloaded.suspended and reloaded.suspended_reason == reason
+
+        # …and clearing the flag leaves the suspension alone too
+        meet_rarely_elsewhere(user, word)
+        assert {:ok, []} = Ledger.update_chrome_like(user.id)
+
+        reloaded = Repo.reload!(word)
+        refute reloaded.chrome_like
+        assert reloaded.suspended and reloaded.suspended_reason == reason
+      end
+    end
+  end
+
+  # A word met on `n` distinct confirmed pages of one source.
+  defp met_word(user, source, n \\ 2) do
+    lexeme = lexeme_fixture()
+    word = word_fixture(user_id: user.id, lexeme_id: lexeme.id)
+
+    for _ <- 1..n do
+      page = page_fixture(user_id: user.id, source_id: source.id)
+      record(user, source, word, page, true)
+    end
+
+    %{lexeme: lexeme, word: word}
+  end
+
+  # A word on every page of a fresh source: chrome-like in its only source.
+  defp chrome_word(user) do
+    source = source_fixture(user_id: user.id)
+    lexeme = lexeme_fixture()
+    word = word_fixture(user_id: user.id, lexeme_id: lexeme.id)
+    pages = for _ <- 1..2, do: page_fixture(user_id: user.id, source_id: source.id)
+    Enum.each(pages, &record(user, source, word, &1, true))
+
+    %{lexeme: lexeme, word: word, source: source}
+  end
+
+  # Meets `word` on one of two fresh manga pages: exactly half the pages does
+  # not clear the chrome threshold (§6.5 says *more than*), so the word stops
+  # being chrome-like in every source.
+  defp meet_rarely_elsewhere(user, word) do
+    manga = source_fixture(user_id: user.id, kind: :manga)
+    [met, _unmet] = for _ <- 1..2, do: page_fixture(user_id: user.id, source_id: manga.id)
+    record(user, manga, word, met, true)
+
+    manga
+  end
+
+  defp record(user, source, word, page, confirmed, opts \\ %{}) do
+    attrs =
+      Map.merge(
+        %{
+          user_id: user.id,
+          word_id: word.id,
+          page_id: page.id,
+          source_id: source.id,
+          text_hash: page.text_hash,
+          crop_key: "crops/#{page.id}.jpg",
+          seen_on: ~D[2026-11-01],
+          confirmed: confirmed
+        },
+        opts
+      )
+
+    Ledger.record_encounter(attrs)
   end
 end

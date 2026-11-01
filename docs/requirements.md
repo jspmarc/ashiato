@@ -42,8 +42,9 @@ problem this app does not have.
 - Handwriting practice / stroke-order grading (production cards are deferred; see R3.7)
 - Audio, TTS, listening practice
 - Grammar SRS (grammar is tracked as a separate concern, not in this app)
+- Anki and WaniKani progress import — deferred to the next scope (Epic 8)
 - Bunpro import (no official API; only an unstable reverse-engineered one)
-- Anki export of review intervals (export is a known-words list only; see R8.2)
+- Anki export of review intervals (export is a known-words list only; see R5.4)
 
 ---
 
@@ -181,7 +182,7 @@ or introduction (§6.5).
 | ID | Pri | Requirement |
 |---|---|---|
 | R3.1 | M | A review session presents due cards, one at a time, gradeable. |
-| R3.2 | M | Card front = the line crop where the word was met, with the target word masked. Card back = word, reading, meaning, kanji. One card per word. |
+| R3.2 | M | Card front = the line crop where the word was met, **with the target word named beneath it, not masked**. Card back = word, reading, meaning, kanji. One card per word. |
 | R3.3 | M | Grading updates FSRS state for that word. |
 | R3.4 | M | A word is not introduced to the queue until it has been encountered at least N times, N configurable (default 2), with a force-add override. |
 | R3.5 | M | Interval caps by frequency band: top band ≤ 60 days, next band ≤ 120 days, tail unbounded. |
@@ -195,6 +196,17 @@ or introduction (§6.5).
 
 **Acceptance (R3.2):** grading a word card never advances a kanji card, and a kanji is never presented
 as "what does this mean".
+
+**Why the word is named rather than masked.** The skill being trained is *receptive*: see the word in a
+real sentence and know what it means. That is what reading actually requires, and it is what the card
+should test. Masking would turn the same card into a cloze — a production task — which is a different
+skill, and one that also needs token-level geometry and an alignment between tokenizer tokens and OCR
+glyph boxes that does not exist yet. Naming the word keeps the context doing its job while making the
+stimulus visible, so no mask has to be drawn and no geometry has to be stored.
+
+The word is also named so the grade stays attached to the right thing: if the front showed a sentence and
+said nothing about which word it was for, a failure caused by a different unknown word in the same line
+would push *this* word's FSRS interval down for reasons that have nothing to do with it.
 
 **Acceptance (R3.4):** changing N triggers a recomputation of which words qualify for introduction.
 It must never remove or reset a card already in review rotation.
@@ -266,16 +278,14 @@ its own provider set, its own switch, and its own credentials.
 **Note:** the user's own encounters are the primary source of example sentences. Generated ones are
 supplementary.
 
-### Epic 8 — Imports
+### Epic 8 — Imports (deferred to the next scope)
 
-| ID | Pri | Requirement |
-|---|---|---|
-| R8.1 | S | Import Anki collection. The collection file is SQLite; read it directly. |
-| R8.2 | S | Import WaniKani progress via API v2 with a personal token. |
-| R8.3 | M | Imported progress is treated as a **known baseline**, not as review state. Merging foreign intervals with local FSRS parameters produces nonsense. |
+Not in this scope. Anki and WaniKani import were specified as a cold-start mitigation and a way to seed a
+known baseline; both are pushed to the next scope. Bunpro was already out — no official API exists, only a
+permissioned reverse-engineered one that is explicitly unstable.
 
-**Out of scope:** Bunpro. No official API exists; only a permissioned reverse-engineered one that is
-explicitly unstable.
+The requirement that would return with them is unchanged: **imported progress is a known baseline, never
+review state.** Merging foreign intervals with local FSRS parameters produces nonsense (D10).
 
 ---
 
@@ -971,7 +981,7 @@ switch means no translate affordance anywhere in the UI — hidden, not failing.
 | Risk | Mitigation |
 |---|---|
 | **LLM OCR hallucination** — plausible but wrong characters pass dictionary validation (待/持) | Raw output retained, crops retained, confirmation on first encounter, OCR-correction pairs feed discrimination sets |
-| **Cold start** — empty ledger on day one | Accept and state plainly; imports (E8) give a baseline |
+| **Cold start** — empty ledger on day one | Accept and state plainly; it becomes useful in months. Anki/WaniKani seeding would have helped and is deferred |
 | **Grammar is the real N4 bottleneck** — a frequency deck will not fix て-form or passive | Out of scope by design; pair with a separate grammar track |
 | **Kana-only material** — no kanji, and mojibake in a ledger built on kanji | Detected and surfaced per page; such sources contribute vocabulary only |
 | **Dictionary service unavailable** | Local cache; degrade to recording without enrichment |
@@ -982,6 +992,7 @@ switch means no translate affordance anywhere in the UI — hidden, not failing.
 
 ## 12. Later / not now
 
+- Anki and WaniKani progress import, from the deferred Epic 8
 - Production cards (write a character from its reading) — deferred until handwriting is an actual goal
 - Multi-user with per-user ledgers
 - On-device OCR (removes the per-image cost and the privacy exposure)

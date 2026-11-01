@@ -15,7 +15,7 @@ group Session start — pick the due cards
 User -> UI: open review
 UI -> DB: due words where due_at <= now\nand not suspended and not mastered
 UI --> User: card 1 of N
-note over UI: front = the line crop where the word was met,\ntarget word masked. Back = word, reading, meaning, kanji.
+note over UI: front = the line crop where the word was met,\ntarget word named below it, not masked.\nBack = word, reading, meaning, kanji.
 end
 
 group Review loop — one card at a time

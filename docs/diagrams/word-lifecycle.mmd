@@ -1,0 +1,77 @@
+%% Ashiato — the life of a word
+%% Canonical source. Mirrored in README.md for GitHub rendering; keep both in step.
+%% Columns flow left to right; each column stacks internally.
+
+flowchart LR
+  subgraph capture["① Capture"]
+    direction TB
+    C1["Image or PDF uploaded"] --> C2["PDF: text layer?<br/>use it, skip OCR"] --> C3["Else rasterise, then<br/>detector finds one<br/>quad per text line"] --> C4["Recogniser reads each<br/>line crop; every token<br/>dictionary-validated"]
+  end
+
+  subgraph ledger["② Ledger"]
+    direction TB
+    L1{"Token already<br/>in the ledger?"}
+    L2["Create lexeme<br/>lemma + reading + POS"]
+    L3["Reuse lexeme"]
+    L4["Record encounter<br/>page, crop, date<br/>confirmed = false"]
+    L5{"Above the chrome ratio<br/>in EVERY source it<br/>appears in?"}
+    L6["Flagged chrome_like"]
+    L1 -->|"no"| L2
+    L1 -->|"yes"| L3
+    L2 --> L4
+    L3 --> L4
+    L4 --> L5
+    L5 -->|"yes"| L6
+  end
+
+  subgraph intro["③ Introduction"]
+    direction TB
+    Q1{"Confirmed<br/>and occurrences<br/>>= N?"}
+    Q2["Stays in the ledger<br/>counts toward coverage<br/>never becomes a card"]
+    Q3["Enters the<br/>review queue"]
+    Q1 -->|"no"| Q2
+    Q1 -->|"yes, or force-added"| Q3
+  end
+
+  subgraph review["④ Review"]
+    direction TB
+    R1["Card front: the line crop<br/>where the word was met,<br/>target word masked"]
+    R2{"Grade"}
+    R3["Lapse: interval resets,<br/>+1 toward leech"]
+    R4["Stability grows"]
+    R5["final_interval = min of<br/>FSRS interval and<br/>the frequency band cap"]
+    R1 --> R2
+    R2 -->|"again"| R3
+    R2 -->|"hard / good / easy"| R4
+    R4 --> R5
+  end
+
+  subgraph after["⑤ Between and after"]
+    direction TB
+    A1{"Met in the wild again<br/>while the due date<br/>is far out?"}
+    A2["Early review<br/>a real FSRS event,<br/>never a faked interval"]
+    A3["Waits for its<br/>due date"]
+    A4{"User action"}
+    A5["Suspend: out of the queue,<br/>still counted in coverage"]
+    A6["Mastered: suspended<br/>plus mastered_at"]
+    A1 -->|"yes"| A2
+    A1 -->|"no"| A3
+    A4 -->|"suspend"| A5
+    A4 -->|"mark mastered"| A6
+  end
+
+  subgraph derived["Derived, never stored twice"]
+    direction TB
+    D1["Kanji known when<br/>1 word is mature AND<br/>it appears in 2+ words"]
+    D2["Coverage = known tokens<br/>over total tokens,<br/>per source and chapter"]
+    D3["Ghost = many occurrences,<br/>few days_seen"]
+  end
+
+  C4 --> L1
+  L5 -->|"no"| Q1
+  L6 --> Q2
+  Q3 --> R1
+  R3 --> A4
+  R5 --> A1
+
+  L6 -.->|"already a card?<br/>suspend it, keep history"| A5

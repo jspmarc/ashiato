@@ -80,8 +80,8 @@ one deployable unit.
 **5. Ecto has the best dual-database story of the four.**
 The requirement is SQLite locally and Postgres in production, with migrations that run unchanged on
 both. Ecto's type system does the mapping: `:boolean` → 0/1 or `bool`, `:utc_datetime` → text or
-`timestamptz`, `:binary_id` → text or `uuid` (generated client-side, so no Postgres extension is
-needed). Spring/Hibernate's SQLite dialect is second-class; Diesel and SQLx require per-dialect
+`timestamptz`, and `:id` → `bigserial` on Postgres or `INTEGER PRIMARY KEY` on SQLite from a single
+definition. Spring/Hibernate's SQLite dialect is second-class; Diesel and SQLx require per-dialect
 migration directories; Alembic requires hand-written dialect conditionals.
 
 **6. Iteration speed matters more than peak performance here.**

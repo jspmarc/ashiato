@@ -35,6 +35,9 @@ problem this app does not have.
 ## 2. Non-goals (v1)
 
 - Multi-user (not planned; schema prepared for it, see §1.1), accounts, sharing, social features
+- **Standard JLPT-level decks for introduction.** Planned, not in v1: introducing cards from a
+  canned N5–N1 ordering instead of only from your own encounters. The ledger stays the default source
+  of truth for what gets studied; a standard deck is an opt-in shortcut, not a replacement.
 - Native mobile app (responsive web is sufficient)
 - Handwriting practice / stroke-order grading (production cards are deferred; see R3.7)
 - Audio, TTS, listening practice
@@ -138,6 +141,7 @@ Priority: **M** = must have in v1, **S** = should have, **C** = could have / lat
 | R1.8 | S | See a translation of the passage, or of a selected phrase. Optional AI feature (R7). |
 | R1.9 | M | Browse a list of stored pages and reopen any without re-photographing. |
 | R1.10 | S | When two OCR backends are configured, run both. Where they agree, auto-accept; where they disagree, require confirmation before those tokens are recorded. |
+| R1.11 | S | Produce a translated page image with each line's translation painted over it, as `jp-reader` does, alongside the plain text list. |
 
 **Acceptance (R1.3):** text edits are saved before tokenization; the recorded ledger reflects the
 corrected text, and the original OCR output is retained separately for audit.
@@ -158,6 +162,7 @@ encounter.
 | R2.6 | M | Store a per-line crop permanently; store the full page image with a 30-day TTL. |
 | R2.7 | S | Discard an individual encounter (bad OCR) without deleting the word. |
 | R2.8 | M | Encounters are recorded automatically but carry a `confirmed` flag. Unconfirmed encounters count toward nothing — no ranking, no queue entry, no coverage. Confirmation happens once per word, not per page. |
+| R2.9 | M | When a word becomes chrome-like, an existing card is suspended with reason `chrome`. History preserved, coverage still counts it, clearing the flag restores it. |
 
 **Acceptance (R2.1):** particles, auxiliaries, punctuation, and standalone numerals are not recorded.
 Proper nouns are recorded but flagged, so they can be excluded from ranking.
@@ -186,6 +191,7 @@ or introduction (§6.5).
 | R3.9 | M | New-card introduction ordered by priority (frequency within own material × novelty), capped per day. |
 | R3.10 | S | Filter new-card introduction by JLPT level relative to the user's own level setting. |
 | R3.11 | S | Flag and surface leeches: words met often but repeatedly failed. |
+| R3.12 | M | A word met in several pages shows one occurrence per review, chosen deterministically by `reps mod occurrence_count`, so every context is eventually seen and any card is reproducible. Never show a discarded or unconfirmed encounter. |
 
 **Acceptance (R3.2):** grading a word card never advances a kanji card, and a kanji is never presented
 as "what does this mean".
@@ -212,9 +218,8 @@ is the number that predicts whether a given source is readable, and the one no e
 
 | ID | Pri | Requirement |
 |---|---|---|
-| R5.1 | M | Merge duplicate words produced by OCR or tokenizer variance. |
+| R5.1 | M | Offer a merge for **orthographic variants**: same reading, same POS, and one lemma contains no CJK character at all ("kana-only") while the other contains at least one ("kanji-bearing"). Merge candidates: たべる ↔ 食べる (タベル, verb), いけす ↔ 生簀 (イケス, noun). Never auto-merge two **kanji-bearing** lemmas sharing a reading — 橋 and 箸 are different words, and checking "same reading" alone would fuse them. |
 | R5.2 | M | Delete an encounter or an entire source; derived stats recompute. |
-| R5.3 | S | Re-run OCR on a stored page with a different model, keeping the old result for comparison. |
 | R5.4 | M | Export the known-words list in a portable format. |
 
 ### Epic 6 — Lookup and detail
@@ -234,13 +239,29 @@ false). `OPENAI_BASE_URL` and `OPENAI_API_KEY` are **credentials, not switches**
 work without them, but setting them must not turn anything on by itself. Capability is checked at boot
 and exposed to the UI, so affordances hide rather than fail.
 
-OCR is *not* in this epic. It runs on locally hosted PaddleOCR-VL and needs no AI credentials (§7.3).
+OCR is *not* in this epic. It runs on the local PaddleOCR service and needs no AI credentials (§7.3),
+which is what makes the credentials genuinely optional rather than effectively required.
+
+**So "optional" now means optional.** `OPENAI_BASE_URL` defaults to `https://api.openai.com/v1`, and the
+LLM backend may be anything OpenAI-compatible (llama.cpp, vLLM, a proxy). Only `OPENAI_API_KEY` has no
+default. Capability is computed once at boot:
+
+```
+ai_capable = ai_features_enabled AND OPENAI_API_KEY present
+```
+
+An empty key disables every AI affordance even if the switch is on, and the UI hides the buttons rather
+than offering something that will fail.
+
+**Translation is gated separately** (§7.5). It is not an LLM feature and does not require an LLM: it has
+its own provider set, its own switch, and its own credentials.
 
 | ID | Pri | Requirement |
 |---|---|---|
 | R7.1 | S | Mnemonic generation for a word or kanji. Stored, cached, user-editable. Regenerating over an edit requires confirmation and keeps the previous version. Records which model and prompt version produced each. |
 | R7.2 | S | Generate 1–3 example sentences per word. The prompt includes the user's own recorded meaning and the source sentence, so generated sentences match the sense actually learned. Validate the target word appears with the expected reading before displaying. |
-| R7.3 | S | Passage and phrase translation. |
+| R7.3 | S | Passage translation in one request per page, so cross-line context survives. The `llm` provider is asked for a **JSON array** of strings and falls back to per-line if it does not parse; NMT providers return line-aligned text directly. Results cached per line by `(lang, line)`. Provider and gate: §7.5. |
+| R7.4 | M | Settings screen: choose the translation provider from all of them, toggle translation, and enter each provider's credentials. Each provider displays its readiness. No provider is privileged. |
 
 **Note:** the user's own encounters are the primary source of example sentences. Generated ones are
 supplementary.
@@ -268,7 +289,10 @@ explicitly unstable.
   Postgres. Uniqueness is `(lemma, reading, part_of_speech)` on the **shared** `lexemes` table, not per
   user; see §6.3.
 - **Page identity is a hash of its normalized text**, unique per user. Re-uploading the same screen
-  creates nothing new.
+  creates nothing new. It is a hash rather than the text itself because a Postgres btree index entry
+  is capped at roughly 2.7 kB — a page of Japanese dialogue exceeds that and the insert would fail —
+  and because NFKC/whitespace normalization has to happen once, before comparison, not on every
+  lookup. A SHA-256 hex digest is a fixed 64 bytes whatever the page length.
 - **Encounter identity is `(user, word, page-text hash)`** — one encounter per word per page. A single
   page yields many word encounters, so the page hash alone would collapse them into one. (Writing the
   constraint as `(user, text_hash)` was wrong; the ERD caught it.)
@@ -288,6 +312,56 @@ expensive later:
   That context layer is the only thing that changes when auth eventually arrives.
 - Coverage, imports, and the review queue are per-user by construction, so per-user reporting needs
   no new code path.
+
+**Identifiers are `int` — 4 bytes, auto-incrementing. Not UUIDs, and not bigint.**
+
+UUIDs solve a problem this design does not have: merging rows between databases. That happens with
+replication, offline clients syncing, or sharding. Here there is one writer and one database, and
+export/import is a *document* (JSON keyed by `lemma + reading` and `glyph`), so surrogate ids never
+travel. A v4 UUID is 16 bytes and random, so every insert lands at a random point in the B-tree rather
+than appending — the worst pattern for the two append-only tables, `encounters` and `review_events`.
+
+`bigint` is the usual insurance against a later `int` overflow, and here the insurance is not worth
+buying. The ceiling is 2.1 billion rows. The heaviest table is `encounters`, and a genuinely heavy user
+— 100 pages a day, 20 words a page, every day for a decade — lands at about 7.3 million, which is 0.3%
+of the limit. Going `int` → `bigint` later is one `ALTER TABLE` plus a rewrite that takes seconds at
+this scale, so the downside of being wrong is small and the saving is half the bytes in every index and
+every join, forever.
+
+**Right-sizing per table, for the record:**
+
+| Table | Expected rows | Type |
+|---|---|---|
+| `kanji` | ≤ 13,000 (every CJK character that exists) | `int` |
+| `lexemes` | ≤ 1 M (JMdict has ~200 k entries) | `int` |
+| `users` | tens, even self-hosted for years | `int` |
+| `words` | ~50 k–500 k | `int` |
+| `pages` | thousands | `int` |
+| `encounters`, `review_events` | ~7 M per decade of heavy use | `int` |
+| `dict_cache_entries` | ≤ 200 k | `int` |
+
+Nothing needs `bigint`. `smallint` would do for a position column, but there is none — see below.
+
+**There is no `kanji` table and no `kanji_lexemes` table.** The kanji of a word are the CJK codepoints
+already in its `lemma`, in order: 食べる contains 食, 一生懸命 contains 一 · 生 · 懸 · 命. Storing that
+relation denormalises a value already held, and it is derived data — which P6 already forbids storing.
+
+Two consequences worth stating:
+
+- **It is more correct, not just tidier.** If the text shows たべる in kana, the reader has not seen 食.
+  A projection of the lemma records exactly that. A relation built from the dictionary's kanji forms
+  would credit characters never actually encountered.
+- **Querying changes shape.** Filtering by one character is still a portable SQL filter —
+  `WHERE lemma LIKE '%生%'` is exact for CJK, since a glyph is one character and cannot be a substring of
+  another — but it is a scan rather than an index lookup. Aggregating *across* characters cannot stay in
+  SQL portably: splitting a string into characters is `regexp_split_to_table` on Postgres and has no
+  SQLite equivalent. So the kanji map is one query plus a grouping fold in Elixir, which at 50 k lexemes
+  is a rounding error.
+
+Costed and rejected along the way: a join table at 8 bytes per row (~480 KB with `int`), or the glyph
+stored inline in that table (~420 KB), versus **zero** for deriving it. Deriving also removes a table, a
+foreign key, and an entire class of drift — the same argument P6 makes about counters, applied to a
+relation.
 
 ### 6.3 What is stored, what is fetched
 
@@ -350,8 +424,13 @@ Page identity is a hash of normalized page text, which gives three consequences:
   dialogue box, creates no new encounter.
 - **HUD and menu chrome is the massed-repetition case.** 「HP」「セーブ」「コマンド」 appear on nearly
   every screen of a game. A word appearing on more than a configurable fraction of a source's pages
-  (default 50%) is flagged `chrome_like` and excluded from ranking and introduction by default. The
-  user can also ignore a line or a pattern explicitly.
+  (default 50%) is *chrome-like in that source*. The word is flagged only when it is chrome-like in **every** source it
+  appears in — otherwise a HUD word in one game would suppress real vocabulary met in a manga. The user
+  can also ignore a line or a pattern explicitly.
+
+  **What happens to a card that already exists when the flag lands** (R2.9): it is suspended with
+  `suspended_reason = chrome`, never deleted. Review history survives, coverage still counts it, and
+  clearing the flag un-suspends it — which is why the reason is stored rather than inferred.
 - **Ranking uses `occurrences`, not `tokens`**, so one screen repeating a word ten times cannot
   promote it.
 
@@ -421,7 +500,29 @@ if a new encounter arrives AND now < due_at - 7 days:
 
 The ledger never writes a fake interval. It supplies a new observation and lets FSRS decide.
 
-### 6.7 Review history
+### 6.7 Page revisions
+
+`pages.revision` is a **fencing token, not a history**. It starts at 1 and is incremented inside the
+same transaction as anything that changes what processing would produce:
+
+- accepting a corrected text (R1.3)
+- replacing the photo (R1.5)
+- applying a rotation or perspective correction and re-running (R1.4)
+
+Every job reads the revision at start and carries it. Writes are conditional:
+
+```sql
+UPDATE pages
+   SET status = :status, accepted_text = :text
+ WHERE id = :page_id AND revision = :started_at;   -- 0 rows ⇒ superseded
+```
+
+Zero rows affected means the page moved on while the job was working; the job discards its own result
+and logs that it was superseded. That is optimistic concurrency control — no lock is held across the
+multi-second OCR call, and a late result can never clobber a correction the user made in the meantime.
+Borrowed directly from `jp-reader`'s `update_record_if_revision`.
+
+### 6.8 Review history
 
 Review history is an **append-only log**. Current state is derived from the latest event, and may be
 materialised as a row for query speed, rebuildable from the log at any time.
@@ -429,6 +530,21 @@ materialised as a row for query speed, rebuildable from the log at any time.
 The log is what makes these possible: re-running FSRS with newly optimised parameters over real
 history, answering "why is this due in 200 days", and recomputing the queue when the
 minimum-encounter threshold changes. A mutable state row destroys all three.
+
+### 6.9 Enumerations and cache policy
+
+**Enumerations are strings, constrained twice**: `Ecto.Enum` in the app and a `CHECK` constraint in the
+migration, so anything else writing to the database is rejected too. Never a native Postgres `ENUM`:
+SQLite has no equivalent and altering one is a migration hazard with no payoff. The enumerated columns
+are `sources.kind`, `pages.status`, `pages.text_origin`, `pages.image_store`, `words.suspended_reason`,
+`encounters.crop_store`, `dict_cache_entries.kind`, plus the integers `word_states.state` and
+`review_events.grade`.
+
+**`dict_cache_entries` has no TTL and no refresh schedule.** JMdict is immutable between releases, so an
+entry keyed by `dict_version` is either current or superseded wholesale — never stale. Refresh happens
+one way: `jp-dict-api` reports a new `dict_version`, and the app re-fetches lazily on miss. A nightly job
+re-downloading identical bytes would be pure waste. The only scheduled work worth having is a *check* for a new JMdict release, which flips a version
+string and nothing else. That check is admin-configurable: on/off, and its interval (default weekly).
 
 ---
 
@@ -474,222 +590,140 @@ later option (§12), not a v1 dependency.
 Contract: per token — surface form, lemma, reading in hiragana, POS. Output must be deterministic for
 identical input, so it is cacheable by text hash.
 
+**Measured behaviour** (SudachiPy, core dictionary, run against the cases that decide the schema):
+
+| input | surface | lemma | reading | implication |
+|---|---|---|---|---|
+| たべる | たべる | **たべる** | タベル | kana is **not** converted to kanji |
+| 食べた | 食べ | 食べる | タベ | inflection is normalised to the dictionary form |
+| 食べる | 食べる | 食べる | タベル | same reading as たべる, different lemma |
+| いけす | いけす | **いけす** | イケス | kana preserved |
+| 生簀 | 生簀 | 生簀 | イケス | — |
+| はし / 橋 / 箸 | as written | as written | ハシ | homophones stay **three** lexemes |
+
+Four things follow, and each one changes a design decision:
+
+- **Lemmas preserve orthography.** This is what makes deriving kanji from the lemma honest: たべる
+  contributes no 食 because 食 was never on screen. Had the tokenizer normalised kana to kanji, the
+  derivation would credit characters the reader never saw.
+- **Inflection is normalised**, so 食べた, 食べます and 食べる collapse to one lexeme — the whole reason
+  counting works at all.
+- **Readings arrive in katakana** and must be converted to hiragana before they become part of the lexeme
+  identity, or the same word would be minted twice.
+- **A reading does not identify a word.** はし / 橋 / 箸 share ハシ and are three different words, which is
+  why identity is `lemma + reading` rather than reading alone.
+
 ### 7.3 OCR
 
-**Default: classic PP-OCR, end to end.** Three small networks in sequence, all running locally:
+**Decision: classic PP-OCR, end to end** — a detector plus a recogniser, both from PaddleOCR, running as
+a resident local service. With `lang="japan"` PaddleOCR resolves to **PP-OCRv6 `medium` det + rec**.
+CPU only. No credentials, no per-image cost, no network.
 
-1. **Detection (DB — Differentiable Binarization).** A segmentation model emits a shrunk
-   "this-is-text" probability map; threshold it, extract contours, then dilate back (unclip) to recover
-   full line polygons. Output: one quadrilateral per text line, which is exactly what R2.6 and R3.2 need.
-2. **Orientation (optional).** A four-way classifier for upside-down lines. Needed for photographs,
+The three stages:
+
+1. **Detection (DB — Differentiable Binarization).** A segmentation model emits a shrunk "this is text"
+   probability map; threshold it, extract contours, dilate back (unclip) to full line polygons. Output is
+   one quadrilateral per text line — exactly what R2.6 and R3.2 need.
+2. **Orientation (optional).** Four-way classifier for upside-down lines. Needed for photographs,
    skippable for screenshots.
-3. **Recognition.** Each quadrilateral is perspective-warped to an axis-aligned strip, **resized to a
-   fixed height (~48 px)**, and fed to a CRNN/SVTR sequence model, CTC-decoded into characters.
+3. **Recognition.** Each quad is perspective-warped to an axis-aligned strip, **resized to a fixed height
+   (~48 px)**, and fed to a CRNN/SVTR sequence model, CTC-decoded to characters.
 
-Step 3 is the reason this is the default rather than a VL model. **Recognition runs on a crop, upscaled
-to a fixed height, so a low-resolution frame still gives every glyph plenty of pixels.** A VLM does the
-opposite: it consumes the whole image, squeezed into a fixed patch/token budget. That is a structural
-advantage, not a benchmark delta — and it is precisely the failure the sample exposed.
+**Why this shape beats a vision LLM.** Step 3 is the whole argument: recognition sees *one line, upscaled
+to a fixed height*, so a low-resolution frame still gives every glyph plenty of pixels. A VLM consumes
+the whole image squeezed into a fixed patch budget — the opposite. Detection still needs enough
+resolution to *find* line boundaries, but locating a line is far easier than reading a glyph.
 
-Detection still needs enough resolution to *find* line boundaries, but locating a line is far easier
-than reading a glyph.
+**Evidence, one Japanese frame.** 1920×1080, ruby off, ground truth read at 4× zoom:
 
-The VL model is demoted to a **second opinion** for the disagreement check in R1.10, where it is useful
-because its failure modes differ from PP-OCR's.
-
-**Size and runtime.** Mobile detector and recogniser are single-digit to low-tens of megabytes; server
-variants an order of magnitude larger. PaddlePaddle is CUDA-first — ROCm support is not something to
-plan on for a 7800-class card, so **CPU is the realistic path**, and it is adequate: the reference
-wrapper in this repo records that PaddleOCR oversubscribes threads badly (85 CPU-seconds for one page
-on 16 threads, 22 on one), hence its hard cap at 4.
-
-**It runs locally.** Model files are loaded into the Python process. No network, no credentials, no
-per-image cost, after the one-time model download.
-
-**What PP-OCR actually is.** PaddleOCR's classic two-stage pipeline: a **detector** (a DB —
-Differentiable Binarization — model) that finds text-line quads, and a **recogniser** (SVTR-based) that
-reads each cropped line. It is a Python/PaddlePaddle library.
-
-**Evaluated: Chandra OCR 2** (Datalab) — a 4B-parameter model, 90+ languages including Japanese,
-emitting HTML/Markdown/JSON with `data-bbox` per element. Tested on one real TotK dialogue screenshot
-(400×225, ruby enabled), which settles the granularity question and raises a different one.
-
-*Granularity: solved.* It returns **one bbox per text line**, which is exactly what R2.6 and R3.2 need.
-PP-OCR detection would not be required if Chandra were the backend.
-
-*Accuracy: not good enough for a ledger.* As best readable from the sample:
-
-| Chandra output | What is actually there |
-|---|---|
-| ヤンバ | インパ |
-| セップクじゅう | せっかくじゃ |
-| 何方も一緒に海上を走りに行ってみか | 貴方も一緒に地上を飛びに行くが |
-| ちよっく待って | ちょっと待って |
-| 盗み攻撃を受けました | nothing — no such line in the image |
-| 奥にが | 見に行く |
-
-貴方→何方 and 地上→海上 are the worst kind: **plausible real words**, so dictionary validation (P8)
-cannot catch them, and they would enter the ledger silently. One entire line was invented.
-
-*Three findings from that sample:*
-
-- **Ruby is OCR noise.** Furigana sit between text lines and read as stray glyphs — せっかくじゃ came
-  back as katakana セップクじゅう, which looks like the model reading the ruby column. Since the
-  tokenizer supplies readings anyway (§7.2), **ruby should be turned off in-game when photographing**.
-  It helps a human reading raw; it hurts every OCR backend.
-- **Boxes are normalised 0–1000, by contract, because the prompt asks for it.** Values read x≈940,
-  y≈951 on both a 400×225 and a 1920×1080 frame because they are *fractions of the frame*, not pixels.
-  This is a good backend contract — resolution-independent and identical across providers. Convert with
-  `x_px = x × width / 1000`, `y_px = y × height / 1000`, and assert the range on ingest.
-- **4B wants a GPU.** PaddleOCR-VL (0.9B) runs acceptably on CPU; 4B does not. Fine on a 16 GB card,
-  a barrier for anyone else installing the app.
-
-**Do not choose the default from one sample.** Run PaddleOCR-VL and Chandra over the same batch of ~10
-real screenshots and count errors, weighting plausible-substitution errors as worse than garbage.
-
-**Input requirements — these bind every backend, and matter more than model choice.**
-
-Measured on the sample above, plus a second run with a 2B vision model on the same file:
-
-| Backend | Result |
-|---|---|
-| Chandra OCR 2 (4B) | structure right, ~6 line-level errors, 1 invented line |
-| LFM-3 2B VL | fabricated menu labels that do not exist, invented a dialogue line |
-
-Both models independently produced **the same wrong token** for せっかくじゃ (セップクじゅう / セツクじゅう).
-When two unrelated models converge on the same error, the fault is in the **input**, not the model: the
-pixels do not resolve the glyphs. That is the resolution-and-ruby problem, and no amount of model
-upgrade fixes it.
-
-**Re-run at 1920×1080 (different screenshot, same game).** Both backends improved dramatically:
-
-| Text | Chandra 4B | LFM 2B |
-|---|---|---|
-| 冷たいな！？ (dialogue) | ✅ | ✅ |
-| A はなす (button prompt) | ✅ | ✅ |
-| AM 10:50 (clock) | ✅ | ✅ |
-| 0101 / 0008 (minimap numerals) | ❌ missed | ✅ |
-| ドーネイ (speaker name) | ❌ ドーンイ | ❌ ドーンイ |
-
-Two conclusions, one of which reverses an earlier claim:
-
-1. **Resolution was the dominant variable, not model size.** At 400×225 both produced garbage; at
-   1920×1080 both got the dialogue, the prompt, and the clock right. The earlier conclusion that a 2B
-   model is categorically too weak does not survive this sample — it caught *more* than the 4B here.
-   Do not select a backend on parameter count.
-2. **Minimal-pair confusions survive resolution.** ネ read as ン in both models, at full resolution.
-   Those two kana differ by a couple of internal strokes at UI font sizes, so no resolution gain
-   separates them. This is the same class as 未/末 and 待/持 — and it is exactly what the confirmation
-   flag (R2.8) exists for. Better input fixes systematic errors; only human confirmation fixes
-   minimal-pair errors.
-
-**Expect format drift.** Both models ignored `data-label="Text"` and repeated the text in the label, and
-Chandra emitted malformed attributes (`data-bbox="[641,311,695,334]` — array brackets, no closing
-quote). Treat the output as untrusted: parse leniently, coerce types, validate ranges, and reject a
-block rather than accepting a corrupt one.
-
-**How much text is actually there.** A full 1920×1080 game frame yielded 4–6 text blocks; the rest of
-the HUD is icons. Chrome contamination is therefore smaller than feared — but minimap numerals are real
-chrome text, and they are dropped downstream as non-content tokens.
-
-Rules that follow:
-
-1. **Never downscale before OCR.** Send the native capture. The bounding-box extents in the sample are
-   consistent with a ~1691×951 native frame; a 400×225 thumbnail is roughly **18× fewer pixels**. This
-   is the single largest accuracy lever available, larger than the choice of model.
-2. **Crop to the text region** — the dialogue box, not the whole frame — so each glyph occupies more
-   pixels. Cheaper than any model upgrade.
-3. **Turn ruby off in-game** (D22). Furigana sit between lines and read as stray glyphs.
-4. **Never assume source-pixel coordinates** for returned boxes (above).
-
-**Measured: three backends, one Japanese frame.** 1920×1080 TotK screenshot, ruby off, ground truth
-read at 4× zoom.
-
-| Text | Truth | Chandra 4B | LFM-3 2B | PP-OCRv4-japan |
+| Text | Truth | Chandra 4B | LFM-3 2B | PP-OCRv6-japan |
 |---|---|---|---|---|
 | speaker | ドーネイ | ドーンイ ❌ | ドーンイ ❌ | ドーネイ ✅ (0.99) |
 | dialogue | 冷たいな！？ | ✅ | ✅ | ✅ |
-| prompt | A はなす | ✅ | ✅ | はなす ✅ (missed the A glyph) |
+| prompt | A はなす | ✅ | ✅ | はなす ✅ (missed the `A`) |
 | button glyph | B | ❌ | ❌ | B ✅ |
 | minimap | 0101 / 0008 | ❌ ❌ | ~ ✅ | ✅ ✅ (1.00) |
-| noise | — | invented a line | fabricated menu labels | one spurious "-" |
+| noise | — | invented a line | fabricated menu labels | one spurious `-` |
 
 PP-OCR won every disagreement, including the ネ/ン minimal pair both VLMs missed at full resolution.
-The fixed-height-crop argument holds empirically, not just theoretically.
 
-**Measured on 18 Japanese screenshots** (Nintendo JP guide + IGN Japan, 1280×720 to 1920×1080),
-CPU only, 2 threads:
+**Evidence, 18 Japanese screenshots** (Nintendo JP guide + IGN Japan, 1280×720–1920×1080), CPU, 2 threads:
 
 | Backend | Character errors | Speed |
 |---|---|---|
-| **PaddleOCR** — PP-OCRv6 `medium` det+rec, `lang=japan` | **~0** | ~7.6 s/image |
+| **PaddleOCR** — PP-OCRv6 `medium`, `lang=japan` | **~0** | ~7.6 s/image |
 | RapidOCR — `japan_PP-OCRv4_rec_mobile` on ONNXRuntime | ~7 per text-heavy screen (~6% CER) | ~0.7 s/image |
 
-On one verified frame RapidOCR misread マップ→マツプ, アルバム→アルパム, チャレンジ→チャレソジ,
-だった→だつた, ブルアパッド→プルアパツド, いると→しいると, 選ぶ→選ぷ. PaddleOCR read all seven
-correctly. Ten times slower, and correct — the right trade for a few pages a day.
+One verified frame, RapidOCR: マップ→マツプ, アルバム→アルパム, チャレンジ→チャレソジ, だった→だつた,
+ブルアパッド→プルアパツド, いると→しいると, 選ぶ→選ぷ. PaddleOCR read all seven correctly. Ten times
+slower and correct is the right trade for a few pages a day.
 
-Its error classes, both now measurable, are the ones the confirmation flag exists for:
+**Two failure classes, and only one is fixable by better input.**
 
-- **Voicing and small-kana collapse** — ッ→ツ, っ→つ, ブ→プ, ぶ→ぷ. Mostly caught downstream because
-  the misread word does not exist in the dictionary (P8).
-- **Convergent item names** — both backends read ブルアパッド as プルアパッド. Real glyph ambiguity,
-  immune to model choice, caught only by confirmation (R2.8).
+- **Systematic** — voicing and small-kana collapse (ッ→ツ, っ→つ, ブ→プ, ぶ→ぷ). Mostly harmless, because
+  the misread word does not exist in the dictionary and P8 drops it.
+- **Convergent minimal pairs** — both backends read ブルアパッド as プルアパッド; both VLMs read ネ as ン.
+  Real glyph ambiguity, immune to model choice and to resolution. Only human confirmation (R2.8) catches
+  these.
 
-**Runtime findings that constrain deployment:**
+**Language match beats model size.** The Japanese recogniser run over an English screenshot set produced
+lookalike errors — power→Dower, ravaged→Favaged, research→Yesearch — while the English recogniser read
+the same lines correctly. The recogniser's character set must match the material.
 
-- **Paddle 3.x + oneDNN fails on every image** with `(Unimplemented)
-  ConvertPirAttribute2RuntimeAttribute …`. Both `enable_mkldnn=False` **and**
-  `FLAGS_enable_pir_api=0` are required. Miss either and every image errors out.
-- **PaddlePaddle's CPU wheel needs AVX.** It SIGILLs on a vCPU without it — observed here on
-  `QEMU Virtual CPU version 2.5+`, exit 132. RAM is irrelevant; only an AVX-capable vCPU fixes it.
-  The host now runs with CPU type `host` (Ryzen 5 8600G, AVX-512).
-- **`lang="japan"` resolves to PP-OCRv6 `medium` det+rec** in PaddleOCR proper. RapidOCR's registry
-  has only `japan_PP-OCRv4_rec_mobile`, which is measurably worse. The two are not the same model.
+**Runtime constraints — every one of these cost a debugging session.**
+
+- **PaddlePaddle's CPU wheel requires AVX.** Without it the import dies with SIGILL (exit 132). More RAM
+  does not help; only an AVX-capable vCPU does.
+- **Paddle 3.x + oneDNN fails on every image** with `(Unimplemented) ConvertPirAttribute2RuntimeAttribute`.
+  Both `enable_mkldnn=False` **and** `FLAGS_enable_pir_api=0` are required; miss either and nothing works.
+- **`lang="japan"` resolves to PP-OCRv6 `medium`.** RapidOCR's model registry only has
+  `japan_PP-OCRv4_rec_mobile`, which is measurably worse — the two runtimes are not shipping the same model.
+- **No ROCm.** PaddlePaddle is CUDA-first, so CPU is the realistic path on AMD. It is adequate: the
+  reference wrapper in this repo measured PaddleOCR oversubscribing threads badly (85 CPU-seconds for one
+  page on 16 threads, 22 on one), hence its cap at 4.
 - **Box format differs by runtime:** PaddleOCR returns flat `[x1,y1,x2,y2]`, RapidOCR returns N×2
   polygons. Normalise for both.
-- Ruby fragments are transcribed as their own lines by both — the empirical basis for D22.
+- **Boxes are normalised 0–1000**, because the backend contract says so. They are fractions of the frame,
+  identical on a 400×225 and a 1920×1080 image. Convert with `x_px = x × width / 1000` and assert the
+  range on ingest.
+- **Expect format drift.** Providers ignore the requested labels and emit malformed attributes. Parse
+  leniently, coerce, validate ranges, reject a corrupt block rather than accept it.
 
-**Language match beats model size.** Running the Japanese recogniser over an English screenshot set
-produced lookalike errors — power→Dower, ravaged→Favaged, research→Yesearch, Invert→Thvert — while the
-English recogniser read the same lines correctly. The failure surface is the same minimal-pair class as
-ネ/ン, so the rule generalises: **the recogniser's character set must match the material.**
+**Input requirements — these bind every backend and outweigh model choice.**
 
-**OCR is a long-lived service, not a per-image CLI.** The models are the expensive part: loading
-PP-OCRv6 medium takes seconds, and a per-image subprocess would pay that on every page. The 18-image
-batch above took 137 s *with a single model load* — per-image invocation would multiply that.
+1. **Never downscale before OCR.** Send the native capture. A 400×225 thumbnail against a 1920×1080
+   original is ~18× fewer pixels, and it was the single largest accuracy lever measured.
+2. **Crop to the text region** — the dialogue box, not the whole frame — so each glyph occupies more
+   pixels. Cheaper than any model upgrade.
+3. **Turn ruby off in-game** (D22). Furigana sit between lines and read as stray glyphs, and the
+   tokenizer supplies readings anyway (§7.2).
 
-So `ashiato-ocr` is a small resident process: load once at boot, then answer requests with
-`{"lines": [{"bbox": [x1,y1,x2,y2], "text": "...", "score": 0.98}]}` in the normalised 0–1000 contract.
+**Service shape.** `ashiato-ocr` is a **resident** process, not a per-image CLI: loading PP-OCRv6 medium
+costs seconds, and the 18-image batch took 137 s *with a single model load*. Load once at boot, then
+answer requests with `{"lines": [{"bbox": [x1,y1,x2,y2], "text": "...", "score": 0.98}]}` in the
+normalised 0–1000 contract.
 
-**Transport: a Unix domain socket, not HTTP.** Not for speed — a socket round trip is sub-millisecond
-against a 7.6-second OCR call, so the transport choice is irrelevant to performance. It is chosen
-because it is *simpler*: no port to publish, no bind address, no auth, nothing reachable from off the
-host, and Erlang has first-class support for it — `:gen_tcp.connect({:local, path}, 0, [:binary, packet: 4])`.
-Framing is a 4-byte big-endian length prefix on both sides; JSON is one compact object per frame.
+**Transport is a Unix domain socket, not HTTP** — not for speed (a socket round trip is sub-millisecond
+against a 7.6 s call) but for simplicity: no published port, no bind address, no auth, nothing reachable
+off-host. Erlang has first-class support: `:gen_tcp.connect({:local, path}, 0, [:binary, packet: 4])`,
+with a 4-byte big-endian length prefix and one compact JSON object per frame.
 
-**Requests carry a path, not image bytes.** The containers share a volume for uploaded images, so the
-request is `{"op":"ocr","path":"/var/ashiato/pages/abc.png"}`. Base64 over a socket would inflate every
-image by a third and hold it in memory twice.
+**Requests carry a locator, never image bytes.** With the `local` image store the request carries the
+shared-volume path; with `s3` the app presigns a GET and sends the URL. Base64 over the socket would
+inflate every image by a third and hold it in memory twice.
 
-**Deployment shape: pod `ashiato`, exactly two containers** — `ashiato-web` (Phoenix) and
-`ashiato-ocr` (resident PaddleOCR) — sharing a volume for the Unix socket and one for page images.
+**Deployment: pod `ashiato`, exactly two containers** — `ashiato-web` (Phoenix) and `ashiato-ocr`
+(resident PaddleOCR) — sharing a volume for the socket and one for page images. The dictionary service is
+**outside** the pod: it is shared, versioned, and has its own release cadence.
 
-**The dictionary service is deliberately outside the pod.** It is a shared, versioned data service:
-different release cadence, different data volume, and eventually possibly a different host (it exists so
-that installs share one copy of JMdict rather than rebuilding it). The web container reaches it over
-HTTP. Co-locating it would couple two things that have no reason to share a lifecycle.
+A pod shares network, pid and ipc namespaces, so the two sit together with no published port while each
+keeps **its own cgroup and restart policy**. That is the point: this OCR path crashed twice during
+development (SIGILL without AVX, then the oneDNN PIR failure), and an OCR OOM must not take the review UI
+with it.
 
-A pod shares network, pid and ipc namespaces, so web and OCR sit together with no published port, while
-each keeps **its own cgroup and restart policy**. That distinction is the whole point: OCR crashed twice
-during development (SIGILL on a non-AVX vCPU, then the oneDNN PIR failure), and an OCR OOM must not
-take the review UI with it. A single container running both would work, at the cost of a shared cgroup
-and a ~3–4 GB image where every Elixir change rebuilds behind the Python layer.
-
-**Deployment mechanism: Quadlet.** `.pod` and `.container` unit files in
-`~/.config/containers/systemd/`, which systemd materialises into user units on `daemon-reload`. Quadlet
-5.4.2 ships inside the `podman` package on this host already — the generator is
-`/usr/lib/systemd/system-generators/podman-system-generator`. No extra package is needed.
+**Deployment mechanism: Quadlet** — `.pod` and `.container` units in `~/.config/containers/systemd/`,
+materialised into systemd user units on `daemon-reload`. Quadlet ships inside the `podman` package here
+(`/usr/lib/systemd/system-generators/podman-system-generator`); no extra package.
 
 ```text
 ~/.config/containers/systemd/
@@ -698,28 +732,31 @@ and a ~3–4 GB image where every Elixir change rebuilds behind the Python layer
 └── ashiato-ocr.container       Pod=ashiato.pod  Volume=ashiato-run:/run/ashiato
 ```
 
-`jp-dict-api` gets its own unit, on its own schedule, wherever it ends up living.
+**Accuracy is measured by a fixture corpus**, not by retained production output: a small set of
+screenshots with hand-checked transcriptions lives with the tests and every backend change runs against
+it. That is why no `ocr_raw` column exists — a fixture has ground truth, and retaining per-page output
+would store the same bytes twice on pages nobody corrected.
 
-**No OCR backend is available for Elixir**, and no binding exists for any of them. For this app it is therefore a **service or
-a Port**, never an in-process call — exactly like the dictionary. The good news: this repository
-already contains a working wrapper in `reference/python-jp-reader/core/ocr.py`, which returns
-`rec_boxes` per line. That is the detector half this design needs; it can be lifted rather than
-rewritten.
+**Optional second backend (R1.10).** Any OpenAI-compatible vision endpoint can serve as a second opinion;
+where the two backends agree the tokens are auto-accepted, and only disagreements require confirmation.
+Hygiene for that path: strict transcription prompt, temperature 0, no commentary, every token
+dictionary-validated (P8), crops retained. Agreement is a *confidence* signal, never a correctness one —
+see the convergent-error class above.
 
-Alternative: an OpenAI-compatible vision endpoint, on the optional AI path. Hygiene rules apply to
-either recognition backend:
-
-- strict transcription prompt, temperature 0, no commentary
-- raw output stored separately from accepted text; never overwritten
-- every token dictionary-validated (P8)
-- crops retained as the audit trail
+**There is no OCR backend for Elixir**, and no binding for any of them, so this is a service rather than
+an in-process call. This repository already contains a working PaddleOCR wrapper at
+`reference/python-jp-reader/core/ocr.py` returning `rec_boxes` per line — the detector half can be lifted
+rather than rewritten.
 
 ### 7.4 Ingest pipeline
 
 The state a page moves through, in order. Stages after (5) run as background work and publish progress,
 so the UI fills in as results arrive rather than blocking on the slowest step.
 
-1. **Upload** — one or more images; each becomes a page record in `uploaded`
+1. **Upload** — images, or PDFs. An image becomes one page record in `uploaded`. A PDF becomes one
+   `documents` row plus one `pages` row per PDF page, sharing `document_id` and carrying `page_index`.
+   If the PDF has a **text layer** the text is extracted directly, `text_origin = embedded`, and stages
+   3–4 are skipped: no OCR, no character error. Only image-only PDFs are rasterised (200 DPI).
 2. **Preprocess** — rotation and perspective correction, as needed
 3. **Detect** — PP-OCR detector returns line quads; each line becomes a crop (R2.6)
 4. **Recognise** — PP-OCR recogniser (default), per line crop; a VL model may run as a second
@@ -740,6 +777,87 @@ so the UI fills in as results arrive rather than blocking on the slowest step.
 Failure at any stage leaves the page in a failed state with the last good artifacts retained, and does
 not roll back encounters already recorded.
 
+**This pipeline follows `reference/python-jp-reader` deliberately.** That module already solved the
+shape; its choices are worth copying rather than rediscovering:
+
+- **Decode hygiene**: EXIF transpose, an 80-megapixel decompression-bomb cap, JPEG/PNG/WebP only, and a
+  single normalised stored image that is *exactly* what OCR saw, so reported boxes line up with what the
+  browser shows. One deviation: it downscales to `max_dim` first. We must not downscale text below
+  legibility — set the cap high (≈3000 px long edge) instead of reusing a thumbnail size.
+- **A monotonic `revision` per page.** A correction or re-photograph bumps it; a job that finishes late
+  compares revisions and discards its own result rather than overwriting newer work.
+- **Translation is its own job, after OCR.** Text is readable while translation runs, and a failed
+  translation never loses the OCR result. Note what this means for us specifically: in `jp-reader`,
+  tokenization is *not* a pipeline stage at all — it is computed on demand to render furigana for a
+  phrase. In Ashiato it is a stage, because encounters are recorded from tokens. But tokenization and
+  translation are **siblings, not a chain**: both depend only on `accepted_text`, so they run
+  concurrently and neither waits for the other. Only OCR is a hard predecessor.
+- **Translation cached by `(lang, text)`**, each line translated separately so it can be **painted over
+  the line** on the page image. That overlay is the real reading aid (R1.11).
+- **Furigana comes from the tokenizer**, never read off the image.
+- **Per-line progress events**, published as each stage and each line completes.
+
+### 7.5 Translation — a provider behaviour
+
+Translation is one HTTP call, so it lives **in the Elixir app** using `Req`, not in a Python service.
+There is no local model to host and no reason to pay for a boundary. Results are cached per line by
+`(lang, line)` in the app's own database.
+
+`jp-reader`'s chain is not the model to copy. It calls Google through `deep_translator`, which uses the
+*free web endpoint* — no API key, which is exactly why it gets refused and why that module needs a
+MyMemory fallback, a chunker for MyMemory's 500-character cap, and a 300-second circuit breaker. Fine
+for a personal toy; a poor foundation for something shipped.
+
+| Provider | Credentials | Japanese quality | Notes |
+|---|---|---|---|
+| `google_free` | **None** | Good | **Default.** The undocumented web endpoint the free widget uses. Works with zero setup, which is why it wins as a default |
+| `llm` | OpenAI-compatible key or a local server | Best with page context | The only provider that can use surrounding lines, speaker, and register |
+| `deepl` | DeepL API key (free tier exists) | Strongest on prose | Weakest on slang and casual game dialogue |
+| `google_cloud` | Cloud Translation key (paid) | Same engine, supported contract | The official API — use this if you need reliability you can depend on |
+| `libretranslate` | None; self-hosted URL | Weakest | Fully offline. Japanese is supported (ja↔en Argos models, ~112 MB) but it is a small NMT model |
+| `off` | — | — | Disables translation entirely |
+
+**Default provider is `google_free`**, because it is the only one that works on a fresh install with no
+key, no URL, and no local server — and at single-user volume (a few hundred short lines a day) the free
+endpoint is nowhere near its rate limits.
+
+Three caveats that are not optional to state:
+
+- **It is undocumented and outside Google's terms.** No key, no contract, no warning if it changes. It is
+  the right default for a personal install and the wrong foundation for anything with users who depend on
+  it — that is what `google_cloud` is for.
+- **It can start refusing without notice.** The circuit breaker (§7.5, borrowed from `jp-reader`) is not
+  decorative: a refused provider is skipped for a cool-down rather than retried per request, and an
+  unconfigured fallback means translation silently degrades to "unavailable" instead of failing a page.
+- **It sends your text to Google.** Game screenshots carry dialogue, and dialogue is personal. That is why
+  the `translation_enabled` switch is **off by default** even though the provider is configured: nothing
+  leaves the machine until you ask for it.
+
+**Every provider is equally available and the user picks.** `google_free` is only the *initial* value, so a
+fresh install has something working; it is not privileged. Selection, the enable switch, and each
+provider's credentials are all editable in the app's Settings screen, and each provider shows whether it
+is ready — "needs an API key", "needs a URL", "ready" — so a misconfiguration is visible before a page
+fails.
+
+Credentials entered in the UI are stored in `settings` with `secret = true`, encrypted at rest using a key
+derived from `SECRET_KEY_BASE`, and never written to logs or error reports. Environment variables still
+work as defaults for the same values, which keeps unattended container deploys possible without touching
+the UI.
+
+There is no `deep_translator` in Elixir, so `google_free` is a thin client of our own — the
+`translate_a/single` endpoint, unwrapping a nested JSON array into plain strings. It returns
+line-aligned text for input separated by newlines, so the page-batch contract (D44) works without the
+JSON-array trick that only an LLM needs.
+
+Capability, computed at boot alongside the AI gate:
+
+```
+translate_capable = translation_enabled AND provider_configured(translation_provider)
+```
+
+Where `provider_configured` means the key or URL that provider needs is present. No `translation_enabled`
+switch means no translate affordance anywhere in the UI — hidden, not failing.
+
 ---
 
 ## 8. Configuration
@@ -747,7 +865,14 @@ not roll back encounters already recorded.
 | Setting | Default | Purpose |
 |---|---|---|
 | `ai_features_enabled` | **false** | The switch for Epic 7. Not implied by credentials |
-| `OPENAI_BASE_URL` / `OPENAI_API_KEY` | unset | Credentials; required for AI features to work once enabled |
+| `ai_features_enabled` | `false` | The switch for mnemonics and example sentences. Does not imply credentials exist |
+| `translation_enabled` | `false` | UI-editable. Off by default so nothing is sent off-host until opted in |
+| `translation_provider` | `google_free` | UI-editable. `google_free`, `llm`, `deepl`, `google_cloud`, `libretranslate`, `off` |
+| `deepl_api_key` | unset | Only read for the `deepl` provider |
+| `google_translate_api_key` | unset | Only read for the `google` provider |
+| `libretranslate_url` | unset | Only read for the `libretranslate` provider; the key is optional (self-hosted) |
+| `OPENAI_BASE_URL` | `https://api.openai.com/v1` | Any OpenAI-compatible endpoint: llama.cpp, vLLM, proxy |
+| `OPENAI_API_KEY` | unset | Credentials only. No default; empty means AI features are unavailable |
 | `JP_DICT_API_URL` | — | Dictionary service |
 | `tokenizer_provider` | `http` | `http` or `sudachi_nif` |
 | `ocr_provider` | `paddleocr_vl` | OCR recognition backend |
@@ -761,6 +886,12 @@ not roll back encounters already recorded.
 | Frequency cap — second band | 120 days | R3.5 |
 | Chrome page-ratio | 0.5 | Chrome flagging (§6.5) |
 | Page image TTL | 30 days | R2.6 |
+| Image store | `local` | `local` or `s3` |
+| Image format | `jpeg` | Admin-configurable: `jpeg`, `webp`, `png`, `jxl` |
+| Image quality | 90 | Admin-configurable; ignored by lossless formats |
+| S3 endpoint / bucket / keys | unset | Read only when the image store is `s3` |
+| JMdict release check | weekly | Admin-configurable on/off and interval |
+| PDF raster DPI | 200 | Image-only PDFs; text layers are extracted instead |
 
 ---
 
@@ -769,6 +900,10 @@ not roll back encounters already recorded.
 - **OCR and translation run as background jobs**, not request-blocking. A page moves through
   states (uploaded → OCR → tokens recorded → enriched → translated) with progress published so the
   UI updates as each stage and each line completes.
+- **Every index and constraint carries a comment in the migration** saying what it is for. A unique
+  index is an assertion about the domain, and six months later nobody can tell
+  `(user_id, word_id, text_hash)` from `(user_id, text_hash)` without one. The intent for each index is
+  recorded on the tables in `docs/diagrams/erd.dbml`.
 - **Database:** SQLite in development, Postgres in production. Migrations must run unchanged on both.
   Achieved by choosing the intersection type set, not the idiomatic per-dialect one: UUID primary keys
   generated client-side, `utc_datetime` timestamps, no `ALTER COLUMN TYPE`, no `ILIKE`, no full-text
@@ -793,6 +928,11 @@ not roll back encounters already recorded.
 | D9 | Kanji discrimination = minimal pairs | Masked-glyph production card | Masking tests production; the reading, not vision, would disambiguate |
 | D10 | Import as known baseline | Import SRS intervals | Foreign intervals and local FSRS parameters do not merge |
 | D11 | `OPENAI_BASE_URL` | `OPENAI_API_BASE_URL` | Conventional name; SDKs and proxies expect it |
+| D43 | AI capability = switch **and** non-empty key; base URL defaults to OpenAI | Treat the env vars as the switch | OCR no longer needs those credentials, so they are genuinely optional; an empty key must disable the feature rather than fail at call time |
+| D44 | Translate the page in one request, asking for a JSON array; fall back to per-line | Per-line only, or jp-reader's numbered-prose batching | A sentence split across two OCR lines only translates correctly when the model sees the page; JSON survives round-trip far better than "1. 2. 3." prose |
+| D45 | Translation is a provider behaviour, defaulting to `google_free` | Ship `off`, or default to a paid engine | It is the only provider that works on a fresh install with no key and no server; at single-user volume the rate limits are irrelevant. `translation_enabled` stays off so nothing leaves the host until asked |
+| D46 | Translation lives in the Elixir app, not a Python service | Add it to the NLP service | It is one HTTP call with no local model, and the cache belongs in the ledger's database |
+| D47 | Settings are a per-user key-value table; secrets encrypted with a key from `SECRET_KEY_BASE` | A column per setting, or credentials in env only | The schema is still moving and a settings UI would otherwise cost a migration per toggle; typed access stops the looseness at one boundary |
 | D12 | Tokenizer is an HTTP endpoint on the dictionary service | Sudachi NIF via Rustler | Elixir tokenizer packages are dead (2018) or v0.2.0; one call per page makes the hop irrelevant |
 | D13 | AI gated by an application setting | Gating on env vars | Env vars are credentials; a credential is not a preference |
 | D14 | Classic PP-OCR end to end as default; VL model only as a second opinion | VLM-only OCR | PP-OCR recognises per line crop at fixed height, which survives low-res frames; VLMs squeeze the whole image |
@@ -809,6 +949,20 @@ not roll back encounters already recorded.
 | D25 | PaddleOCR (PP-OCRv6 medium) as default; RapidOCR as the AVX-less fallback | One runtime only | PaddleOCR was ~0 errors vs ~6% CER for RapidOCR's v4-mobile model — 10× slower and correct |
 | D27 | `enable_mkldnn=False` + `FLAGS_enable_pir_api=0` | Paddle defaults | Paddle 3.x oneDNN fails every image with a PIR attribute error otherwise |
 | D28 | All NLP/vision in Python services; the app stays Elixir | Python monolith | OCR and tokenization are Python-only, so a Python process exists either way; a monolith would also cost LiveView, Ecto and OTP supervision |
+| D29 | Images in S3-compatible storage behind one behaviour | Filesystem paths | The app and the OCR service must not assume they share a filesystem |
+| D30 | PDFs accepted; text layer extracted, else rasterised at 200 DPI | Images only | Text-layer PDFs skip OCR entirely and carry zero character error |
+| D31 | Chrome flag requires the ratio in *every* source | Flag on the first source that trips it | A HUD word in one game must not suppress real vocabulary met elsewhere |
+| D32 | Suspension records a reason | A bare boolean | Chrome, manual, leech and mastered must be reversible independently |
+| D33 | Enums are strings, validated in app and by CHECK | Postgres native enums | SQLite has no equivalent; native enum migrations are a hazard |
+| D34 | `dict_cache_entries` is version-keyed, no TTL | Time-based refresh | JMdict is immutable between releases |
+| D35 | Adopt `jp-reader`'s pipeline shape | Design it again | It already solved ordering, staleness and failure isolation |
+| D36 | Kanji membership is derived from `lemma`; no `kanji` and no `kanji_lexemes` table | Dimension table, or a glyph-carrying join table | The relation is a projection of data already stored; deriving it cannot drift, costs nothing, and credits only characters actually seen |
+| D37 | Tokenization and translation run concurrently after OCR | Tokenize then translate as a chain | Both depend only on `accepted_text`; serialising them adds latency for nothing |
+| D38 | Image format and quality are admin settings | Hard-coded encoder | Operators have opinions about storage cost and fidelity, and neither choice affects correctness |
+| D39 | Drop the "re-OCR with another model" requirement | Keep it | Single-user app; making it useful would have required a separate OCR-runs table, and nobody would use it |
+| D40 | Review cards rotate through their occurrences by `reps` | Always the first crop, or random | Rotation eventually shows every context; keying on `reps` keeps any given card reproducible |
+| D41 | `int` primary keys everywhere | UUIDs, or `bigint` | UUIDs serve row-merging, which this does not do; the 2.1 B ceiling is 300× beyond a heavy decade, and `int`→`bigint` is one ALTER |
+| D42 | No `ocr_raw` column | Keep model output for audit | A fixture corpus with ground truth measures OCR accuracy better; retaining per-page output stores the same bytes twice on pages nobody corrected |
 | D26 | Recogniser language must match the material | One recogniser for everything | A mismatched character set produces confident lookalike errors (power→Dower) |
 
 ---

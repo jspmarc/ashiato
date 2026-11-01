@@ -76,6 +76,7 @@ custom classes must fully style the input
       assert_receive {:DOWN, ^ref, :process, ^pid, :normal}
 
    - Instead of sleeping to synchronize before the next call, **always** use `_ = :sys.get_state/1` to ensure the process has handled prior messages
+- Only add unit tests for public functions and methods, unless instructed otherwise.
 <!-- phoenix:elixir-end -->
 
 <!-- phoenix:phoenix-start -->

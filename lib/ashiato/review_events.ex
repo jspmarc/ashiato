@@ -13,6 +13,8 @@ defmodule Ashiato.ReviewEvents do
 
   use Ecto.Schema
 
+  import Ecto.Changeset
+
   schema "review_events" do
     belongs_to :user, Ashiato.Users
     belongs_to :word, Ashiato.Words
@@ -24,5 +26,36 @@ defmodule Ashiato.ReviewEvents do
     field :stability_after, :float
     field :difficulty_after, :float
     field :interval_after, :integer
+  end
+
+  @doc """
+  Changeset for inserting a review event.
+
+  `user_id` and `word_id` are set programmatically by the ledger, never cast.
+  All review log fields are required. Two declarations, one constraint (the
+  house pattern from `Encounters.changeset/2`): `validate_number/3` rejects
+  an out-of-range grade before the database does, and the
+  `review_events_grade_valid` CHECK is declared so anything that slips past
+  still arrives as `{:error, changeset}` instead of a raise.
+  """
+  def changeset(event, attrs) do
+    event
+    |> cast(attrs, [
+      :grade,
+      :reviewed_at,
+      :stability_after,
+      :difficulty_after,
+      :interval_after
+    ])
+    |> validate_required([
+      :grade,
+      :reviewed_at,
+      :stability_after,
+      :difficulty_after,
+      :interval_after
+    ])
+    |> validate_number(:grade, greater_than: 0, less_than: 5)
+    |> validate_number(:interval_after, greater_than_or_equal_to: 0)
+    |> check_constraint(:grade, name: :review_events_grade_valid)
   end
 end

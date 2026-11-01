@@ -15,6 +15,10 @@ defmodule Ashiato.Ledger do
   alias Ashiato.Lexemes
   alias Ashiato.Pages
   alias Ashiato.Repo
+  alias Ashiato.ReviewEvents
+  alias Ashiato.Srs
+  alias Ashiato.WordStates
+  alias Ashiato.Words
 
   @doc """
   Finds the lexeme matching `(lemma, reading, part_of_speech)` or creates it.
@@ -101,6 +105,158 @@ defmodule Ashiato.Ledger do
           nil -> {:error, changeset}
         end
     end
+  end
+
+  @doc """
+  Grades one review of a word and advances its scheduling state (§6.4).
+
+  FSRS computes from grades alone (§6.4); the §6.6 occurrence bands only cap
+  how far the interval may stretch. So the split is: `Ashiato.Srs.grade/3`
+  produces the next state and the *uncapped* FSRS interval, and this function
+  applies `Ashiato.Srs.final_interval/2` — the cap derived from the word's
+  confirmed, non-discarded encounters — before writing anything.
+
+  Everything happens in one `Repo` transaction:
+
+    1. the `Words` row is fetched for `user_id` (error if missing)
+    2. the current `WordStates` is fetched; an absent row just means *new*
+       (state 0) — the state is rebuildable from the log, per §6.8
+    3. the review is appended to `review_events` (append-only; the log is the
+       source of truth)
+    4. `word_states` is upserted from it — a mere materialisation
+
+  `user_id` is set programmatically, never cast (AGENTS Ecto house rule).
+
+  Returns `{:ok, %WordStates{}}` (with `due_at` = `now` + the capped
+  interval) or `{:error, changeset}`. `review/2` reviews now; pass `now`
+  explicitly in tests for determinism.
+  """
+  @spec review(integer(), Srs.grade()) :: {:ok, WordStates.t()} | {:error, Ecto.Changeset.t()}
+  def review(word_id, grade), do: review(word_id, grade, DateTime.utc_now())
+
+  @spec review(integer(), Srs.grade(), DateTime.t()) ::
+          {:ok, WordStates.t()} | {:error, Ecto.Changeset.t()}
+  def review(word_id, grade, now) when is_integer(grade) and grade in 1..4 do
+    fn ->
+      do_review(word_id, grade, now)
+    end
+    |> Repo.transaction()
+    |> case do
+      {:ok, {:ok, word_state}} -> {:ok, word_state}
+      {:error, %Ecto.Changeset{} = changeset} -> {:error, changeset}
+    end
+  end
+
+  def review(_word_id, _grade, _now) do
+    {:error,
+     %ReviewEvents{}
+     |> Ecto.Changeset.change()
+     |> Ecto.Changeset.add_error(:grade, "must be an FSRS grade between 1 and 4")}
+  end
+
+  # Runs inside a transaction; returns {:ok, %WordStates{}} or rolls back with
+  # a changeset.
+  defp do_review(word_id, grade, now) do
+    word =
+      Repo.get(Words, word_id) ||
+        Repo.rollback(missing_word_changeset(word_id))
+
+    # a missing row means "new": the state is rebuildable from the log (§6.8)
+    word_state =
+      case Repo.get(WordStates, word_id) do
+        %WordStates{} = existing -> existing
+        nil -> new_word_state(word_id, now)
+      end
+
+    # FSRS computes from the grade alone; the caps are applied below
+    %{state: next, interval_days: fsrs_interval} =
+      Srs.grade(word_state, grade, now)
+
+    {occurrences, _days_seen} = encounter_counts(word.user_id, word_id)
+    final_interval = Srs.final_interval(fsrs_interval, occurrences)
+
+    # word_states columns are second-precision (:utc_datetime); the log row
+    # keeps the full usec `now`
+    second = DateTime.truncate(now, :second)
+    due_at = DateTime.add(second, final_interval, :day)
+
+    with {:ok, _event} <-
+           append_review_event(word.user_id, word_id, grade, now, next, final_interval),
+         {:ok, word_state} <- upsert_word_state(word_id, next, due_at, second) do
+      {:ok, word_state}
+    else
+      {:error, %Ecto.Changeset{} = changeset} -> Repo.rollback(changeset)
+    end
+  end
+
+  # §6.6 counting rules, as in chrome_ratio/2: an occurrence is a *distinct
+  # page*, and unconfirmed or discarded encounters count toward nothing.
+  defp encounter_counts(user_id, word_id) do
+    from(e in Encounters,
+      where: e.user_id == ^user_id and e.word_id == ^word_id,
+      where: e.confirmed and is_nil(e.discarded_at),
+      select: {count(e.page_id, :distinct), count(e.seen_on, :distinct)}
+    )
+    |> Repo.one()
+  end
+
+  # The log is append-only: rows are only ever inserted, never updated or
+  # deleted (§6.8).
+  defp append_review_event(user_id, word_id, grade, now, next, interval_after) do
+    %ReviewEvents{user_id: user_id, word_id: word_id}
+    |> ReviewEvents.changeset(%{
+      grade: grade,
+      reviewed_at: now,
+      stability_after: next.stability,
+      difficulty_after: next.difficulty,
+      interval_after: interval_after
+    })
+    |> Repo.insert()
+  end
+
+  defp upsert_word_state(word_id, next, due_at, last_reviewed_at) do
+    %WordStates{word_id: word_id}
+    |> WordStates.changeset(%{
+      state: next.state,
+      stability: next.stability,
+      difficulty: next.difficulty,
+      reps: next.reps,
+      lapses: next.lapses,
+      due_at: due_at,
+      last_reviewed_at: last_reviewed_at
+    })
+    |> Repo.insert(
+      on_conflict: [
+        set: [
+          state: next.state,
+          stability: next.stability,
+          difficulty: next.difficulty,
+          reps: next.reps,
+          lapses: next.lapses,
+          due_at: due_at,
+          last_reviewed_at: last_reviewed_at
+        ]
+      ],
+      conflict_target: :word_id
+    )
+  end
+
+  defp new_word_state(word_id, now) do
+    %WordStates{
+      word_id: word_id,
+      state: 0,
+      stability: nil,
+      difficulty: nil,
+      reps: 0,
+      lapses: 0,
+      due_at: now
+    }
+  end
+
+  defp missing_word_changeset(word_id) do
+    %WordStates{word_id: word_id}
+    |> Ecto.Changeset.change()
+    |> Ecto.Changeset.add_error(:word_id, "does not exist")
   end
 
   @doc """

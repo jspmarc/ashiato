@@ -9,7 +9,7 @@ defmodule Ashiato.Repo.Migrations.CreateOtherTables do
         comment: "NULL means the catch-all bucket, displayed as 現実世界. Unique only where present."
 
       add :kind, :string, null: false, comment: "game | manga | book | signage | other"
-      add :chapter, :string
+      add :chapter, :string, null: false, default: ""
 
       timestamps(type: :utc_datetime)
     end
@@ -61,7 +61,7 @@ defmodule Ashiato.Repo.Migrations.CreateOtherTables do
           "sweeper deletes the object after this. Line crops are permanent; this is the full page only."
 
       add :text_origin, :string,
-        null: false,
+        null: true,
         comment: "ocr | embedded: PDFs with a text layer skip OCR entirely"
 
       add :accepted_text, :text, comment: "user-corrected text; everything downstream uses this"
@@ -148,9 +148,6 @@ defmodule Ashiato.Repo.Migrations.CreateOtherTables do
 
       add :crop_store, :string, null: false, default: "local"
 
-      add :bbox, :string,
-        comment: "normalised 0-1000 x1 y1 x2 y2, so a crop can be re-cut from the page"
-
       add :seen_on, :date, null: false
 
       add :confirmed, :boolean,
@@ -183,7 +180,7 @@ defmodule Ashiato.Repo.Migrations.CreateOtherTables do
       add :user_id, references(:users, type: :integer, on_delete: :delete_all), null: false
       add :word_id, references(:words, type: :integer, on_delete: :delete_all), null: false
       add :grade, :integer, null: false, comment: "FSRS grade 1..4"
-      add :reviewed_at, :utc_datetime, null: false
+      add :reviewed_at, :utc_datetime_usec, null: false
 
       add :stability_after, :float,
         null: false,

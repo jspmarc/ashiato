@@ -7,6 +7,9 @@
 # General application configuration
 import Config
 
+# NOTE: Might be an issue when we need 8 bytes int, but for a small app, 4 bytes should suffice
+config :ashiato, Ashiato.Repo, migration_primary_key: [type: :serial]
+
 config :ashiato, Oban,
   engine: Oban.Engines.Lite,
   notifier: Oban.Notifiers.PG,

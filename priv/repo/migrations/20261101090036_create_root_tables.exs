@@ -43,7 +43,7 @@ defmodule Ashiato.Repo.Migrations.CreateRootTables do
           "true for API keys: encrypted at rest with a key derived from SECRET_KEY_BASE, never logged"
 
       # updated_at only: key-value rows are overwritten, creation moment is irrelevant
-      timestamps(type: :utc_datetime, created_at: false)
+      timestamps(type: :utc_datetime)
     end
 
     # one row per (user, key): upsert on save, and the read path loads a user's
@@ -62,7 +62,7 @@ defmodule Ashiato.Repo.Migrations.CreateRootTables do
         null: false,
         comment: "JMdict release. No TTL: entries are immutable within a version."
 
-      add :payload, :text, comment: "JSON as TEXT, for dialect portability"
+      add :payload, :map, comment: "JSON as TEXT, for dialect portability"
 
       add :fetched_at, :utc_datetime
     end

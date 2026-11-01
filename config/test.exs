@@ -6,8 +6,9 @@ config :ashiato, Oban, testing: :manual
 # The MIX_TEST_PARTITION environment variable can be used
 # to provide built-in test partitioning in CI environment.
 # Run `mix help test` for more information.
+config :ashiato, :ecto_adapter, Ecto.Adapters.SQLite3
+
 config :ashiato, Ashiato.Repo,
-  adapter: Ecto.Adapters.SQLite3,
   database: Path.expand("../ashiato_test.db", __DIR__),
   pool_size: 5,
   pool: Ecto.Adapters.SQL.Sandbox

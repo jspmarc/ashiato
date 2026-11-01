@@ -1,5 +1,5 @@
 defmodule Ashiato.Repo do
   use Ecto.Repo,
-    adapter: Ecto.Adapters.SQLite3,
-    otp_app: :ashiato
+    otp_app: :ashiato,
+    adapter: Application.compile_env(:ashiato, :ecto_adapter)
 end

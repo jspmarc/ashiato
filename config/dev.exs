@@ -1,8 +1,9 @@
 import Config
 
 # Configure your database
+config :ashiato, :ecto_adapter, Ecto.Adapters.SQLite3
+
 config :ashiato, Ashiato.Repo,
-  adapter: Ecto.Adapters.SQLite3,
   database: Path.expand("../ashiato_dev.db", __DIR__),
   pool_size: 5,
   stacktrace: true,

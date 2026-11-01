@@ -1,14 +1,6 @@
 import Config
 
-db_uri = System.get_env("DATABASE_URI")
-if is_nil(db_uri) do
-  raise "environment variable \"DATABASE_URI\" is missing."
-end
-
-config :ashiato, Ashiato.Repo,
-  adapter: Ecto.Adapters.Postgres,
-  url: db_uri,
-  pool_size: String.to_integer(System.get_env("POOL_SIZE") || "1")
+config :ashiato, :ecto_adapter, Ecto.Adapters.Postgres
 
 # Force using SSL in production. This also sets the "strict-security-transport" header,
 # known as HSTS. If you have a health check endpoint, you may want to exclude it below.

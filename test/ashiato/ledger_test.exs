@@ -166,9 +166,8 @@ defmodule Ashiato.LedgerTest do
     })
   end
 
-  # Page lifecycle: the revision fence (§6.7) and the ingest state machine
-  # (§7.4). The interesting behaviour is concurrency: a stale fenced write is
-  # discarded rather than raising, and a page can only move forward.
+  # The interesting behaviour is concurrency: a stale fenced write is discarded
+  # rather than raising, and pages only move forward.
   describe "page lifecycle and revision fencing" do
     setup do
       user = user_fixture()
@@ -243,12 +242,9 @@ defmodule Ashiato.LedgerTest do
       assert {:ok, page} = Ledger.transition(page, :detecting)
       assert {:ok, page} = Ledger.transition(page, :text_ready)
 
-      # back to an earlier state
       assert {:error, :invalid_transition} = Ledger.transition(page, :uploaded)
-      # a skipped state is not a valid edge either
       assert {:error, :invalid_transition} = Ledger.transition(page, :ready)
 
-      # and once terminal, nothing moves out
       assert {:ok, page} = Ledger.transition(page, :translating)
       assert {:ok, page} = Ledger.transition(page, :ready)
       assert {:error, :invalid_transition} = Ledger.transition(page, :failed)

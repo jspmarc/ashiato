@@ -1,8 +1,8 @@
 defmodule Ashiato.Ledger do
   @moduledoc """
   The ledger: the context layer that owns vocabulary identity and every
-  sighting of it, and that populates `user_id` (§6.2 — no auth yet, so this
-  module is the single place that changes when auth arrives).
+  sighting of it, and that populates `user_id` (no auth yet, so this module is
+  the single place that changes when auth arrives).
 
   Identity is global (`Ashiato.Lexemes`, shared by all users); everything this
   module writes downstream of it is per user, carried explicitly via `user_id`
@@ -16,12 +16,7 @@ defmodule Ashiato.Ledger do
   alias Ashiato.Pages
   alias Ashiato.Repo
 
-  # Forward edges of the ingest pipeline (§7.4):
-  #
-  #     uploaded -> detecting -> text_ready -> translating -> ready
-  #
-  # `:failed` is reachable from every non-terminal state; `:ready` and
-  # `:failed` are terminal, so nothing moves out of them.
+  # Forward edges of the ingest pipeline; `:failed` is reachable from any non-terminal state.
   @forward %{
     uploaded: [:detecting],
     detecting: [:text_ready],
@@ -96,7 +91,6 @@ defmodule Ashiato.Ledger do
           {:ok, Encounters.t()} | {:error, Ecto.Changeset.t()}
   def record_encounter(attrs) do
     attrs = Map.new(attrs)
-    # user_id is set programmatically, never cast (AGENTS Ecto house rule)
     user_id = Map.fetch!(attrs, :user_id)
 
     %Encounters{user_id: user_id}
@@ -120,21 +114,9 @@ defmodule Ashiato.Ledger do
 
   @doc """
   Chrome detection for one source: for each word, the fraction of that source's
-  pages on which the word appears.
-
-  This is a **query, never stored state** — re-run it whenever pages or
-  encounters change, so re-tuning the threshold costs nothing but time (§6.6).
-  It is what decides `words.chrome_like` (§6.5): a word whose ratio clears the
-  configured threshold (default 50%) is *chrome-like in this source*, but the
-  `chrome_like` flag is only ever set when the word is chrome-like in **every**
-  source it appears in — otherwise a HUD word met in one game would suppress
-  real vocabulary read in a manga.
-
-  Counting rules: an occurrence is a *distinct page* (counted once per page,
-  breadth, not raw token count), and unconfirmed or soft-deleted (discarded)
-  encounters count toward nothing (R2.8). The denominator is every page of the
-  source. Returns a map of `word_id => ratio` in 0.0..1.0, empty when the
-  source has no pages yet.
+  pages it appears on. The ratio is a query, never stored state, so it can be
+  recomputed after any change to pages or encounters. An occurrence is a
+  distinct page, and unconfirmed or discarded encounters count toward nothing.
   """
   @spec chrome_ratio(integer(), integer()) :: %{optional(integer()) => float()}
   def chrome_ratio(user_id, source_id) do
@@ -159,27 +141,15 @@ defmodule Ashiato.Ledger do
     end
   end
 
-  # Page lifecycle: the ingest state machine and the revision fence (§6.7,
-  # §7.4). `revision` is a fencing token, not a history — it starts at 1 and is
-  # bumped by anything that changes what processing would produce. A
-  # background job reads it at the start of its work and carries it; its final
-  # write is conditional on that revision, so a late result can never clobber a
-  # correction the user made meanwhile.
-
   @doc """
-  Creates a page. `attrs` is a map (or keyword list) that must include
-  `user_id`, `source_id`, `image_key`, and `text_hash`; `document_id`,
-  `page_index`, `text_origin`, `image_store`, and `status` are optional, with
-  `status` defaulting to `:uploaded`.
-
-  `user_id` is set on the struct, never cast. Returns `{:ok, %Pages{}}`. A
-  duplicate `(user_id, text_hash)` — re-uploading the same screen — is a no-op
-  insert and returns `{:error, changeset}`.
+  Creates a page. `attrs` must carry `user_id`, `source_id`, `image_key` and
+  `text_hash`; `status` defaults to `:uploaded`. A duplicate
+  `(user_id, text_hash)` — the same screen re-uploaded — returns
+  `{:error, changeset}` instead of inserting.
   """
   @spec create_page(map() | keyword()) :: {:ok, Pages.t()} | {:error, Ecto.Changeset.t()}
   def create_page(attrs) do
     attrs = Map.new(attrs)
-    # user_id is set programmatically, never cast (AGENTS Ecto house rule)
     user_id = Map.fetch!(attrs, :user_id)
     attrs = attrs |> Map.delete(:user_id) |> Map.put_new(:status, :uploaded)
 
@@ -189,37 +159,21 @@ defmodule Ashiato.Ledger do
   end
 
   @doc """
-  Accepts corrected text for a page (R1.3). Sets `accepted_text` and bumps
-  `revision` in one transaction.
-
-  The bump is the whole point of the column: the accepted text is what
-  tokenization, validation, and translation all produce from, so changing it
-  changes what processing would produce. Bumping is what makes an in-flight
-  job's fenced write see a newer revision and discard itself (§6.7).
-  Returns `{:ok, %Pages{}}` or `{:error, changeset}`.
+  Accepts corrected text for a page: sets `accepted_text` and bumps `revision`
+  in a single write. The bump is what makes an in-flight job notice that the
+  page moved on and discard its own result.
   """
   @spec accept_text(Pages.t(), String.t()) :: {:ok, Pages.t()} | {:error, Ecto.Changeset.t()}
   def accept_text(%Pages{} = page, text) do
-    # accepted_text is what tokenization, validation, and translation produce
-    # from, so changing it bumps revision (§6.7). Both columns are written by
-    # the same UPDATE statement — one atomic write.
     page
     |> Pages.changeset(%{accepted_text: text, revision: page.revision + 1})
     |> Repo.update()
   end
 
   @doc """
-  The conditional write from §6.7:
-
-      UPDATE pages
-         SET status = :status
-      WHERE id = :page_id AND revision = :page.revision
-
-  The job read `revision` at the start of its work and carries it; if the page
-  moved on meanwhile (a correction bumped `revision`), the update matches zero
-  rows and this returns `{:error, :superseded}` — a normal outcome, not an
-  exception, and it never raises. On a matching revision it sets the status and
-  returns `{:ok, %Pages{}}`. An invalid transition returns
+  Writes a job's final status, but only while the page still carries the
+  `revision` the job started from. A stale write matches no rows and returns
+  `{:error, :superseded}`; a move the pipeline forbids returns
   `{:error, :invalid_transition}`.
   """
   @spec finish_page(Pages.t(), atom()) ::
@@ -241,14 +195,8 @@ defmodule Ashiato.Ledger do
   end
 
   @doc """
-  Moves a page to a new status, enforcing the ingest pipeline order (§7.4):
-
-      uploaded -> detecting -> text_ready -> translating -> ready
-
-  plus `:failed` from any non-terminal state. `:ready` and `:failed` are
-  terminal, so nothing moves out of them. Backward moves, skipped states, and
-  moves out of a terminal state are rejected with `{:error, :invalid_transition}`.
-  On success returns `{:ok, %Pages{}}`.
+  Moves a page to the next status in the ingest pipeline, or to `:failed` from
+  any non-terminal state. Anything else returns `{:error, :invalid_transition}`.
   """
   @spec transition(Pages.t(), atom()) :: {:ok, Pages.t()} | {:error, :invalid_transition}
   def transition(%Pages{} = page, status) do

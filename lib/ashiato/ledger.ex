@@ -1,17 +1,16 @@
 defmodule Ashiato.Ledger do
   @moduledoc """
   The ledger: the context layer that owns vocabulary identity and every
-  sighting of it, and that populates `user_id` (§6.2 — no auth yet, so this
-  module is the single place that changes when auth arrives).
+  sighting of it, and that populates `user_id` (no auth yet, so this module is
+  the single place that changes when auth arrives).
 
   Identity is global (`Ashiato.Lexemes`, shared by all users); everything this
   module writes downstream of it is per user, carried explicitly via `user_id`
   on the arguments.
 
   Beyond identity and encounters, this module owns the boundary of the review
-  queue: which words qualify for introduction (R3.4), the known and suspended
-  markers (R2.3, R3.8), and the `chrome_like` flag with its R2.9 suspension
-  hand-off (§6.5).
+  queue: which words qualify for introduction, the known and suspended markers,
+  and the `chrome_like` flag, including how it suspends and un-suspends words.
   """
 
   import Ecto.Query
@@ -24,14 +23,12 @@ defmodule Ashiato.Ledger do
   alias Ashiato.WordStates
   alias Ashiato.Words
 
-  # R3.4: a word is not introduced to the queue until it has been met on at
-  # least this many distinct pages. `introduce_words/3` takes `:min_encounters`
-  # to override per call.
+  # A word enters the queue only after being met on this many distinct pages;
+  # `introduce_words/3` lets a caller override it.
   @min_encounters 2
 
-  # §6.5: a word appearing on more than this fraction of a source's pages is
-  # chrome-like in that source. Strictly more than: being met on exactly half
-  # the pages does not clear it.
+  # Chrome-like in a source means appearing on more than this fraction of its
+  # pages — strictly more, so exactly half does not clear it.
   @chrome_threshold 0.5
 
   @doc """
@@ -99,7 +96,6 @@ defmodule Ashiato.Ledger do
           {:ok, Encounters.t()} | {:error, Ecto.Changeset.t()}
   def record_encounter(attrs) do
     attrs = Map.new(attrs)
-    # user_id is set programmatically, never cast (AGENTS Ecto house rule)
     user_id = Map.fetch!(attrs, :user_id)
 
     %Encounters{user_id: user_id}
@@ -123,21 +119,9 @@ defmodule Ashiato.Ledger do
 
   @doc """
   Chrome detection for one source: for each word, the fraction of that source's
-  pages on which the word appears.
-
-  This is a **query, never stored state** — re-run it whenever pages or
-  encounters change, so re-tuning the threshold costs nothing but time (§6.6).
-  It is what decides `words.chrome_like` (§6.5): a word whose ratio clears the
-  configured threshold (default 50%) is *chrome-like in this source*, but the
-  `chrome_like` flag is only ever set when the word is chrome-like in **every**
-  source it appears in — otherwise a HUD word met in one game would suppress
-  real vocabulary read in a manga.
-
-  Counting rules: an occurrence is a *distinct page* (counted once per page,
-  breadth, not raw token count), and unconfirmed or soft-deleted (discarded)
-  encounters count toward nothing (R2.8). The denominator is every page of the
-  source. Returns a map of `word_id => ratio` in 0.0..1.0, empty when the
-  source has no pages yet.
+  pages it appears on. The ratio is a query, never stored state, so it can be
+  recomputed after any change to pages or encounters. An occurrence is a
+  distinct page, and unconfirmed or discarded encounters count toward nothing.
   """
   @spec chrome_ratio(integer(), integer()) :: %{optional(integer()) => float()}
   def chrome_ratio(user_id, source_id) do
@@ -163,32 +147,15 @@ defmodule Ashiato.Ledger do
   end
 
   @doc """
-  Introduces words to the review queue (R3.4): for every qualifying lexeme,
-  creates the `word_states` row that the introduction query (kanji-review §6)
-  reads as "not yet introduced" when it is absent — `state = 0`, `due_at` set
-  to now, so the card is due immediately and FSRS owns everything after.
+  Introduces words to the review queue: each qualifying lexeme gets the
+  `word_states` row whose absence marks it as not yet introduced. A lexeme
+  qualifies when it has been met on at least `:min_encounters` distinct pages
+  and is not known, suspended, chrome-like, or already queued.
 
-  A lexeme qualifies only when this user's `words` row for it
-
-    * has been met on at least `:min_encounters` **distinct pages** (R3.4,
-      §6.5 — occurrences, not tokens; confirmed and non-discarded only, R2.8)
-    * is not `known` (R2.3)
-    * is not `suspended`
-    * is not `chrome_like` (§6.5)
-    * has no `word_states` row yet — introducing twice never duplicates
-
-  ## Options
-
-    * `:force` (default `false`) — bypasses the occurrence threshold only. A
-      known, suspended, chrome-like, or already-introduced word is still
-      skipped. A lexeme that was never met has no `words` row at all; forcing
-      one mints that row (the user's copy of the lexeme) and introduces it —
-      the force-add override of R3.4 taken to its floor.
-    * `:min_encounters` (default `#{@min_encounters}`) — the threshold itself.
-
-  The batch runs in one transaction: every qualifying word is introduced or
-  none is. Returns `{:ok, words}` — the words introduced, in the order the
-  lexeme ids were given — or `{:error, reason}` if anything rolled back.
+  `:force` bypasses the occurrence threshold only, minting the `words` row for a
+  lexeme never met; a known, suspended, chrome-like, or already-introduced word
+  is still skipped. `:min_encounters` overrides the threshold. Returns the
+  introduced words in the order the lexeme ids were given.
   """
   @spec introduce_words(integer(), [integer()], keyword()) ::
           {:ok, [Words.t()]} | {:error, term()}
@@ -209,14 +176,9 @@ defmodule Ashiato.Ledger do
   end
 
   @doc """
-  Marks the user's copy of a lexeme as already known (R2.3): it never becomes a
-  card. Known words are excluded from `introduce_words/3` and from the
-  introduction query, while encounters keep counting — the ledger remembers the
-  sightings even when the word needs no studying.
-
-  Returns `{:ok, %Words{}}`, or `{:error, :not_found}` when the user has no
-  `words` row for that lexeme (nothing was ever met, so there is nothing to
-  mark).
+  Marks the user's copy of a lexeme as already known, so it never becomes a
+  card; encounters keep counting. Returns `{:error, :not_found}` when the user
+  has no `words` row for that lexeme.
   """
   @spec mark_known(integer(), integer()) :: {:ok, Words.t()} | {:error, :not_found}
   def mark_known(user_id, lexeme_id) do
@@ -232,22 +194,14 @@ defmodule Ashiato.Ledger do
   end
 
   @doc """
-  Suspends the user's copy of a lexeme (R3.8): out of the queue, history
-  preserved, coverage unaffected.
+  Suspends the user's copy of a lexeme: out of the review queue, history and
+  coverage untouched. `reason` is one of `:manual | :chrome | :mastered |
+  :leech`, and `:mastered` also stamps `mastered_at`.
 
-  `reason` must be one of the `words.suspended_reason` Ecto.Enum values —
-  `:manual | :chrome | :mastered | :leech` — and is validated by casting
-  through that same Ecto.Enum, so anything else arrives as
-  `{:error, changeset}`. `:mastered` also stamps `mastered_at` (R3.8: suspend +
-  mark mastered); any other reason leaves an existing stamp alone.
-
-  Suspending never touches `chrome_like`: `update_chrome_like/1` owns that
-  flag. Suspending a word that is already suspended keeps its original
-  reason — `:chrome` never clobbers a `:manual` (or `:mastered` / `:leech`)
-  suspension, which is what keeps clearing the flag from wiping one.
-
-  Returns `{:ok, %Words{}}`, `{:error, changeset}` for a bad reason, or
-  `{:error, :not_found}`.
+  An existing suspension keeps its reason, so `:chrome` never overwrites a
+  `:manual`, `:mastered` or `:leech` one — that is what lets clearing the chrome
+  flag remove only its own suspensions. Returns `{:error, changeset}` for a bad
+  reason and `{:error, :not_found}` when there is no `words` row.
   """
   @spec mark_suspended(integer(), integer(), atom()) ::
           {:ok, Words.t()} | {:error, Ecto.Changeset.t()} | {:error, :not_found}
@@ -257,9 +211,6 @@ defmodule Ashiato.Ledger do
         {:error, :not_found}
 
       %Words{} = word ->
-        # An existing suspension keeps its reason: a :manual (or :mastered /
-        # :leech) suspension must never be converted into :chrome, or clearing
-        # the chrome flag would wipe it (R2.9, why the reason is stored).
         reason =
           if word.suspended and not is_nil(word.suspended_reason) do
             word.suspended_reason
@@ -278,27 +229,13 @@ defmodule Ashiato.Ledger do
   end
 
   @doc """
-  Recomputes `words.chrome_like` for every word of one user (§6.5, §6.6 — the
-  ratio is a query, never stored state, so this is rerun whenever pages or
-  encounters change).
+  Recomputes `words.chrome_like` for one user. A word is chrome-like only when
+  `chrome_ratio/2` clears the threshold in every source it appears in, so a word
+  common in one game but rare in a manga stays unflagged.
 
-  `chrome_ratio/2` runs once per source of the user. A word is chrome-like only
-  when its ratio clears `@chrome_threshold` (more than half the pages) in
-  **every** source it appears in — the sources where it has at least one
-  confirmed, non-discarded page. So a HUD word that trips the threshold in one
-  game but is rare in a manga stays unflagged, and a word that has stopped
-  appearing anywhere loses a stale flag.
-
-  R2.9 wiring:
-
-    * when the flag lands on a word that is not already suspended, the word is
-      suspended with `suspended_reason = :chrome` — history and coverage
-      survive, nothing is deleted;
-    * when the flag is cleared, the word is un-suspended **only** if its reason
-      was `:chrome`. A `:manual`, `:mastered`, or `:leech` suspension survives —
-      which is why the reason is stored rather than inferred.
-
-  Returns `{:ok, words}` — the user's chrome-like words after the run.
+  Flagging suspends the word with reason `:chrome`; clearing the flag
+  un-suspends it only if that was its reason, so manual and mastered suspensions
+  survive. Returns the user's chrome-like words after the run.
   """
   @spec update_chrome_like(integer()) :: {:ok, [Words.t()]}
   def update_chrome_like(user_id) do
@@ -318,10 +255,8 @@ defmodule Ashiato.Ledger do
 
   # ── introduction ────────────────────────────────────────────────────────────
 
-  # Every lexeme id resolved to this user's `words` row. Rows only exist for
-  # met lexemes — except under `:force`, which mints the missing ones: a
-  # never-met lexeme has no encounters to score, so it qualifies vacuously once
-  # the threshold is bypassed.
+  # Resolves lexeme ids to this user's `words` rows; `:force` mints the missing
+  # ones, since a never-met lexeme has no encounters to score.
   defp words_pool(user_id, lexeme_ids, force?) do
     existing =
       Repo.all(from(w in Words, where: w.user_id == ^user_id and w.lexeme_id in ^lexeme_ids))
@@ -341,12 +276,9 @@ defmodule Ashiato.Ledger do
     end
   end
 
-  # Same fetch-first shape as find_or_create_lexeme/3: on a lost insert race
-  # the `(user_id, lexeme_id)` unique index is declared on the changeset, the
-  # violation arrives as `{:error, changeset}`, and the winner's row is
-  # fetched. `Words` has no changeset of its own — both fields are set
-  # programmatically, never cast (AGENTS Ecto house rule) — so the changeset is
-  # built here, empty, around the struct.
+  # Fetch-first, so a lost insert race ends with the winner's row rather than a
+  # raise. `Words` has no changeset (both fields are set on the struct), so one
+  # is built here.
   defp find_or_create_word(user_id, lexeme_id) do
     case Repo.get_by(Words, user_id: user_id, lexeme_id: lexeme_id) do
       %Words{} = word ->
@@ -368,10 +300,8 @@ defmodule Ashiato.Ledger do
     end
   end
 
-  # The qualification half of the introduction query (kanji-review §6), minus
-  # the priority ordering — the caller decides order and the daily cap (R3.9).
-  # Occurrences are counted in SQL and filtered here, so `:force` is the same
-  # query with the threshold ignored.
+  # The qualifying half of the introduction query; ordering and the daily cap
+  # belong to the caller. `:force` runs the same query with the threshold ignored.
   defp qualify(words, user_id, min_encounters, force?) do
     word_ids = Enum.map(words, & &1.id)
 
@@ -379,12 +309,10 @@ defmodule Ashiato.Ledger do
       from(w in Words,
         where: w.user_id == ^user_id and w.id in ^word_ids,
         where: w.known == false and w.suspended == false and w.chrome_like == false,
-        # "not yet introduced": the word_states row does not exist
         left_join: ws in WordStates,
         on: ws.word_id == w.id,
         where: is_nil(ws.word_id),
-        # occurrences per §6.5: distinct pages; unconfirmed and discarded
-        # encounters count toward nothing (R2.8)
+        # distinct pages; unconfirmed and discarded encounters count toward nothing
         left_join: e in Encounters,
         on: e.word_id == w.id and e.confirmed == true and is_nil(e.discarded_at),
         group_by: w.id,
@@ -403,10 +331,8 @@ defmodule Ashiato.Ledger do
     %WordStates{word_id: word.id, state: 0, due_at: due_at}
     |> Repo.insert(on_conflict: :nothing, conflict_target: [:word_id])
     |> case do
-      # on_conflict: :nothing also reports {:ok, _} when a concurrent caller
-      # won the row — the word is introduced either way, so it stays in the
-      # result. `word_states` has no changeset to declare the constraint; the
-      # conflict target names the primary key itself.
+      # `on_conflict: :nothing` also reports {:ok, _} when a concurrent caller
+      # won the row; the word is introduced either way.
       {:ok, _} ->
         word
 
@@ -422,10 +348,8 @@ defmodule Ashiato.Ledger do
 
   # ── chrome_like ─────────────────────────────────────────────────────────────
 
-  # One pass of chrome_ratio/2 per source, folded into word => [ratio, ...]
-  # over the sources where the word appears (R2.8 counting rules apply:
-  # chrome_ratio already excludes unconfirmed and discarded encounters). The
-  # lists are never empty, so all?/1 is never vacuously true here.
+  # One chrome_ratio/2 pass per source, folded into word => [ratio, ...]. The
+  # lists are never empty, so `all?/1` here is never vacuously true.
   defp chrome_word_ids(user_id) do
     user_id
     |> source_ids()
@@ -445,7 +369,6 @@ defmodule Ashiato.Ledger do
     Repo.all(from(s in Sources, where: s.user_id == ^user_id, select: s.id))
   end
 
-  # §6.5: the flag lands on every word chrome-like in all of its sources.
   defp flag_chrome(user_id, chrome_ids, flagged_at) do
     from(w in Words,
       where: w.user_id == ^user_id and w.id in ^chrome_ids and w.chrome_like == false
@@ -453,9 +376,7 @@ defmodule Ashiato.Ledger do
     |> Repo.update_all(set: [chrome_like: true, updated_at: flagged_at])
   end
 
-  # R2.9: an existing card is suspended with reason chrome, never deleted.
-  # Already-suspended words keep their reason — a :manual (or :mastered /
-  # :leech) suspension is never overwritten by the flag.
+  # Suspends rather than deletes, so card history and coverage survive.
   defp suspend_chrome(user_id, chrome_ids, flagged_at) do
     from(w in Words,
       where: w.user_id == ^user_id and w.id in ^chrome_ids and w.suspended == false
@@ -463,8 +384,8 @@ defmodule Ashiato.Ledger do
     |> Repo.update_all(set: [suspended: true, suspended_reason: :chrome, updated_at: flagged_at])
   end
 
-  # A word no longer chrome-like everywhere loses the flag — including a word
-  # that has stopped appearing anywhere at all.
+  # A word that has stopped appearing anywhere loses the flag too, not just one
+  # that is now rare.
   defp unflag_chrome(user_id, chrome_ids, flagged_at) do
     from(w in Words,
       where: w.user_id == ^user_id and w.chrome_like == true and w.id not in ^chrome_ids
@@ -472,10 +393,8 @@ defmodule Ashiato.Ledger do
     |> Repo.update_all(set: [chrome_like: false, updated_at: flagged_at])
   end
 
-  # R2.9: clearing the flag restores the card — but only a :chrome suspension.
-  # The reason is stored rather than inferred, which is what makes this safe:
-  # a :manual (or :mastered / :leech) suspension survives untouched. This also
-  # heals a :chrome suspension whose flag is already gone.
+  # Only a `:chrome` suspension is restored, which is why the reason is stored
+  # rather than inferred.
   defp unsuspend_chrome(user_id, chrome_ids, flagged_at) do
     from(w in Words,
       where:
@@ -491,13 +410,11 @@ defmodule Ashiato.Ledger do
 
   # ── shared ──────────────────────────────────────────────────────────────────
 
-  # R3.8: suspend + mark mastered. Only :mastered stamps the date.
   defp mastered_at(changeset, :mastered),
     do: Ecto.Changeset.change(changeset, mastered_at: utc_now())
 
   defp mastered_at(changeset, _reason), do: changeset
 
-  # `words` timestamps, `word_states.due_at` and `words.mastered_at` are
-  # :utc_datetime columns — whole seconds.
+  # The columns are `:utc_datetime`, i.e. whole seconds, so timestamps truncate here.
   defp utc_now, do: DateTime.utc_now() |> DateTime.truncate(:second)
 end

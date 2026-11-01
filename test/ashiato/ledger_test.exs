@@ -1,23 +1,11 @@
 defmodule Ashiato.LedgerTest do
   @moduledoc """
   The ledger's two identities are the whole contract, so these tests are about
-  idempotency rather than happy paths:
+  idempotency rather than happy paths: one lexeme row per `lemma + reading +
+  part_of_speech`, one encounter row per `(user, word, page text hash)`.
 
-    * a lexeme is one row per `lemma + reading + part_of_speech`, globally
-    * an encounter is one row per `(user, word, page text hash)`
-
-  Both are enforced by unique indexes, and both are easy to get subtly wrong —
-  `find_or_create_lexeme` has to survive a race, and `record_encounter` has to
-  turn a duplicate into a value rather than an exception.
-
-  The queue boundary layered on top has contracts of its own:
-
-    * introduction is one `word_states` row per word — the threshold is
-      respected, `force: true` bypasses it, and introducing twice never
-      duplicates
-    * `chrome_like` is derived, never stored truth: it lands only when the word
-      is chrome-like in *every* source it appears in (§6.5), and the R2.9
-      suspension hand-off never clobbers a suspension that is not `:chrome`
+  They also cover the introduction threshold and the derived `chrome_like` flag,
+  including its hand-off with suspensions.
   """
 
   use Ashiato.DataCase, async: false
@@ -45,8 +33,7 @@ defmodule Ashiato.LedgerTest do
     end
 
     test "a nil reading is normalised to an empty string" do
-      # NULL is distinct in a unique index, so storing nil would create a new
-      # row on every call. The database default is "" for exactly this reason.
+      # NULL is distinct in a unique index, so nil would insert a new row every call.
       assert {:ok, first} = Ledger.find_or_create_lexeme("ねこ", nil, "noun")
       assert {:ok, second} = Ledger.find_or_create_lexeme("ねこ", nil, "noun")
 
@@ -148,7 +135,6 @@ defmodule Ashiato.LedgerTest do
          %{user: user, source: source, word: word} do
       pages = for _ <- 1..4, do: page_fixture(user_id: user.id, source_id: source.id)
 
-      # on two of the four pages
       pages |> Enum.take(2) |> Enum.each(&record(user, source, word, &1, true))
 
       assert Ledger.chrome_ratio(user.id, source.id) == %{word.id => 0.5}
@@ -199,7 +185,7 @@ defmodule Ashiato.LedgerTest do
         for _ <- 1..3, do: page_fixture(user_id: user.id, source_id: source.id)
 
       record(user, source, word, met, true)
-      # R2.8: both count toward nothing
+      # unconfirmed and discarded: neither counts toward the threshold
       record(user, source, word, unconfirmed, false)
 
       record(user, source, word, discarded, true, %{
@@ -246,8 +232,7 @@ defmodule Ashiato.LedgerTest do
 
       assert {:ok, [_first]} = Ledger.introduce_words(user.id, [lexeme.id])
 
-      # a second call, and a repeated id within one call, both find the
-      # word_states row already there
+      # a repeat call and a duplicated id both see the existing word_states row
       assert {:ok, []} = Ledger.introduce_words(user.id, [lexeme.id])
       assert {:ok, []} = Ledger.introduce_words(user.id, [lexeme.id, lexeme.id])
 
@@ -322,12 +307,11 @@ defmodule Ashiato.LedgerTest do
       refute Repo.reload!(word).suspended
     end
 
-    test "suspending again never clobbers an existing reason (R2.9)", %{user: user, word: word} do
+    test "suspending again never clobbers an existing reason", %{user: user, word: word} do
       assert {:ok, first} = Ledger.mark_suspended(user.id, word.lexeme_id, :manual)
       assert {:ok, second} = Ledger.mark_suspended(user.id, word.lexeme_id, :chrome)
 
-      # a manual suspension survives the chrome re-mark, so clearing the flag
-      # later can never wipe it
+      # the manual reason survives, so clearing the chrome flag cannot wipe it
       assert first.suspended_reason == :manual
       assert second.suspended_reason == :manual
     end
@@ -353,7 +337,7 @@ defmodule Ashiato.LedgerTest do
       assert Repo.reload!(word).chrome_like
     end
 
-    test "a word chrome in one game but rare in a manga stays unflagged (§6.5)", %{user: user} do
+    test "a word chrome in one game but rare in a manga stays unflagged", %{user: user} do
       game = source_fixture(user_id: user.id)
       game_pages = for _ <- 1..2, do: page_fixture(user_id: user.id, source_id: game.id)
 
@@ -367,15 +351,13 @@ defmodule Ashiato.LedgerTest do
       manga_pages = for _ <- 1..3, do: page_fixture(user_id: user.id, source_id: manga.id)
       Enum.each(Enum.take(manga_pages, 1), &record(user, manga, real, &1, true))
 
-      # the HUD word is chrome-like in its only source; the real word is not
-      # chrome-like everywhere it appears, so the flag may not land on either
-      # of them wrongly
+      # HUD word: chrome in its only source. Real word: not chrome in every source.
       assert {:ok, [flagged]} = Ledger.update_chrome_like(user.id)
       assert flagged.id == hud.id
       refute Repo.reload!(real).chrome_like
     end
 
-    test "when the flag lands, an existing card is suspended with reason chrome (R2.9)",
+    test "when the flag lands, an existing card is suspended with reason chrome",
          %{user: user} do
       %{lexeme: lexeme, word: word} = chrome_word(user)
 
@@ -401,7 +383,7 @@ defmodule Ashiato.LedgerTest do
       assert reloaded.suspended and reloaded.suspended_reason == :manual
     end
 
-    test "clearing the flag un-suspends a chrome suspension (R2.9)", %{user: user} do
+    test "clearing the flag un-suspends a chrome suspension", %{user: user} do
       %{word: word} = chrome_word(user)
 
       assert {:ok, [_]} = Ledger.update_chrome_like(user.id)
@@ -418,7 +400,7 @@ defmodule Ashiato.LedgerTest do
     end
 
     for reason <- [:manual, :mastered, :leech] do
-      test "clearing the flag leaves a #{reason} suspension intact (R2.9)", %{user: user} do
+      test "clearing the flag leaves a #{reason} suspension intact", %{user: user} do
         reason = unquote(reason)
         %{lexeme: lexeme, word: word} = chrome_word(user)
 
@@ -465,9 +447,8 @@ defmodule Ashiato.LedgerTest do
     %{lexeme: lexeme, word: word, source: source}
   end
 
-  # Meets `word` on one of two fresh manga pages: exactly half the pages does
-  # not clear the chrome threshold (§6.5 says *more than*), so the word stops
-  # being chrome-like in every source.
+  # Meets `word` on one of two manga pages: exactly half does not clear the
+  # threshold, so the word stops being chrome-like in every source.
   defp meet_rarely_elsewhere(user, word) do
     manga = source_fixture(user_id: user.id, kind: :manga)
     [met, _unmet] = for _ <- 1..2, do: page_fixture(user_id: user.id, source_id: manga.id)

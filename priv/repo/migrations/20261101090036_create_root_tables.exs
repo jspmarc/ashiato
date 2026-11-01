@@ -62,7 +62,7 @@ defmodule Ashiato.Repo.Migrations.CreateRootTables do
         null: false,
         comment: "JMdict release. No TTL: entries are immutable within a version."
 
-      add :payload, :map, comment: "JSON as TEXT, for dialect portability"
+      add :payload, :map
 
       add :fetched_at, :utc_datetime
     end

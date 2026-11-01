@@ -1,9 +1,9 @@
-' Ashiato — review session
-' sequencediagram.org syntax. Paste at https://sequencediagram.org
+# Ashiato — review session
+# sequencediagram.org syntax. Paste at https://sequencediagram.org
 
 title Ashiato — review session and rescheduling
 
-actor Josep
+actor User
 participant "LiveView (ashiato-web)" as UI
 participant "Scheduler" as SCHED
 participant "jp-dict-api" as DICT
@@ -11,41 +11,46 @@ database "Database" as DB
 
 autonumber
 
-Josep -> UI: open review
+group Session start — pick the due cards
+User -> UI: open review
 UI -> DB: due words where due_at <= now\nand not suspended and not mastered
-UI --> Josep: card 1 of N
-
+UI --> User: card 1 of N
 note over UI: front = the line crop where the word was met,\ntarget word masked. Back = word, reading, meaning, kanji.
+end
 
+group Review loop — one card at a time
 loop every card
-  Josep -> UI: reveal
+  User -> UI: reveal
   UI -> DICT: cached lookup (meaning, kanji breakdown)
   DICT --> UI: entry
-  UI --> Josep: back of card
-  Josep -> UI: grade (again / hard / good / easy)
+  UI --> User: back of card
+  User -> UI: grade (again / hard / good / easy)
   UI -> DB: append review_event
-  UI -> DB: update word_state (materialised)
-  note over DB: review_events is the source of truth;\nword_state is a cache that can be rebuilt
+  UI -> DB: update word_states (materialised)
+  note over DB: review_events is the source of truth;\nword_states is a cache that can be rebuilt
 
   opt grade is "again"
     SCHED -> DB: increment lapses
     note over SCHED: word is a leech candidate\nonce lapses pass the threshold
   end
 end
+end
 
+group Reschedule — FSRS plus the frequency cap
 UI -> SCHED: session finished
 SCHED -> DB: compute next due_at per word
 note over SCHED: final_interval = min(fsrs_interval, cap_for_band(occurrences))
-note over SCHED: canned by frequency band:\n>=20 -> 60d, 8..19 -> 120d, 3..7 -> 240d, else uncapped
+note over SCHED: capped by frequency band:\n>=20 -> 60d, 8..19 -> 120d, 3..7 -> 240d, else uncapped
 
-UI --> Josep: progress: coverage, streak, words to 95%
+UI --> User: progress: coverage, streak, words to 95%
+end
 
-' ── asynchronous, between sessions ──
-
-note over SCHED: Between sessions an ingest job may record a new encounter
+group Between sessions — re-encounter resurfacing
+note over SCHED: an ingest job may record a new encounter for W
 SCHED -> DB: new encounter for word W
 alt W is due far in the future and W was just met in the wild
   SCHED -> DB: schedule an early review
   note over SCHED: a real FSRS review event, never a fabricated interval
-  SCHED --> Josep: "you just saw this one"
+  SCHED --> User: "you just saw this one"
+end
 end

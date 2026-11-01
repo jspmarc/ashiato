@@ -1,0 +1,83 @@
+# Ashiato — page ingest
+# sequencediagram.org syntax (PlantUML sequence subset). Paste at https://sequencediagram.org
+
+title Ashiato — page ingest
+
+actor User
+participant "LiveView (ashiato-web)" as UI
+participant "Ingest job (Oban)" as Job
+participant "ashiato-ocr (PaddleOCR)" as OCR
+participant "jp-dict-api (SudachiPy)" as DICT
+participant "Translator (configured provider)" as TR
+database "Database (SQLite / Postgres)" as DB
+
+autonumber
+
+group Capture — upload to readable text
+User -> UI: upload images, or a PDF
+UI -> DB: insert document (PDF) and pages, status = uploaded
+note over UI: a PDF with a text layer skips OCR entirely
+UI --> User: page list appears, live
+
+UI -> Job: enqueue page
+Job -> DB: status = detecting
+
+Job -> OCR: request {op: ocr, path or presigned url}
+note over OCR: PP-OCRv6 medium detector\nline quads -> per-line crops
+note over OCR: PaddleOCR recogniser\nper crop, fixed 48px height
+
+alt OCR service down or crashes
+  OCR --> Job: error
+  Job -> DB: status = failed, artifacts kept
+  Job --> UI: retry affordance
+else OCR returns
+  OCR --> Job: lines[{bbox, text, score}]
+end
+
+Job -> DB: accepted_text, status = text_ready
+Job --> UI: publish :ocr_ready
+UI --> User: lines rendered, editable
+end
+
+group Correction — fenced by revision
+opt User corrects a misread line
+  User -> UI: corrected text
+  UI -> DB: accepted_text, revision increased
+  note over DB: an in-flight job compares revisions\nand discards its own result if superseded
+end
+end
+
+group Record — tokenise and translate, concurrently
+note over Job: tokenise and translate are independent branches.\nBoth need only accepted_text, so they run concurrently —\nneither waits for the other.
+
+Job -> DICT: POST /tokenize
+Job -> TR: translate the page, one request
+
+DICT --> Job: tokens[surface, lemma, reading, pos]
+TR --> Job: one translated string per input line
+
+note over TR: provider comes from settings, google_free by default.\nResults cached per (lang, line).\nPage context survives because the model sees the whole page.
+
+note over Job: drop particles and auxiliaries,\nvalidate every token against the dictionary
+
+alt any token unconfirmed
+  Job -> DB: encounters with confirmed = false
+  note over DB: unconfirmed counts toward nothing:\nno ranking, no queue, no coverage
+  Job --> UI: publish :needs_confirmation
+  UI --> User: confirm once per new word
+  User -> UI: confirm
+  UI -> DB: encounters confirmed = true
+else all tokens valid
+  Job -> DB: encounters (confirmed = true)
+end
+end
+
+group Enrich — dictionary data
+Job -> DICT: batch lookup meanings, kanji, JLPT, frequency
+DICT --> Job: entries
+Job -> DB: dict_cache_entries, stamped with dict_version
+end
+
+Job -> DB: status = ready
+Job --> UI: publish :line_translated as each line lands
+UI --> User: page re-readable from the list, translation optional

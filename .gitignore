@@ -29,3 +29,6 @@ ashiato-*.tar
 *.db
 *.db-*
 
+*.env*
+!.env.example
+!.envrc

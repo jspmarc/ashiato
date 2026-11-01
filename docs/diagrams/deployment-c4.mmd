@@ -1,0 +1,27 @@
+%% Ashiato — deployment (production shape)
+%% Canonical source. Mirrored in README.md for GitHub rendering; keep both in step.
+
+C4Deployment
+  title Ashiato — deployment
+
+  Person(user, "User", "Photographs or scans Japanese text, reviews cards")
+
+  Deployment_Node(pod, "pod", "ashiato") {
+    Container(web, "ashiato-web", "Elixir / Phoenix", "ledger, SRS, LiveView")
+    Container(ocr, "ashiato-ocr", "Python / PaddleOCR", "resident model")
+  }
+
+  ContainerDb(db, "Postgres", "own LXC or managed service", "words, encounters")
+  Container(dict, "jp-dict-api", "Python / FastAPI", "dictionary, tokenize")
+
+  ContainerDb(objstore, "S3-compatible store", "images and line crops", "keyed by image_key")
+  System_Ext(llm, "LLM endpoint", "optional")
+
+  Rel(user, web, "HTTPS")
+  Rel(web, ocr, "Unix socket")
+  Rel(web, dict, "HTTP")
+  Rel(web, db, "Ecto")
+  Rel(web, objstore, "S3 API", "presigned GET for OCR")
+  Rel(web, llm, "HTTPS")
+
+  UpdateLayoutConfig($c4ShapeInRow="3", $c4BoundaryInRow="1")

@@ -1,0 +1,51 @@
+' Ashiato — review session
+' sequencediagram.org syntax. Paste at https://sequencediagram.org
+
+title Ashiato — review session and rescheduling
+
+actor Josep
+participant "LiveView (ashiato-web)" as UI
+participant "Scheduler" as SCHED
+participant "jp-dict-api" as DICT
+database "Database" as DB
+
+autonumber
+
+Josep -> UI: open review
+UI -> DB: due words where due_at <= now\nand not suspended and not mastered
+UI --> Josep: card 1 of N
+
+note over UI: front = the line crop where the word was met,\ntarget word masked. Back = word, reading, meaning, kanji.
+
+loop every card
+  Josep -> UI: reveal
+  UI -> DICT: cached lookup (meaning, kanji breakdown)
+  DICT --> UI: entry
+  UI --> Josep: back of card
+  Josep -> UI: grade (again / hard / good / easy)
+  UI -> DB: append review_event
+  UI -> DB: update word_state (materialised)
+  note over DB: review_events is the source of truth;\nword_state is a cache that can be rebuilt
+
+  opt grade is "again"
+    SCHED -> DB: increment lapses
+    note over SCHED: word is a leech candidate\nonce lapses pass the threshold
+  end
+end
+
+UI -> SCHED: session finished
+SCHED -> DB: compute next due_at per word
+note over SCHED: final_interval = min(fsrs_interval, cap_for_band(occurrences))
+note over SCHED: canned by frequency band:\n>=20 -> 60d, 8..19 -> 120d, 3..7 -> 240d, else uncapped
+
+UI --> Josep: progress: coverage, streak, words to 95%
+
+' ── asynchronous, between sessions ──
+
+note over SCHED: Between sessions an ingest job may record a new encounter
+SCHED -> DB: new encounter for word W
+alt W is due far in the future and W was just met in the wild
+  SCHED -> DB: schedule an early review
+  note over SCHED: a real FSRS review event, never a fabricated interval
+  SCHED --> Josep: "you just saw this one"
+end

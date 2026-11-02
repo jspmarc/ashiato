@@ -107,7 +107,7 @@ Table pages {
   created_at timestamptz
 
   indexes {
-    (user_id, text_hash) [unique, name: 'one_page_per_distinct_text']
+    (user_id, text_hash) [unique, name: 'pages_user_id_text_hash_index']
     (user_id, status)
     (document_id, page_index)
   }

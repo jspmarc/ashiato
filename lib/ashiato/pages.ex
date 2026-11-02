@@ -2,7 +2,8 @@ defmodule Ashiato.Pages do
   @moduledoc """
   One photographed / uploaded screen (or one PDF page).
 
-  Page identity is `(user_id, text_hash)`, unique via `one_page_per_distinct_text`.
+  Page identity is `(user_id, text_hash)`, unique via
+  `pages_user_id_text_hash_index`.
   The hash is a SHA-256 of the normalised text: a fixed 64 bytes whatever the
   page length, since a raw-text index entry would outgrow the btree.
 
@@ -62,8 +63,6 @@ defmodule Ashiato.Pages do
       :status
     ])
     |> validate_required([:source_id, :image_key, :text_hash, :status])
-    |> unique_constraint([:user_id, :text_hash], name: :one_page_per_distinct_text)
-    # declared twice: Postgres reports the index name, ecto_sqlite3 derives one from the columns
     |> unique_constraint([:user_id, :text_hash])
   end
 end

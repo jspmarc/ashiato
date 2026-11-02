@@ -82,10 +82,11 @@ defmodule Ashiato.Repo.Migrations.CreateOtherTables do
       timestamps(type: :utc_datetime)
     end
 
-    # one_page_per_distinct_text: re-uploading the same screen creates nothing
+    # pages_user_id_text_hash_index: re-uploading the same screen creates nothing
     # new. The hash is fixed-length, unlike the text, which would overflow a
-    # Postgres btree index entry for a page of dialogue.
-    create unique_index(:pages, [:user_id, :text_hash], name: "one_page_per_distinct_text")
+    # Postgres btree index entry for a page of dialogue. The default Ecto name
+    # lets one declared constraint match on both Postgres and SQLite.
+    create unique_index(:pages, [:user_id, :text_hash])
 
     # the ingest queue: pick up pages that are waiting for work, per user
     create index(:pages, [:user_id, :status])

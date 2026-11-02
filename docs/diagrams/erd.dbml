@@ -33,7 +33,7 @@ Table lexemes {
   created_at timestamptz
 
   indexes {
-    (lemma, reading, part_of_speech) [unique, name: 'lexemes_identity']
+    (lemma, reading, part_of_speech) [unique, name: 'lexemes_lemma_reading_part_of_speech_index']
   }
 }
 
@@ -61,7 +61,7 @@ Table sources {
   created_at timestamptz
 
   indexes {
-    (user_id, name, chapter) [unique, name: 'sources_identity', note: 'partial: WHERE name IS NOT NULL']
+    (user_id, name, chapter) [unique, name: 'sources_user_id_name_chapter_index', note: 'partial: WHERE name IS NOT NULL']
   }
 }
 
@@ -148,7 +148,7 @@ Table encounters {
   discarded_at timestamptz
 
   indexes {
-    (user_id, word_id, text_hash) [unique, name: 'one_encounter_per_word_per_page']
+    (user_id, word_id, text_hash) [unique, name: 'encounters_user_id_word_id_text_hash_index']
     (word_id, seen_on)
     (user_id, source_id)
   }

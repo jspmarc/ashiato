@@ -31,12 +31,13 @@ defmodule Ashiato.Ledger do
 
   Safe under races. The common path is fetch-first; if the row does not exist
   we insert, and if we lose the race against a concurrent caller the declared
-  `lexemes_identity` unique constraint surfaces as `{:error, changeset}`, after
-  which we fetch the row the winner just wrote. Returns `{:ok, %Lexemes{}}`
-  whether we created it or not.
+  `lexemes_lemma_reading_part_of_speech_index` unique constraint surfaces as
+  `{:error, changeset}`, after which we fetch the row the winner just wrote.
+  Returns `{:ok, %Lexemes{}}` whether we created it or not.
 
   `reading` is normalised `nil` → `""` to match the database default, so the
-  `lexemes_identity` unique index actually bites (multiple NULLs would pass).
+  `lexemes_lemma_reading_part_of_speech_index` unique index actually bites
+  (multiple NULLs would pass).
   """
   @spec find_or_create_lexeme(String.t(), String.t() | nil, String.t() | nil) ::
           {:ok, Lexemes.t()} | {:error, Ecto.Changeset.t()}
@@ -74,7 +75,7 @@ defmodule Ashiato.Ledger do
   Records one sighting of a word on one page. Returns `{:ok, %Encounters{}}`
   whether it was just inserted or already existed.
 
-  Idempotent against `one_encounter_per_word_per_page`
+  Idempotent against `encounters_user_id_word_id_text_hash_index`
   (`(user_id, word_id, text_hash)`): on conflict the insert is a no-op — the
   declaration in `Encounters.changeset/2` turns the constraint violation into
   `{:error, changeset}` instead of a raise — and the row that already exists is

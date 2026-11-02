@@ -14,14 +14,12 @@ defmodule Ashiato.Repo.Migrations.CreateOtherTables do
       timestamps(type: :utc_datetime)
     end
 
-    # sources_identity: a named source is unique per user and chapter. The
-    # default source has name NULL and is deliberately exempt, because there is
-    # exactly one catch-all bucket per user and SQL would otherwise need a
-    # sentinel name for it.
-    create unique_index(:sources, [:user_id, :name, :chapter],
-             name: "sources_identity",
-             where: "name IS NOT NULL"
-           )
+    # a named source is unique per user and chapter. The default source has name
+    # NULL and is deliberately exempt, because there is exactly one catch-all
+    # bucket per user and SQL would otherwise need a sentinel name for it. The
+    # default Ecto index name lets one declared constraint match on both
+    # Postgres and SQLite.
+    create unique_index(:sources, [:user_id, :name, :chapter], where: "name IS NOT NULL")
 
     # §6.9: enumerations are strings constrained twice. Ecto.Enum lives in the
     # schema; this CHECK covers everything else writing to the database.
@@ -160,11 +158,10 @@ defmodule Ashiato.Repo.Migrations.CreateOtherTables do
         comment: "soft delete so a bad OCR encounter never removes the word"
     end
 
-    # one_encounter_per_word_per_page: a single page yields many word
-    # encounters, so page text hash alone would collapse them into one.
-    create unique_index(:encounters, [:user_id, :word_id, :text_hash],
-             name: "one_encounter_per_word_per_page"
-           )
+    # one encounter per word per page: a single page yields many word encounters,
+    # so page text hash alone would collapse them into one. The default Ecto
+    # index name lets one declared constraint match on both Postgres and SQLite.
+    create unique_index(:encounters, [:user_id, :word_id, :text_hash])
 
     # the occurrence rotation and the ghost signal
     create index(:encounters, [:word_id, :seen_on])

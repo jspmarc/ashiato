@@ -15,7 +15,7 @@ defmodule Ashiato.LedgerTest do
 
   import Ashiato.Fixtures
 
-  alias Ashiato.{Encounters, Ledger, Lexemes, Repo}
+  alias Ashiato.{Encounters, Ledger, Lexemes, Pages, Repo}
 
   describe "find_or_create_lexeme/3" do
     test "creates the lexeme the first time and returns the same row the second" do
@@ -216,6 +216,16 @@ defmodule Ashiato.LedgerTest do
 
       assert page.accepted_text == "冷たいな！？"
       assert page.revision == 2
+    end
+
+    test "a correction with a stale revision is rejected as :superseded",
+         %{user: user, source: source} do
+      page = make_page(user, source)
+      stale = page
+
+      assert {:ok, _} = Ledger.accept_text(page, "正しく読めた")
+      assert {:error, :superseded} = Ledger.accept_text(stale, "別の修正")
+      assert %{accepted_text: "正しく読めた", revision: 2} = Repo.get!(Pages, page.id)
     end
 
     test "a matching revision write succeeds and does not bump revision",

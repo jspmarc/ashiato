@@ -163,12 +163,23 @@ defmodule Ashiato.Ledger do
   Accepts corrected text for a page: sets `accepted_text` and bumps `revision`
   in a single write. The bump is what makes an in-flight job notice that the
   page moved on and discard its own result.
+
+  Fenced on the `revision` the caller read: a correction arriving with a stale
+  struct matches no rows and returns `{:error, :superseded}`, so two concurrent
+  corrections cannot both write the same revision.
   """
-  @spec accept_text(Pages.t(), String.t()) :: {:ok, Pages.t()} | {:error, Ecto.Changeset.t()}
+  @spec accept_text(Pages.t(), String.t()) ::
+          {:ok, Pages.t()} | {:error, :superseded}
   def accept_text(%Pages{} = page, text) do
-    page
-    |> Pages.changeset(%{accepted_text: text, revision: page.revision + 1})
-    |> Repo.update()
+    query = from(p in Pages, where: p.id == ^page.id and p.revision == ^page.revision)
+
+    {count, _} =
+      Repo.update_all(query, set: [accepted_text: text, revision: page.revision + 1])
+
+    case count do
+      0 -> {:error, :superseded}
+      1 -> {:ok, Repo.get!(Pages, page.id)}
+    end
   end
 
   @doc """

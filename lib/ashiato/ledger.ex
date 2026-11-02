@@ -20,6 +20,7 @@ defmodule Ashiato.Ledger do
   alias Ashiato.Pages
   alias Ashiato.Repo
   alias Ashiato.Sources
+  alias Ashiato.Utils
   alias Ashiato.WordStates
   alias Ashiato.Words
 
@@ -165,8 +166,8 @@ defmodule Ashiato.Ledger do
     lexeme_ids = Enum.uniq(lexeme_ids)
 
     Repo.transaction(fn ->
-      due_at = utc_now()
-      words = words_pool(user_id, lexeme_ids, force?)
+      due_at = Utils.utc_now()
+      words = resolve_words(user_id, lexeme_ids, force?)
 
       words
       |> qualify(user_id, min_encounters, force?)
@@ -242,7 +243,7 @@ defmodule Ashiato.Ledger do
     chrome_ids = chrome_word_ids(user_id)
 
     Repo.transaction(fn ->
-      flagged_at = utc_now()
+      flagged_at = Utils.utc_now()
 
       flag_chrome(user_id, chrome_ids, flagged_at)
       suspend_chrome(user_id, chrome_ids, flagged_at)
@@ -256,8 +257,9 @@ defmodule Ashiato.Ledger do
   # ── introduction ────────────────────────────────────────────────────────────
 
   # Resolves lexeme ids to this user's `words` rows; `:force` mints the missing
-  # ones, since a never-met lexeme has no encounters to score.
-  defp words_pool(user_id, lexeme_ids, force?) do
+  # ones, since a never-met lexeme has no encounters to score (R3.4 force-add).
+  @spec resolve_words(integer(), [integer()], boolean()) :: [Words.t()]
+  defp resolve_words(user_id, lexeme_ids, force?) do
     existing =
       Repo.all(from(w in Words, where: w.user_id == ^user_id and w.lexeme_id in ^lexeme_ids))
 
@@ -279,6 +281,7 @@ defmodule Ashiato.Ledger do
   # Fetch-first, so a lost insert race ends with the winner's row rather than a
   # raise. `Words` has no changeset (both fields are set on the struct), so one
   # is built here.
+  @spec find_or_create_word(integer(), integer()) :: {:ok, Words.t()}
   defp find_or_create_word(user_id, lexeme_id) do
     case Repo.get_by(Words, user_id: user_id, lexeme_id: lexeme_id) do
       %Words{} = word ->
@@ -302,6 +305,7 @@ defmodule Ashiato.Ledger do
 
   # The qualifying half of the introduction query; ordering and the daily cap
   # belong to the caller. `:force` runs the same query with the threshold ignored.
+  @spec qualify([Words.t()], integer(), pos_integer(), boolean()) :: [Words.t()]
   defp qualify(words, user_id, min_encounters, force?) do
     word_ids = Enum.map(words, & &1.id)
 
@@ -327,6 +331,7 @@ defmodule Ashiato.Ledger do
     end
   end
 
+  @spec introduce_word(Words.t(), DateTime.t()) :: Words.t()
   defp introduce_word(word, due_at) do
     %WordStates{word_id: word.id, state: 0, due_at: due_at}
     |> Repo.insert(on_conflict: :nothing, conflict_target: [:word_id])
@@ -341,6 +346,7 @@ defmodule Ashiato.Ledger do
     end
   end
 
+  @spec in_lexeme_order([Words.t()], [integer()]) :: [Words.t()]
   defp in_lexeme_order(introduced, lexeme_ids) do
     by_lexeme = Map.new(introduced, &{&1.lexeme_id, &1})
     for(lexeme_id <- lexeme_ids, word = Map.get(by_lexeme, lexeme_id), do: word)
@@ -348,27 +354,27 @@ defmodule Ashiato.Ledger do
 
   # ── chrome_like ─────────────────────────────────────────────────────────────
 
-  # One chrome_ratio/2 pass per source, folded into word => [ratio, ...]. The
-  # lists are never empty, so `all?/1` here is never vacuously true.
+  # One chrome_ratio/2 pass per source, then one ratio list per word. The lists
+  # are never empty, so `all?/1` here is never vacuously true.
+  @spec chrome_word_ids(integer()) :: [integer()]
   defp chrome_word_ids(user_id) do
-    user_id
-    |> source_ids()
-    |> Enum.reduce(%{}, fn source_id, acc ->
-      chrome_ratio(user_id, source_id)
-      |> Enum.reduce(acc, fn {word_id, ratio}, acc ->
-        Map.update(acc, word_id, [ratio], &[ratio | &1])
-      end)
-    end)
-    |> Enum.filter(fn {_word_id, ratios} ->
-      Enum.all?(ratios, &(&1 > @chrome_threshold))
-    end)
-    |> Enum.map(&elem(&1, 0))
+    ratios_by_word =
+      user_id
+      |> source_ids()
+      |> Enum.flat_map(&chrome_ratio(user_id, &1))
+      |> Enum.group_by(fn {word_id, _ratio} -> word_id end, fn {_word_id, ratio} -> ratio end)
+
+    for {word_id, ratios} <- ratios_by_word, Enum.all?(ratios, &(&1 > @chrome_threshold)) do
+      word_id
+    end
   end
 
+  @spec source_ids(integer()) :: [integer()]
   defp source_ids(user_id) do
     Repo.all(from(s in Sources, where: s.user_id == ^user_id, select: s.id))
   end
 
+  @spec flag_chrome(integer(), [integer()], DateTime.t()) :: {non_neg_integer(), nil}
   defp flag_chrome(user_id, chrome_ids, flagged_at) do
     from(w in Words,
       where: w.user_id == ^user_id and w.id in ^chrome_ids and w.chrome_like == false
@@ -377,6 +383,7 @@ defmodule Ashiato.Ledger do
   end
 
   # Suspends rather than deletes, so card history and coverage survive.
+  @spec suspend_chrome(integer(), [integer()], DateTime.t()) :: {non_neg_integer(), nil}
   defp suspend_chrome(user_id, chrome_ids, flagged_at) do
     from(w in Words,
       where: w.user_id == ^user_id and w.id in ^chrome_ids and w.suspended == false
@@ -386,6 +393,7 @@ defmodule Ashiato.Ledger do
 
   # A word that has stopped appearing anywhere loses the flag too, not just one
   # that is now rare.
+  @spec unflag_chrome(integer(), [integer()], DateTime.t()) :: {non_neg_integer(), nil}
   defp unflag_chrome(user_id, chrome_ids, flagged_at) do
     from(w in Words,
       where: w.user_id == ^user_id and w.chrome_like == true and w.id not in ^chrome_ids
@@ -395,6 +403,7 @@ defmodule Ashiato.Ledger do
 
   # Only a `:chrome` suspension is restored, which is why the reason is stored
   # rather than inferred.
+  @spec unsuspend_chrome(integer(), [integer()], DateTime.t()) :: {non_neg_integer(), nil}
   defp unsuspend_chrome(user_id, chrome_ids, flagged_at) do
     from(w in Words,
       where:
@@ -404,17 +413,16 @@ defmodule Ashiato.Ledger do
     |> Repo.update_all(set: [suspended: false, suspended_reason: nil, updated_at: flagged_at])
   end
 
+  @spec chrome_words(integer()) :: [Words.t()]
   defp chrome_words(user_id) do
     Repo.all(from(w in Words, where: w.user_id == ^user_id and w.chrome_like == true))
   end
 
   # ── shared ──────────────────────────────────────────────────────────────────
 
+  @spec mastered_at(Ecto.Changeset.t(), atom()) :: Ecto.Changeset.t()
   defp mastered_at(changeset, :mastered),
-    do: Ecto.Changeset.change(changeset, mastered_at: utc_now())
+    do: Ecto.Changeset.change(changeset, mastered_at: Utils.utc_now())
 
   defp mastered_at(changeset, _reason), do: changeset
-
-  # The columns are `:utc_datetime`, i.e. whole seconds, so timestamps truncate here.
-  defp utc_now, do: DateTime.utc_now() |> DateTime.truncate(:second)
 end

@@ -185,7 +185,7 @@ defmodule Ashiato.Ledger do
       query = from(p in Pages, where: p.id == ^page.id and p.revision == ^page.revision)
 
       {count, _} =
-        Repo.update_all(query, set: [status: status, updated_at: DateTime.utc_now()])
+        Repo.update_all(query, set: [status: status])
 
       case count do
         0 -> {:error, :superseded}

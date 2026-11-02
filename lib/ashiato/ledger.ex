@@ -313,6 +313,7 @@ defmodule Ashiato.Ledger do
       from(w in Words,
         where: w.user_id == ^user_id and w.id in ^word_ids,
         where: w.known == false and w.suspended == false and w.chrome_like == false,
+        # anti-join: `is_nil` below keeps only words with no word_states row — not yet introduced
         left_join: ws in WordStates,
         on: ws.word_id == w.id,
         where: is_nil(ws.word_id),

@@ -151,12 +151,19 @@ defmodule Ashiato.Settings do
   defp provider_configured?(user_id, "llm"), do: credential?(user_id, "OPENAI_API_KEY")
   defp provider_configured?(_user_id, _unknown), do: false
 
-  # The settings row wins and environment variables are the fallback for the
-  # same values (§7.5); an explicitly empty key stays empty rather than
-  # falling through to the environment, so it still disables (D43).
+  # A row that exists and holds JSON `null` must not be confused with an absent row:
+  # `get/3` returns nil for both, and treating "cleared key" as "no key" would fall
+  # through to the environment and re-enable a capability the user just switched off.
+  @missing :__missing_setting__
+
+  # The settings row wins and environment variables are the fallback for the same
+  # values (§7.5). Environment names are the uppercase form of the setting key
+  # (`OPENAI_API_KEY`, `DEEPL_API_KEY`, `LIBRETRANSLATE_URL`), which is how §7-§8
+  # name them. An explicitly empty stored key stays empty rather than falling through,
+  # so it still disables (D43).
   defp credential?(user_id, key) do
-    case impl().get(user_id, key, nil) do
-      nil -> present?(System.get_env(key))
+    case impl().get(user_id, key, @missing) do
+      @missing -> present?(System.get_env(String.upcase(key)))
       value -> present?(value)
     end
   end
@@ -210,6 +217,15 @@ defmodule Ashiato.Settings do
   end
 
   defp secret_key_base do
-    Application.get_env(:ashiato, AshiatoWeb.Endpoint)[:secret_key_base]
+    case Application.get_env(:ashiato, AshiatoWeb.Endpoint) do
+      nil ->
+        raise ArgumentError,
+              "The Ashiato endpoint config is missing: SECRET_KEY_BASE cannot be read"
+
+      config ->
+        config[:secret_key_base] ||
+          raise ArgumentError,
+                "SECRET_KEY_BASE is missing: refusing to store a secret unencrypted"
+    end
   end
 end

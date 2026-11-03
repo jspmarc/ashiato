@@ -1,4 +1,4 @@
-defmodule Ashiato.DictCacheEntries do
+defmodule Ashiato.Schemas.DictCacheEntry do
   @moduledoc """
   Cached dictionary lookups — **global**, shared by all users (§6.3).
 

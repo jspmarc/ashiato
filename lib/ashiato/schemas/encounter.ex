@@ -1,4 +1,4 @@
-defmodule Ashiato.Encounters do
+defmodule Ashiato.Schemas.Encounter do
   @moduledoc """
   One sighting of a word on one page.
 
@@ -22,10 +22,10 @@ defmodule Ashiato.Encounters do
   import Ecto.Changeset
 
   schema "encounters" do
-    belongs_to :user, Ashiato.Users
-    belongs_to :word, Ashiato.Words
-    belongs_to :page, Ashiato.Pages
-    belongs_to :source, Ashiato.Sources
+    belongs_to :user, Ashiato.Schemas.User
+    belongs_to :word, Ashiato.Schemas.Word
+    belongs_to :page, Ashiato.Schemas.Page
+    belongs_to :source, Ashiato.Schemas.Source
 
     field :text_hash, :string
     # per-line crop, permanent: card front and OCR audit trail

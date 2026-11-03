@@ -1,4 +1,4 @@
-defmodule Ashiato.Documents do
+defmodule Ashiato.Schemas.Document do
   @moduledoc """
   A PDF upload. Its pages are ordinary rows in `pages`, linked back through
   `pages.document_id` and ordered by `pages.page_index` (zero-based).
@@ -7,7 +7,7 @@ defmodule Ashiato.Documents do
   use Ecto.Schema
 
   schema "documents" do
-    belongs_to :user, Ashiato.Users
+    belongs_to :user, Ashiato.Schemas.User
 
     field :filename, :string
     field :page_count, :integer
@@ -16,6 +16,6 @@ defmodule Ashiato.Documents do
 
     timestamps(type: :utc_datetime)
 
-    has_many :pages, Ashiato.Pages, foreign_key: :document_id
+    has_many :pages, Ashiato.Schemas.Page, foreign_key: :document_id
   end
 end

@@ -6,13 +6,13 @@ defmodule Ashiato.SrsTest do
   use ExUnit.Case, async: true
 
   alias Ashiato.Srs
-  alias Ashiato.WordStates
+  alias Ashiato.Schemas.WordState
 
   @now ~U[2026-11-01 12:00:00Z]
 
   describe "mature?/2" do
     test "stability drives maturity, not the due date" do
-      mature = %WordStates{
+      mature = %WordState{
         state: :review,
         stability: 30.0,
         difficulty: 5.0,
@@ -25,13 +25,13 @@ defmodule Ashiato.SrsTest do
     end
 
     test "a word below the threshold is not mature, however long its interval" do
-      young = %WordStates{state: :review, stability: 20.9, due_at: DateTime.add(@now, 400, :day)}
+      young = %WordState{state: :review, stability: 20.9, due_at: DateTime.add(@now, 400, :day)}
       refute Srs.mature?(young)
       assert Srs.mature?(young, 20)
     end
 
     test "a never-reviewed word is not mature" do
-      refute Srs.mature?(%WordStates{state: :new, stability: nil})
+      refute Srs.mature?(%WordState{state: :new, stability: nil})
     end
   end
 
@@ -57,7 +57,7 @@ defmodule Ashiato.SrsTest do
   describe "grade/3 first review" do
     test "grade 1 seeds the word as learning, due now, with the lapse counted" do
       %{state: next, interval_days: interval} =
-        Srs.grade(%WordStates{word_id: 7, state: :new, due_at: @now}, 1, @now)
+        Srs.grade(%WordState{word_id: 7, state: :new, due_at: @now}, 1, @now)
 
       assert interval == 0
       assert next.word_id == 7
@@ -73,7 +73,7 @@ defmodule Ashiato.SrsTest do
 
     test "grade 2 seeds the word as review, due the next day" do
       %{state: next, interval_days: interval} =
-        Srs.grade(%WordStates{word_id: 7, state: :new, due_at: @now}, 2, @now)
+        Srs.grade(%WordState{word_id: 7, state: :new, due_at: @now}, 2, @now)
 
       assert next.state == :review
       assert next.reps == 1
@@ -89,7 +89,7 @@ defmodule Ashiato.SrsTest do
 
     test "grade 3 seeds the word as review, due in two days" do
       %{state: next, interval_days: interval} =
-        Srs.grade(%WordStates{word_id: 7, state: :new, due_at: @now}, 3, @now)
+        Srs.grade(%WordState{word_id: 7, state: :new, due_at: @now}, 3, @now)
 
       assert next.state == :review
       assert next.reps == 1
@@ -105,7 +105,7 @@ defmodule Ashiato.SrsTest do
 
     test "grade 4 seeds the word as review, due after the S0 interval" do
       %{state: next, interval_days: interval} =
-        Srs.grade(%WordStates{word_id: 7, state: :new, due_at: @now}, 4, @now)
+        Srs.grade(%WordState{word_id: 7, state: :new, due_at: @now}, 4, @now)
 
       assert next.state == :review
       assert next.reps == 1
@@ -124,7 +124,7 @@ defmodule Ashiato.SrsTest do
       for {grade, s0, d0} <-
             [{2, 1.2931, 5.112170705601055}, {3, 2.3065, 2.118103970459015}] do
         %{state: next, interval_days: interval} =
-          Srs.grade(%WordStates{word_id: 7, state: :new, due_at: @now}, grade, @now)
+          Srs.grade(%WordState{word_id: 7, state: :new, due_at: @now}, grade, @now)
 
         assert next.state == :review
         assert next.reps == 1
@@ -141,7 +141,7 @@ defmodule Ashiato.SrsTest do
 
   describe "grade/3 lapses" do
     test "a lapse from review drops to relearning, schedules the FSRS interval, counts the lapse" do
-      state = %WordStates{
+      state = %WordState{
         word_id: 3,
         state: :review,
         stability: 40.0,
@@ -164,7 +164,7 @@ defmodule Ashiato.SrsTest do
     end
 
     test "failing a learning word applies post-lapse stability and stays in learning" do
-      state = %WordStates{
+      state = %WordState{
         word_id: 1,
         state: :learning,
         stability: 0.212,
@@ -187,7 +187,7 @@ defmodule Ashiato.SrsTest do
     end
 
     test "failing a relearning word keeps it there with its FSRS interval" do
-      state = %WordStates{
+      state = %WordState{
         word_id: 2,
         state: :relearning,
         stability: 5.0,
@@ -210,7 +210,7 @@ defmodule Ashiato.SrsTest do
 
   describe "grade/3 passes" do
     test "passing a learning word graduates it to review" do
-      state = %WordStates{
+      state = %WordState{
         word_id: 1,
         state: :learning,
         stability: 0.4872,
@@ -232,7 +232,7 @@ defmodule Ashiato.SrsTest do
     end
 
     test "a same-day good review grows stability by the short-term formula" do
-      state = %WordStates{
+      state = %WordState{
         word_id: 1,
         state: :learning,
         stability: 0.212,
@@ -250,7 +250,7 @@ defmodule Ashiato.SrsTest do
     end
 
     test "passing a relearning word returns it to review" do
-      state = %WordStates{
+      state = %WordState{
         word_id: 2,
         state: :relearning,
         stability: 3.0,
@@ -271,7 +271,7 @@ defmodule Ashiato.SrsTest do
     end
 
     test "a good review from review grows stability and schedules the interval" do
-      state = %WordStates{
+      state = %WordState{
         word_id: 4,
         state: :review,
         stability: 10.0,
@@ -293,7 +293,7 @@ defmodule Ashiato.SrsTest do
     end
 
     test "hard grows stability less than good, easy more" do
-      state = %WordStates{
+      state = %WordState{
         word_id: 4,
         state: :review,
         stability: 10.0,

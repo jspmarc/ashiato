@@ -1,4 +1,4 @@
-defmodule Ashiato.ReviewEvents do
+defmodule Ashiato.Schemas.ReviewEvent do
   @moduledoc """
   Append-only review log.
 
@@ -17,8 +17,8 @@ defmodule Ashiato.ReviewEvents do
   import Ecto.Changeset
 
   schema "review_events" do
-    belongs_to :user, Ashiato.Users
-    belongs_to :word, Ashiato.Words
+    belongs_to :user, Ashiato.Schemas.User
+    belongs_to :word, Ashiato.Schemas.Word
 
     # FSRS grade 1..4
     field :grade, :integer

@@ -1,6 +1,6 @@
 defmodule Ashiato.Srs do
   @moduledoc """
-  The FSRS-6 scheduler as pure functions over `Ashiato.WordStates`: no Repo,
+  The FSRS-6 scheduler as pure functions over `Ashiato.Schemas.WordState`: no Repo,
   no clock, no IO (§6.4 — FSRS computes from grades alone).
 
   Sources (FSRS-6, 21 weights):
@@ -25,7 +25,7 @@ defmodule Ashiato.Srs do
   count is a day count.
   """
 
-  alias Ashiato.WordStates
+  alias Ashiato.Schemas.WordState
 
   @typedoc "The FSRS grade: 1 = again, 2 = hard, 3 = good, 4 = easy."
   @type grade :: 1..4
@@ -85,13 +85,13 @@ defmodule Ashiato.Srs do
   @doc """
   Grades one review and returns the next FSRS state.
 
-  `word_state` is the current `%Ashiato.WordStates{}` (state `:new`,
+  `word_state` is the current `%Ashiato.Schemas.WordState{}` (state `:new`,
   `:learning`, `:review` or `:relearning`; `last_reviewed_at` may be nil for a
   never-reviewed word, and the latter three imply `stability`/`difficulty` are
   set). `grade` is the FSRS grade 1..4: 1 again, 2 hard, 3 good, 4 easy. `now`
   is any `DateTime`, fractional or not.
 
-  Returns `%{state: %Ashiato.WordStates{}, interval_days: integer()}` — the
+  Returns `%{state: %Ashiato.Schemas.WordState{}, interval_days: integer()}` — the
   updated struct (same `word_id`, new state/stability/difficulty/reps/lapses,
   `last_reviewed_at = now`, `due_at = now + interval_days`) plus the integer
   FSRS interval that `due_at` was computed from.
@@ -101,11 +101,11 @@ defmodule Ashiato.Srs do
   (`:learning`, `:review` or `:relearning`), from which the retrievability
   `R(t, S)` is computed. `t == 0` selects the short-term stability formula.
   """
-  @spec grade(WordStates.t(), grade(), DateTime.t()) :: %{
-          state: WordStates.t(),
+  @spec grade(WordState.t(), grade(), DateTime.t()) :: %{
+          state: WordState.t(),
           interval_days: integer()
         }
-  def grade(%WordStates{} = word_state, grade, %DateTime{} = now)
+  def grade(%WordState{} = word_state, grade, %DateTime{} = now)
       when grade in [@grade_again, @grade_hard, @grade_good, @grade_easy] do
     if word_state.state == :new do
       initial_review(word_state, grade, now)
@@ -120,7 +120,7 @@ defmodule Ashiato.Srs do
   Maturity is stability-based, never interval-based: stability is FSRS's own
   measure of memory strength, while the interval is a scheduling choice.
   """
-  @spec mature?(WordStates.t() | map(), number()) :: boolean()
+  @spec mature?(WordState.t() | map(), number()) :: boolean()
   def mature?(%{stability: stability}, threshold \\ @maturity_days) do
     not is_nil(stability) and stability >= threshold
   end
@@ -141,9 +141,9 @@ defmodule Ashiato.Srs do
 
   # S0(G) = clamp(w[G-1], Smin, Smax);
   # D0(G) = clamp(w4 - e^(w5 * (G - 1)) + 1, Dmin, Dmax)
-  @spec initial_review(WordStates.t(), grade(), DateTime.t()) ::
-          %{state: WordStates.t(), interval_days: integer()}
-  defp initial_review(%WordStates{} = word_state, grade, now) do
+  @spec initial_review(WordState.t(), grade(), DateTime.t()) ::
+          %{state: WordState.t(), interval_days: integer()}
+  defp initial_review(%WordState{} = word_state, grade, now) do
     stability = initial_stability(grade)
     difficulty = initial_difficulty(grade)
 
@@ -155,7 +155,7 @@ defmodule Ashiato.Srs do
         {:review, success_interval(stability), 0}
       end
 
-    next = %WordStates{
+    next = %WordState{
       word_state
       | state: state,
         stability: stability,
@@ -185,16 +185,16 @@ defmodule Ashiato.Srs do
 
   ## reviews of a word that has stability and difficulty (:learning, :review, :relearning)
 
-  @spec reviewed(WordStates.t(), grade(), DateTime.t()) ::
-          %{state: WordStates.t(), interval_days: integer()}
-  defp reviewed(%WordStates{} = word_state, grade, now) do
+  @spec reviewed(WordState.t(), grade(), DateTime.t()) ::
+          %{state: WordState.t(), interval_days: integer()}
+  defp reviewed(%WordState{} = word_state, grade, now) do
     elapsed_days = elapsed_days(word_state.last_reviewed_at, now)
     retrievability = retrievability(elapsed_days, word_state.stability)
 
     {state, stability, difficulty, interval_days} =
       transition(word_state, grade, elapsed_days, retrievability)
 
-    next = %WordStates{
+    next = %WordState{
       word_state
       | state: state,
         stability: stability,
@@ -210,9 +210,9 @@ defmodule Ashiato.Srs do
 
   # same-day review: FSRS-6 replaces the long-term growth/lapse formulas with
   # the short-term stability formula
-  @spec transition(WordStates.t(), grade(), non_neg_integer(), float()) ::
+  @spec transition(WordState.t(), grade(), non_neg_integer(), float()) ::
           {1 | 2 | 3, float(), float(), non_neg_integer()}
-  defp transition(%WordStates{state: state, stability: s, difficulty: d}, grade, 0, _r) do
+  defp transition(%WordState{state: state, stability: s, difficulty: d}, grade, 0, _r) do
     stability = short_term_stability(s, grade)
     interval_days = if grade == @grade_again, do: 0, else: success_interval(stability)
 
@@ -222,7 +222,7 @@ defmodule Ashiato.Srs do
   # again after a day or more (lapse): relearning; post-lapse stability Sf is
   # capped at S / e^(w17 * w18), and the due date follows FSRS
   defp transition(
-         %WordStates{state: state, stability: s, difficulty: d},
+         %WordState{state: state, stability: s, difficulty: d},
          @grade_again,
          _elapsed,
          r
@@ -236,7 +236,7 @@ defmodule Ashiato.Srs do
   # good/hard/easy after a day or more: the interval stretches by the FSRS
   # growth factor (hard and easy scaled by w15/w16), difficulty mean-reverts
   # toward D0(4)
-  defp transition(%WordStates{state: state, stability: s, difficulty: d}, grade, _elapsed, r)
+  defp transition(%WordState{state: state, stability: s, difficulty: d}, grade, _elapsed, r)
        when grade >= @grade_hard do
     stability = post_success_stability(s, d, r, grade)
     {next_state(state, grade), stability, next_difficulty(d, grade), success_interval(stability)}

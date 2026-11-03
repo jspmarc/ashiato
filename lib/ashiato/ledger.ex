@@ -4,7 +4,7 @@ defmodule Ashiato.Ledger do
   sighting of it, and that populates `user_id` (no auth yet, so this module is
   the single place that changes when auth arrives).
 
-  Identity is global (`Ashiato.Lexemes`, shared by all users); everything this
+  Identity is global (`Ashiato.Schemas.Lexeme`, shared by all users); everything this
   module writes downstream of it is per user, carried explicitly via `user_id`
   on the arguments.
 
@@ -15,16 +15,16 @@ defmodule Ashiato.Ledger do
 
   import Ecto.Query
 
-  alias Ashiato.Encounters
-  alias Ashiato.Lexemes
-  alias Ashiato.Pages
+  alias Ashiato.Schemas.Encounter
+  alias Ashiato.Schemas.Lexeme
+  alias Ashiato.Schemas.Page
   alias Ashiato.Repo
-  alias Ashiato.ReviewEvents
-  alias Ashiato.Sources
+  alias Ashiato.Schemas.ReviewEvent
+  alias Ashiato.Schemas.Source
   alias Ashiato.Srs
   alias Ashiato.Utils
-  alias Ashiato.WordStates
-  alias Ashiato.Words
+  alias Ashiato.Schemas.WordState
+  alias Ashiato.Schemas.Word
 
   # Mature(word) ⇔ stability ≥ 21 days. Stability, not interval: the interval
   # is clamped by the band caps, and with a cap below the threshold no word
@@ -68,27 +68,27 @@ defmodule Ashiato.Ledger do
   we insert, and if we lose the race against a concurrent caller the declared
   `lexemes_lemma_reading_part_of_speech_index` unique constraint surfaces as
   `{:error, changeset}`, after which we fetch the row the winner just wrote.
-  Returns `{:ok, %Lexemes{}}` whether we created it or not.
+  Returns `{:ok, %Lexeme{}}` whether we created it or not.
 
   `reading` is normalised `nil` → `""` to match the database default, so the
   `lexemes_lemma_reading_part_of_speech_index` unique index actually bites
   (multiple NULLs would pass).
   """
   @spec find_or_create_lexeme(String.t(), String.t() | nil, String.t() | nil) ::
-          {:ok, Lexemes.t()} | {:error, Ecto.Changeset.t()}
+          {:ok, Lexeme.t()} | {:error, Ecto.Changeset.t()}
   def find_or_create_lexeme(lemma, reading, part_of_speech) do
     reading = reading || ""
     identity = [lemma: lemma, reading: reading, part_of_speech: part_of_speech]
 
-    case Repo.get_by(Lexemes, identity) do
-      %Lexemes{} = existing ->
+    case Repo.get_by(Lexeme, identity) do
+      %Lexeme{} = existing ->
         {:ok, existing}
 
       nil ->
         # reading goes on the struct, not through the changeset: cast/3 would
-        # turn "" into nil (see Lexemes.changeset/2).
-        %Lexemes{reading: reading}
-        |> Lexemes.changeset(%{lemma: lemma, part_of_speech: part_of_speech})
+        # turn "" into nil (see Lexeme.changeset/2).
+        %Lexeme{reading: reading}
+        |> Lexeme.changeset(%{lemma: lemma, part_of_speech: part_of_speech})
         |> Repo.insert()
         |> case do
           {:ok, lexeme} ->
@@ -98,8 +98,8 @@ defmodule Ashiato.Ledger do
             # A uniqueness race: the winner's row must be there now. Should the
             # failure have been a validation error instead, the refetch finds
             # nothing and we surface the original changeset as-is.
-            case Repo.get_by(Lexemes, identity) do
-              %Lexemes{} = existing -> {:ok, existing}
+            case Repo.get_by(Lexeme, identity) do
+              %Lexeme{} = existing -> {:ok, existing}
               nil -> {:error, changeset}
             end
         end
@@ -107,12 +107,12 @@ defmodule Ashiato.Ledger do
   end
 
   @doc """
-  Records one sighting of a word on one page. Returns `{:ok, %Encounters{}}`
+  Records one sighting of a word on one page. Returns `{:ok, %Encounter{}}`
   whether it was just inserted or already existed.
 
   Idempotent against `encounters_user_id_word_id_text_hash_index`
   (`(user_id, word_id, text_hash)`): on conflict the insert is a no-op — the
-  declaration in `Encounters.changeset/2` turns the constraint violation into
+  declaration in `Encounter.changeset/2` turns the constraint violation into
   `{:error, changeset}` instead of a raise — and the row that already exists is
   fetched and returned. A duplicate therefore never raises and never writes;
   since encounters are only ever soft-deleted (`discarded_at`), that row is
@@ -124,25 +124,25 @@ defmodule Ashiato.Ledger do
   `bbox`. `user_id` is set programmatically, never cast.
   """
   @spec record_encounter(keyword() | map()) ::
-          {:ok, Encounters.t()} | {:error, Ecto.Changeset.t()}
+          {:ok, Encounter.t()} | {:error, Ecto.Changeset.t()}
   def record_encounter(attrs) do
     attrs = Map.new(attrs)
     user_id = Map.fetch!(attrs, :user_id)
 
-    %Encounters{user_id: user_id}
-    |> Encounters.changeset(Map.delete(attrs, :user_id))
+    %Encounter{user_id: user_id}
+    |> Encounter.changeset(Map.delete(attrs, :user_id))
     |> Repo.insert()
     |> case do
       {:ok, encounter} ->
         {:ok, encounter}
 
       {:error, changeset} ->
-        case Repo.get_by(Encounters,
+        case Repo.get_by(Encounter,
                user_id: user_id,
                word_id: attrs[:word_id],
                text_hash: attrs[:text_hash]
              ) do
-          %Encounters{} = existing -> {:ok, existing}
+          %Encounter{} = existing -> {:ok, existing}
           nil -> {:error, changeset}
         end
     end
@@ -157,8 +157,8 @@ defmodule Ashiato.Ledger do
 
   Everything happens in one `Repo` transaction:
 
-    1. the `Words` row is fetched for `user_id` (error if missing)
-    2. the current `WordStates` is fetched; an absent row just means *new*
+    1. the `Word` row is fetched for `user_id` (error if missing)
+    2. the current `WordState` is fetched; an absent row just means *new*
        (state :new) — the state is rebuildable from the log, per §6.8
     3. the review is appended to `review_events` (append-only; the log is the
        source of truth)
@@ -166,15 +166,15 @@ defmodule Ashiato.Ledger do
 
   `user_id` is set programmatically, never cast (AGENTS Ecto house rule).
 
-  Returns `{:ok, %WordStates{}}` (with `due_at` = `now` + the scheduled
+  Returns `{:ok, %WordState{}}` (with `due_at` = `now` + the scheduled
   interval) or `{:error, changeset}`. `review/2` reviews now; pass `now`
   explicitly in tests for determinism.
   """
-  @spec review(integer(), Srs.grade()) :: {:ok, WordStates.t()} | {:error, Ecto.Changeset.t()}
+  @spec review(integer(), Srs.grade()) :: {:ok, WordState.t()} | {:error, Ecto.Changeset.t()}
   def review(word_id, grade), do: review(word_id, grade, DateTime.utc_now())
 
   @spec review(integer(), Srs.grade(), DateTime.t()) ::
-          {:ok, WordStates.t()} | {:error, Ecto.Changeset.t()}
+          {:ok, WordState.t()} | {:error, Ecto.Changeset.t()}
   def review(word_id, grade, now) when is_integer(grade) and grade in 1..4 do
     Repo.transaction(fn ->
       case do_review(word_id, grade, now) do
@@ -190,23 +190,23 @@ defmodule Ashiato.Ledger do
 
   def review(_word_id, _grade, _now) do
     {:error,
-     %ReviewEvents{}
+     %ReviewEvent{}
      |> Ecto.Changeset.change()
      |> Ecto.Changeset.add_error(:grade, "must be an FSRS grade between 1 and 4")}
   end
 
   @spec do_review(integer(), Srs.grade(), DateTime.t()) ::
-          {:ok, WordStates.t()} | {:error, Ecto.Changeset.t()}
+          {:ok, WordState.t()} | {:error, Ecto.Changeset.t()}
   defp do_review(word_id, grade, now) do
-    case Repo.get(Words, word_id) do
+    case Repo.get(Word, word_id) do
       nil ->
         {:error, missing_word_changeset(word_id)}
 
       word ->
         # a missing row means "new"
         word_state =
-          case Repo.get(WordStates, word_id) do
-            %WordStates{} = existing -> existing
+          case Repo.get(WordState, word_id) do
+            %WordState{} = existing -> existing
             nil -> new_word_state(word_id, now)
           end
 
@@ -251,13 +251,13 @@ defmodule Ashiato.Ledger do
           integer(),
           Srs.grade(),
           DateTime.t(),
-          WordStates.t(),
+          WordState.t(),
           integer()
         ) ::
-          {:ok, ReviewEvents.t()} | {:error, Ecto.Changeset.t()}
+          {:ok, ReviewEvent.t()} | {:error, Ecto.Changeset.t()}
   defp append_review_event(user_id, word_id, grade, now, next, interval_after) do
-    %ReviewEvents{user_id: user_id, word_id: word_id}
-    |> ReviewEvents.changeset(%{
+    %ReviewEvent{user_id: user_id, word_id: word_id}
+    |> ReviewEvent.changeset(%{
       grade: grade,
       reviewed_at: now,
       stability_after: next.stability,
@@ -267,8 +267,8 @@ defmodule Ashiato.Ledger do
     |> Repo.insert()
   end
 
-  @spec upsert_word_state(integer(), WordStates.t(), DateTime.t(), DateTime.t(), integer()) ::
-          {:ok, WordStates.t()} | {:error, Ecto.Changeset.t()}
+  @spec upsert_word_state(integer(), WordState.t(), DateTime.t(), DateTime.t(), integer()) ::
+          {:ok, WordState.t()} | {:error, Ecto.Changeset.t()}
   defp upsert_word_state(word_id, next, due_at, last_reviewed_at, failure_streak) do
     attrs = %{
       state: next.state,
@@ -281,14 +281,14 @@ defmodule Ashiato.Ledger do
       last_reviewed_at: last_reviewed_at
     }
 
-    %WordStates{word_id: word_id}
-    |> WordStates.changeset(attrs)
+    %WordState{word_id: word_id}
+    |> WordState.changeset(attrs)
     |> Repo.insert(on_conflict: [set: Map.to_list(attrs)], conflict_target: :word_id)
   end
 
-  @spec new_word_state(integer(), DateTime.t()) :: WordStates.t()
+  @spec new_word_state(integer(), DateTime.t()) :: WordState.t()
   defp new_word_state(word_id, now) do
-    %WordStates{
+    %WordState{
       word_id: word_id,
       state: :new,
       stability: nil,
@@ -302,7 +302,7 @@ defmodule Ashiato.Ledger do
 
   @spec missing_word_changeset(integer()) :: Ecto.Changeset.t()
   defp missing_word_changeset(word_id) do
-    %WordStates{word_id: word_id}
+    %WordState{word_id: word_id}
     |> Ecto.Changeset.change()
     |> Ecto.Changeset.add_error(:word_id, "does not exist")
   end
@@ -316,7 +316,7 @@ defmodule Ashiato.Ledger do
   @spec chrome_ratio(integer(), integer()) :: %{optional(integer()) => float()}
   def chrome_ratio(user_id, source_id) do
     pages =
-      from(p in Pages,
+      from(p in Page,
         where: p.user_id == ^user_id and p.source_id == ^source_id,
         select: count(p.id)
       )
@@ -325,7 +325,7 @@ defmodule Ashiato.Ledger do
     if pages == 0 do
       %{}
     else
-      from(e in Encounters,
+      from(e in Encounter,
         where: e.user_id == ^user_id and e.source_id == ^source_id,
         where: is_nil(e.discarded_at) and e.confirmed,
         select: {e.word_id, count(e.page_id, :distinct)},
@@ -357,12 +357,12 @@ defmodule Ashiato.Ledger do
         }
   def coverage(user_id, source_id) do
     row =
-      from(e in Encounters,
-        join: w in Words,
+      from(e in Encounter,
+        join: w in Word,
         on: w.id == e.word_id,
-        join: s in Sources,
+        join: s in Source,
         on: s.id == e.source_id,
-        left_join: ws in WordStates,
+        left_join: ws in WordState,
         on: ws.word_id == w.id,
         where: e.user_id == ^user_id and e.source_id == ^source_id,
         where: confirmed_encounter?(e),
@@ -402,10 +402,10 @@ defmodule Ashiato.Ledger do
           }
         ]
   def kanji_met_words(user_id, glyph) do
-    from(l in Lexemes,
-      join: w in Words,
+    from(l in Lexeme,
+      join: w in Word,
       on: w.lexeme_id == l.id and w.user_id == ^user_id,
-      join: e in Encounters,
+      join: e in Encounter,
       on: e.word_id == w.id and confirmed_encounter?(e),
       where: like(l.lemma, ^"%#{glyph}%"),
       group_by: [l.id, l.lemma, l.reading, l.part_of_speech],
@@ -440,12 +440,12 @@ defmodule Ashiato.Ledger do
   @spec kanji_known?(integer(), String.t()) :: boolean()
   def kanji_known?(user_id, glyph) do
     row =
-      from(l in Lexemes,
-        join: w in Words,
+      from(l in Lexeme,
+        join: w in Word,
         on: w.lexeme_id == l.id and w.user_id == ^user_id,
-        join: e in Encounters,
+        join: e in Encounter,
         on: e.word_id == w.id and confirmed_encounter?(e),
-        left_join: ws in WordStates,
+        left_join: ws in WordState,
         on: ws.word_id == w.id,
         where: like(l.lemma, ^"%#{glyph}%"),
         select: %{
@@ -485,10 +485,10 @@ defmodule Ashiato.Ledger do
   def kanji_map(user_id) do
     # distinct (page, day, lemma) rows — the exact per-glyph evidence.
     sightings =
-      from(l in Lexemes,
-        join: w in Words,
+      from(l in Lexeme,
+        join: w in Word,
         on: w.lexeme_id == l.id and w.user_id == ^user_id,
-        join: e in Encounters,
+        join: e in Encounter,
         on: e.word_id == w.id and confirmed_encounter?(e),
         distinct: true,
         select: %{page_id: e.page_id, seen_on: e.seen_on, lemma: l.lemma}
@@ -499,12 +499,12 @@ defmodule Ashiato.Ledger do
     # dates come from the sightings above, since summing per-word counts would
     # double-count across words sharing a kanji.
     word_facts =
-      from(l in Lexemes,
-        join: w in Words,
+      from(l in Lexeme,
+        join: w in Word,
         on: w.lexeme_id == l.id and w.user_id == ^user_id,
-        join: e in Encounters,
+        join: e in Encounter,
         on: e.word_id == w.id and confirmed_encounter?(e),
-        left_join: ws in WordStates,
+        left_join: ws in WordState,
         on: ws.word_id == w.id,
         group_by: [l.id, l.lemma],
         select: %{
@@ -579,6 +579,7 @@ defmodule Ashiato.Ledger do
       has_mature_word: stats.mature?
     }
   end
+
   @doc """
   Introduces words to the review queue: each qualifying lexeme gets the
   `word_states` row whose absence marks it as not yet introduced. A lexeme
@@ -591,7 +592,7 @@ defmodule Ashiato.Ledger do
   introduced words in the order the lexeme ids were given.
   """
   @spec introduce_words(integer(), [integer()], keyword()) ::
-          {:ok, [Words.t()]} | {:error, term()}
+          {:ok, [Word.t()]} | {:error, term()}
   def introduce_words(user_id, lexeme_ids, opts \\ []) do
     force? = Keyword.get(opts, :force, false)
     min_encounters = Keyword.get(opts, :min_encounters, @min_encounters)
@@ -613,13 +614,13 @@ defmodule Ashiato.Ledger do
   card; encounters keep counting. Returns `{:error, :not_found}` when the user
   has no `words` row for that lexeme.
   """
-  @spec mark_known(integer(), integer()) :: {:ok, Words.t()} | {:error, :not_found}
+  @spec mark_known(integer(), integer()) :: {:ok, Word.t()} | {:error, :not_found}
   def mark_known(user_id, lexeme_id) do
-    case Repo.get_by(Words, user_id: user_id, lexeme_id: lexeme_id) do
+    case Repo.get_by(Word, user_id: user_id, lexeme_id: lexeme_id) do
       nil ->
         {:error, :not_found}
 
-      %Words{} = word ->
+      %Word{} = word ->
         word
         |> Ecto.Changeset.change(known: true)
         |> Repo.update()
@@ -632,14 +633,14 @@ defmodule Ashiato.Ledger do
   `(user_id, text_hash)` — the same screen re-uploaded — returns
   `{:error, changeset}` instead of inserting.
   """
-  @spec create_page(map() | keyword()) :: {:ok, Pages.t()} | {:error, Ecto.Changeset.t()}
+  @spec create_page(map() | keyword()) :: {:ok, Page.t()} | {:error, Ecto.Changeset.t()}
   def create_page(attrs) do
     attrs = Map.new(attrs)
     user_id = Map.fetch!(attrs, :user_id)
     attrs = attrs |> Map.delete(:user_id) |> Map.put_new(:status, :uploaded)
 
-    %Pages{user_id: user_id}
-    |> Pages.changeset(attrs)
+    %Page{user_id: user_id}
+    |> Page.changeset(attrs)
     |> Repo.insert()
   end
 
@@ -652,17 +653,17 @@ defmodule Ashiato.Ledger do
   struct matches no rows and returns `{:error, :superseded}`, so two concurrent
   corrections cannot both write the same revision.
   """
-  @spec accept_text(Pages.t(), String.t()) ::
-          {:ok, Pages.t()} | {:error, :superseded}
-  def accept_text(%Pages{} = page, text) do
-    query = from(p in Pages, where: p.id == ^page.id and p.revision == ^page.revision)
+  @spec accept_text(Page.t(), String.t()) ::
+          {:ok, Page.t()} | {:error, :superseded}
+  def accept_text(%Page{} = page, text) do
+    query = from(p in Page, where: p.id == ^page.id and p.revision == ^page.revision)
 
     {count, _} =
       Repo.update_all(query, set: [accepted_text: text, revision: page.revision + 1])
 
     case count do
       0 -> {:error, :superseded}
-      1 -> {:ok, Repo.get!(Pages, page.id)}
+      1 -> {:ok, Repo.get!(Page, page.id)}
     end
   end
 
@@ -672,20 +673,20 @@ defmodule Ashiato.Ledger do
   `{:error, :superseded}`; a move the pipeline forbids returns
   `{:error, :invalid_transition}`.
   """
-  @spec finish_page(Pages.t(), atom()) ::
-          {:ok, Pages.t()} | {:error, :superseded | :invalid_transition}
-  def finish_page(%Pages{} = page, status) do
+  @spec finish_page(Page.t(), atom()) ::
+          {:ok, Page.t()} | {:error, :superseded | :invalid_transition}
+  def finish_page(%Page{} = page, status) do
     unless valid_transition?(page.status, status) do
       {:error, :invalid_transition}
     else
-      query = from(p in Pages, where: p.id == ^page.id and p.revision == ^page.revision)
+      query = from(p in Page, where: p.id == ^page.id and p.revision == ^page.revision)
 
       {count, _} =
         Repo.update_all(query, set: [status: status])
 
       case count do
         0 -> {:error, :superseded}
-        1 -> {:ok, Repo.get!(Pages, page.id)}
+        1 -> {:ok, Repo.get!(Page, page.id)}
       end
     end
   end
@@ -694,13 +695,13 @@ defmodule Ashiato.Ledger do
   Moves a page to the next status in the ingest pipeline, or to `:failed` from
   any non-terminal state. Anything else returns `{:error, :invalid_transition}`.
   """
-  @spec transition(Pages.t(), atom()) :: {:ok, Pages.t()} | {:error, :invalid_transition}
-  def transition(%Pages{} = page, status) do
+  @spec transition(Page.t(), atom()) :: {:ok, Page.t()} | {:error, :invalid_transition}
+  def transition(%Page{} = page, status) do
     unless valid_transition?(page.status, status) do
       {:error, :invalid_transition}
     else
       page
-      |> Pages.changeset(%{status: status})
+      |> Page.changeset(%{status: status})
       |> Repo.update()
     end
   end
@@ -721,13 +722,13 @@ defmodule Ashiato.Ledger do
   reason and `{:error, :not_found}` when there is no `words` row.
   """
   @spec mark_suspended(integer(), integer(), atom()) ::
-          {:ok, Words.t()} | {:error, Ecto.Changeset.t()} | {:error, :not_found}
+          {:ok, Word.t()} | {:error, Ecto.Changeset.t()} | {:error, :not_found}
   def mark_suspended(user_id, lexeme_id, reason) do
-    case Repo.get_by(Words, user_id: user_id, lexeme_id: lexeme_id) do
+    case Repo.get_by(Word, user_id: user_id, lexeme_id: lexeme_id) do
       nil ->
         {:error, :not_found}
 
-      %Words{} = word ->
+      %Word{} = word ->
         reason =
           if word.suspended and not is_nil(word.suspended_reason) do
             word.suspended_reason
@@ -754,7 +755,7 @@ defmodule Ashiato.Ledger do
   un-suspends it only if that was its reason, so manual and mastered suspensions
   survive. Returns the user's chrome-like words after the run.
   """
-  @spec update_chrome_like(integer()) :: {:ok, [Words.t()]}
+  @spec update_chrome_like(integer()) :: {:ok, [Word.t()]}
   def update_chrome_like(user_id) do
     chrome_ids = chrome_word_ids(user_id)
 
@@ -774,10 +775,10 @@ defmodule Ashiato.Ledger do
 
   # Resolves lexeme ids to this user's `words` rows; `:force` mints the missing
   # ones, since a never-met lexeme has no encounters to score (R3.4 force-add).
-  @spec resolve_words(integer(), [integer()], boolean()) :: [Words.t()]
+  @spec resolve_words(integer(), [integer()], boolean()) :: [Word.t()]
   defp resolve_words(user_id, lexeme_ids, force?) do
     existing =
-      Repo.all(from(w in Words, where: w.user_id == ^user_id and w.lexeme_id in ^lexeme_ids))
+      Repo.all(from(w in Word, where: w.user_id == ^user_id and w.lexeme_id in ^lexeme_ids))
 
     if force? do
       covered = MapSet.new(existing, & &1.lexeme_id)
@@ -795,16 +796,16 @@ defmodule Ashiato.Ledger do
   end
 
   # Fetch-first, so a lost insert race ends with the winner's row rather than a
-  # raise. `Words` has no changeset (both fields are set on the struct), so one
+  # raise. `Word` has no changeset (both fields are set on the struct), so one
   # is built here.
-  @spec find_or_create_word(integer(), integer()) :: {:ok, Words.t()}
+  @spec find_or_create_word(integer(), integer()) :: {:ok, Word.t()}
   defp find_or_create_word(user_id, lexeme_id) do
-    case Repo.get_by(Words, user_id: user_id, lexeme_id: lexeme_id) do
-      %Words{} = word ->
+    case Repo.get_by(Word, user_id: user_id, lexeme_id: lexeme_id) do
+      %Word{} = word ->
         {:ok, word}
 
       nil ->
-        %Words{user_id: user_id, lexeme_id: lexeme_id}
+        %Word{user_id: user_id, lexeme_id: lexeme_id}
         |> Ecto.Changeset.change()
         |> Ecto.Changeset.unique_constraint([:user_id, :lexeme_id])
         |> Repo.insert()
@@ -814,27 +815,27 @@ defmodule Ashiato.Ledger do
 
           # lost the race: the concurrent caller's row is there now
           {:error, _changeset} ->
-            {:ok, Repo.get_by!(Words, user_id: user_id, lexeme_id: lexeme_id)}
+            {:ok, Repo.get_by!(Word, user_id: user_id, lexeme_id: lexeme_id)}
         end
     end
   end
 
   # The qualifying half of the introduction query; ordering and the daily cap
   # belong to the caller. `:force` runs the same query with the threshold ignored.
-  @spec qualify([Words.t()], integer(), pos_integer(), boolean()) :: [Words.t()]
+  @spec qualify([Word.t()], integer(), pos_integer(), boolean()) :: [Word.t()]
   defp qualify(words, user_id, min_encounters, force?) do
     word_ids = Enum.map(words, & &1.id)
 
     rows =
-      from(w in Words,
+      from(w in Word,
         where: w.user_id == ^user_id and w.id in ^word_ids,
         where: w.known == false and w.suspended == false and w.chrome_like == false,
         # anti-join: `is_nil` below keeps only words with no word_states row — not yet introduced
-        left_join: ws in WordStates,
+        left_join: ws in WordState,
         on: ws.word_id == w.id,
         where: is_nil(ws.word_id),
         # distinct pages; unconfirmed and discarded encounters count toward nothing
-        left_join: e in Encounters,
+        left_join: e in Encounter,
         on: e.word_id == w.id and e.confirmed == true and is_nil(e.discarded_at),
         group_by: w.id,
         select: {w, count(e.page_id, :distinct)}
@@ -848,9 +849,9 @@ defmodule Ashiato.Ledger do
     end
   end
 
-  @spec introduce_word(Words.t(), DateTime.t()) :: Words.t()
+  @spec introduce_word(Word.t(), DateTime.t()) :: Word.t()
   defp introduce_word(word, due_at) do
-    %WordStates{word_id: word.id, state: :new, due_at: due_at}
+    %WordState{word_id: word.id, state: :new, due_at: due_at}
     |> Repo.insert(on_conflict: :nothing, conflict_target: [:word_id])
     |> case do
       # `on_conflict: :nothing` also reports {:ok, _} when a concurrent caller
@@ -863,7 +864,7 @@ defmodule Ashiato.Ledger do
     end
   end
 
-  @spec in_lexeme_order([Words.t()], [integer()]) :: [Words.t()]
+  @spec in_lexeme_order([Word.t()], [integer()]) :: [Word.t()]
   defp in_lexeme_order(introduced, lexeme_ids) do
     by_lexeme = Map.new(introduced, &{&1.lexeme_id, &1})
     for(lexeme_id <- lexeme_ids, word = Map.get(by_lexeme, lexeme_id), do: word)
@@ -888,12 +889,12 @@ defmodule Ashiato.Ledger do
 
   @spec source_ids(integer()) :: [integer()]
   defp source_ids(user_id) do
-    Repo.all(from(s in Sources, where: s.user_id == ^user_id, select: s.id))
+    Repo.all(from(s in Source, where: s.user_id == ^user_id, select: s.id))
   end
 
   @spec flag_chrome(integer(), [integer()], DateTime.t()) :: {non_neg_integer(), nil}
   defp flag_chrome(user_id, chrome_ids, flagged_at) do
-    from(w in Words,
+    from(w in Word,
       where: w.user_id == ^user_id and w.id in ^chrome_ids and w.chrome_like == false
     )
     |> Repo.update_all(set: [chrome_like: true, updated_at: flagged_at])
@@ -902,7 +903,7 @@ defmodule Ashiato.Ledger do
   # Suspends rather than deletes, so card history and coverage survive.
   @spec suspend_chrome(integer(), [integer()], DateTime.t()) :: {non_neg_integer(), nil}
   defp suspend_chrome(user_id, chrome_ids, flagged_at) do
-    from(w in Words,
+    from(w in Word,
       where: w.user_id == ^user_id and w.id in ^chrome_ids and w.suspended == false
     )
     |> Repo.update_all(set: [suspended: true, suspended_reason: :chrome, updated_at: flagged_at])
@@ -912,7 +913,7 @@ defmodule Ashiato.Ledger do
   # that is now rare.
   @spec unflag_chrome(integer(), [integer()], DateTime.t()) :: {non_neg_integer(), nil}
   defp unflag_chrome(user_id, chrome_ids, flagged_at) do
-    from(w in Words,
+    from(w in Word,
       where: w.user_id == ^user_id and w.chrome_like == true and w.id not in ^chrome_ids
     )
     |> Repo.update_all(set: [chrome_like: false, updated_at: flagged_at])
@@ -922,7 +923,7 @@ defmodule Ashiato.Ledger do
   # rather than inferred.
   @spec unsuspend_chrome(integer(), [integer()], DateTime.t()) :: {non_neg_integer(), nil}
   defp unsuspend_chrome(user_id, chrome_ids, flagged_at) do
-    from(w in Words,
+    from(w in Word,
       where:
         w.user_id == ^user_id and w.suspended == true and w.suspended_reason == :chrome and
           w.id not in ^chrome_ids
@@ -930,9 +931,9 @@ defmodule Ashiato.Ledger do
     |> Repo.update_all(set: [suspended: false, suspended_reason: nil, updated_at: flagged_at])
   end
 
-  @spec chrome_words(integer()) :: [Words.t()]
+  @spec chrome_words(integer()) :: [Word.t()]
   defp chrome_words(user_id) do
-    Repo.all(from(w in Words, where: w.user_id == ^user_id and w.chrome_like == true))
+    Repo.all(from(w in Word, where: w.user_id == ^user_id and w.chrome_like == true))
   end
 
   # ── shared ──────────────────────────────────────────────────────────────────

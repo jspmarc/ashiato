@@ -1,4 +1,4 @@
-defmodule Ashiato.Settings do
+defmodule Ashiato.Schemas.Setting do
   @moduledoc """
   One row per user setting, `(user_id, key)` unique (erd.dbml).
 
@@ -12,7 +12,7 @@ defmodule Ashiato.Settings do
   use Ecto.Schema
 
   schema "settings" do
-    belongs_to :user, Ashiato.Users
+    belongs_to :user, Ashiato.Schemas.User
 
     field :key, :string
     # text column → :string, per the AGENTS.md house rule

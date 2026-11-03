@@ -1,4 +1,4 @@
-defmodule Ashiato.Lexemes do
+defmodule Ashiato.Schemas.Lexeme do
   @moduledoc """
   A lexical identity — **global**, shared by all users (§6.1, §6.3).
 

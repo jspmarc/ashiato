@@ -27,7 +27,8 @@ defmodule Ashiato.LedgerTest do
 
   import Ashiato.Fixtures
 
-  alias Ashiato.{Encounters, Ledger, Lexemes, Pages, Repo, ReviewEvents, Srs, WordStates}
+  alias Ashiato.{Ledger, Repo, Srs}
+  alias Ashiato.Schemas.{Encounter, Lexeme, Page, ReviewEvent, WordState}
 
   describe "find_or_create_lexeme/3" do
     test "creates the lexeme the first time and returns the same row the second" do
@@ -35,7 +36,7 @@ defmodule Ashiato.LedgerTest do
       assert {:ok, second} = Ledger.find_or_create_lexeme("食べる", "たべる", "verb")
 
       assert first.id == second.id
-      assert Repo.aggregate(Lexemes, :count) == 1
+      assert Repo.aggregate(Lexeme, :count) == 1
     end
 
     test "identity includes the reading, so homographs stay apart" do
@@ -44,7 +45,7 @@ defmodule Ashiato.LedgerTest do
       assert {:ok, sei} = Ledger.find_or_create_lexeme("生", "せい", "noun")
 
       refute nama.id == sei.id
-      assert Repo.aggregate(Lexemes, :count) == 2
+      assert Repo.aggregate(Lexeme, :count) == 2
     end
 
     test "a nil reading is normalised to an empty string" do
@@ -54,7 +55,7 @@ defmodule Ashiato.LedgerTest do
 
       assert first.id == second.id
       assert first.reading == ""
-      assert Repo.aggregate(Lexemes, :count) == 1
+      assert Repo.aggregate(Lexeme, :count) == 1
     end
 
     test "concurrent callers end up with one row" do
@@ -67,12 +68,12 @@ defmodule Ashiato.LedgerTest do
         )
         |> Enum.map(fn {:ok, result} -> result end)
 
-      assert Enum.all?(results, &match?({:ok, %Lexemes{}}, &1))
+      assert Enum.all?(results, &match?({:ok, %Lexeme{}}, &1))
 
       assert results |> Enum.map(fn {:ok, lexeme} -> lexeme.id end) |> Enum.uniq() |> length() ==
                1
 
-      assert Repo.aggregate(Lexemes, :count) == 1
+      assert Repo.aggregate(Lexeme, :count) == 1
     end
   end
 
@@ -85,10 +86,10 @@ defmodule Ashiato.LedgerTest do
     end
 
     test "review/2 delegates to review/3 with now", %{word: word} do
-      assert {:ok, %WordStates{} = state} = Ledger.review(word.id, 3)
+      assert {:ok, %WordState{} = state} = Ledger.review(word.id, 3)
       assert state.word_id == word.id
       assert state.state == :review
-      assert length(Repo.all(ReviewEvents)) == 1
+      assert length(Repo.all(ReviewEvent)) == 1
     end
 
     test "appends exactly one review_events row per grade", %{word: word} do
@@ -96,12 +97,12 @@ defmodule Ashiato.LedgerTest do
       day2 = ~U[2026-11-02 12:00:00.000000Z]
 
       assert {:ok, _} = Ledger.review(word.id, 3, day1)
-      assert Repo.aggregate(ReviewEvents, :count) == 1
+      assert Repo.aggregate(ReviewEvent, :count) == 1
 
       assert {:ok, _} = Ledger.review(word.id, 4, day2)
 
       # exactly one row per grade, in reviewed_at order
-      events = Repo.all(from re in ReviewEvents, order_by: re.reviewed_at)
+      events = Repo.all(from re in ReviewEvent, order_by: re.reviewed_at)
       assert [first, second] = events
 
       assert first.grade == 3
@@ -124,7 +125,7 @@ defmodule Ashiato.LedgerTest do
       day1 = ~U[2026-11-01 12:00:00Z]
       assert {:ok, state1} = Ledger.review(word.id, 3, day1)
 
-      assert Repo.aggregate(WordStates, :count) == 1
+      assert Repo.aggregate(WordState, :count) == 1
       assert state1.word_id == word.id
       assert state1.state == :review
       assert state1.reps == 1
@@ -139,7 +140,7 @@ defmodule Ashiato.LedgerTest do
       day2 = ~U[2026-11-02 12:00:00Z]
       assert {:ok, state2} = Ledger.review(word.id, 4, day2)
       # the upsert replaced the row, it did not add one
-      assert Repo.aggregate(WordStates, :count) == 1
+      assert Repo.aggregate(WordState, :count) == 1
 
       # and the row mirrors the FSRS result for the state review 1 left behind
       %{state: expected, interval_days: interval} = Srs.grade(state1, 4, day2)
@@ -170,7 +171,7 @@ defmodule Ashiato.LedgerTest do
       assert lapsed.due_at == DateTime.add(day2, 4, :hour)
 
       assert [lapse_event] =
-               Repo.all(from re in ReviewEvents, where: re.word_id == ^word.id and re.grade == 1)
+               Repo.all(from re in ReviewEvent, where: re.word_id == ^word.id and re.grade == 1)
 
       assert lapse_event.interval_after == 0
       assert same_instant?(lapse_event.reviewed_at, day2)
@@ -209,7 +210,7 @@ defmodule Ashiato.LedgerTest do
 
       [pass_event] =
         Repo.all(
-          from re in ReviewEvents, where: re.word_id == ^word.id and re.reviewed_at == ^passed_at
+          from re in ReviewEvent, where: re.word_id == ^word.id and re.reviewed_at == ^passed_at
         )
 
       assert pass_event.interval_after > 0
@@ -217,7 +218,7 @@ defmodule Ashiato.LedgerTest do
 
       failure_events =
         Repo.all(
-          from re in ReviewEvents,
+          from re in ReviewEvent,
             where: re.word_id == ^word.id and re.grade == 1,
             order_by: re.reviewed_at
         )
@@ -233,8 +234,8 @@ defmodule Ashiato.LedgerTest do
 
       assert errors[:grade]
       # nothing was written
-      assert Repo.aggregate(ReviewEvents, :count) == 0
-      assert Repo.aggregate(WordStates, :count) == 0
+      assert Repo.aggregate(ReviewEvent, :count) == 0
+      assert Repo.aggregate(WordState, :count) == 0
     end
   end
 
@@ -266,7 +267,7 @@ defmodule Ashiato.LedgerTest do
     test "records the first sighting", %{attrs: attrs} do
       assert {:ok, encounter} = Ledger.record_encounter(attrs)
       assert encounter.id
-      assert Repo.aggregate(Encounters, :count) == 1
+      assert Repo.aggregate(Encounter, :count) == 1
     end
 
     test "the same sighting twice is a no-op, not an exception", %{attrs: attrs} do
@@ -274,7 +275,7 @@ defmodule Ashiato.LedgerTest do
       assert {:ok, second} = Ledger.record_encounter(attrs)
 
       assert first.id == second.id
-      assert Repo.aggregate(Encounters, :count) == 1
+      assert Repo.aggregate(Encounter, :count) == 1
     end
 
     test "the same word on a different page is a second sighting", %{attrs: attrs, user: user} do
@@ -284,7 +285,7 @@ defmodule Ashiato.LedgerTest do
       second = %{attrs | page_id: other_page.id, text_hash: other_page.text_hash}
 
       assert {:ok, _} = Ledger.record_encounter(second)
-      assert Repo.aggregate(Encounters, :count) == 2
+      assert Repo.aggregate(Encounter, :count) == 2
     end
   end
 
@@ -732,7 +733,7 @@ defmodule Ashiato.LedgerTest do
       %{lexeme: lexeme} = met_word(user, source, 1)
 
       assert {:ok, []} = Ledger.introduce_words(user.id, [lexeme.id])
-      assert Repo.aggregate(WordStates, :count) == 0
+      assert Repo.aggregate(WordState, :count) == 0
     end
 
     test "a word at the threshold is introduced, due immediately and new",
@@ -742,7 +743,7 @@ defmodule Ashiato.LedgerTest do
       assert {:ok, [introduced]} = Ledger.introduce_words(user.id, [lexeme.id])
       assert introduced.id == word.id
 
-      assert [%WordStates{} = state] = Repo.all(WordStates)
+      assert [%WordState{} = state] = Repo.all(WordState)
       assert state.word_id == word.id
       assert state.state == :new
       assert %DateTime{} = state.due_at
@@ -765,14 +766,14 @@ defmodule Ashiato.LedgerTest do
       })
 
       assert {:ok, []} = Ledger.introduce_words(user.id, [lexeme.id])
-      assert Repo.aggregate(WordStates, :count) == 0
+      assert Repo.aggregate(WordState, :count) == 0
     end
 
     test "force: true bypasses the threshold", %{user: user, source: source} do
       %{lexeme: lexeme} = met_word(user, source, 1)
 
       assert {:ok, [_introduced]} = Ledger.introduce_words(user.id, [lexeme.id], force: true)
-      assert Repo.aggregate(WordStates, :count) == 1
+      assert Repo.aggregate(WordState, :count) == 1
     end
 
     test "force bypasses only the threshold, not the other filters",
@@ -789,7 +790,7 @@ defmodule Ashiato.LedgerTest do
       lexeme_ids = [known.lexeme.id, chrome.lexeme.id, suspended.lexeme.id]
 
       assert {:ok, []} = Ledger.introduce_words(user.id, lexeme_ids, force: true)
-      assert Repo.aggregate(WordStates, :count) == 0
+      assert Repo.aggregate(WordState, :count) == 0
     end
 
     test "the threshold is overridable per call", %{user: user, source: source} do
@@ -808,7 +809,7 @@ defmodule Ashiato.LedgerTest do
       assert {:ok, []} = Ledger.introduce_words(user.id, [lexeme.id])
       assert {:ok, []} = Ledger.introduce_words(user.id, [lexeme.id, lexeme.id])
 
-      assert Repo.aggregate(WordStates, :count) == 1
+      assert Repo.aggregate(WordState, :count) == 1
     end
 
     test "a lexeme with no words row is skipped unless forced", %{user: user} do
@@ -818,7 +819,7 @@ defmodule Ashiato.LedgerTest do
 
       assert {:ok, [minted]} = Ledger.introduce_words(user.id, [lexeme.id], force: true)
       assert minted.lexeme_id == lexeme.id
-      assert Repo.aggregate(WordStates, :count) == 1
+      assert Repo.aggregate(WordState, :count) == 1
     end
 
     test "returns only the introduced words, in the order given",
@@ -941,7 +942,7 @@ defmodule Ashiato.LedgerTest do
       assert reloaded.suspended and reloaded.suspended_reason == :chrome
 
       # suspended, never deleted: the card and its history survive
-      assert Repo.get!(WordStates, word.id)
+      assert Repo.get!(WordState, word.id)
     end
 
     test "when the flag lands on a suspended word, its reason is not clobbered", %{user: user} do
@@ -1107,7 +1108,7 @@ defmodule Ashiato.LedgerTest do
 
       assert {:ok, _} = Ledger.accept_text(page, "正しく読めた")
       assert {:error, :superseded} = Ledger.accept_text(stale, "別の修正")
-      assert %{accepted_text: "正しく読めた", revision: 2} = Repo.get!(Pages, page.id)
+      assert %{accepted_text: "正しく読めた", revision: 2} = Repo.get!(Page, page.id)
     end
 
     test "a matching revision write succeeds and does not bump revision",
@@ -1173,6 +1174,7 @@ defmodule Ashiato.LedgerTest do
 
     page
   end
+
   defp record_on(user, source, word, page, confirmed, seen_on) do
     Ledger.record_encounter(%{
       user_id: user.id,
@@ -1200,7 +1202,7 @@ defmodule Ashiato.LedgerTest do
   defp mature_state(word, stability) do
     reviewed_at = ~U[2026-10-01 00:00:00Z]
 
-    Repo.insert!(%WordStates{
+    Repo.insert!(%WordState{
       word_id: word.id,
       state: :review,
       stability: stability,

@@ -1,4 +1,4 @@
-defmodule Ashiato.Pages do
+defmodule Ashiato.Schemas.Page do
   @moduledoc """
   One photographed / uploaded screen (or one PDF page).
 
@@ -17,11 +17,11 @@ defmodule Ashiato.Pages do
   import Ecto.Changeset
 
   schema "pages" do
-    belongs_to :user, Ashiato.Users
+    belongs_to :user, Ashiato.Schemas.User
     # never null: a default source exists from day one
-    belongs_to :source, Ashiato.Sources
+    belongs_to :source, Ashiato.Schemas.Source
     # set only when this page came from a PDF
-    belongs_to :document, Ashiato.Documents
+    belongs_to :document, Ashiato.Schemas.Document
 
     field :page_index, :integer
     # object key in S3-compatible storage, not a filesystem path
@@ -39,7 +39,7 @@ defmodule Ashiato.Pages do
 
     timestamps(type: :utc_datetime)
 
-    has_many :encounters, Ashiato.Encounters, foreign_key: :page_id
+    has_many :encounters, Ashiato.Schemas.Encounter, foreign_key: :page_id
   end
 
   @doc """

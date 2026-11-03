@@ -8,8 +8,8 @@
 import Ecto.Query
 
 alias Ashiato.Repo
-alias Ashiato.Sources
-alias Ashiato.Users
+alias Ashiato.Schemas.Source
+alias Ashiato.Schemas.User
 
 # §6.2: no auth — a single default user is created on first boot, and the
 # context layer populates user_id.

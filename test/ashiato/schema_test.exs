@@ -16,17 +16,17 @@ defmodule Ashiato.SchemaTest do
   use Ashiato.DataCase
 
   @schemas [
-    Ashiato.Users,
-    Ashiato.Lexemes,
-    Ashiato.Settings,
-    Ashiato.DictCacheEntries,
-    Ashiato.Sources,
-    Ashiato.Documents,
-    Ashiato.Pages,
-    Ashiato.Words,
-    Ashiato.Encounters,
-    Ashiato.ReviewEvents,
-    Ashiato.WordStates
+    Ashiato.Schemas.User,
+    Ashiato.Schemas.Lexeme,
+    Ashiato.Schemas.Setting,
+    Ashiato.Schemas.DictCacheEntry,
+    Ashiato.Schemas.Source,
+    Ashiato.Schemas.Document,
+    Ashiato.Schemas.Page,
+    Ashiato.Schemas.Word,
+    Ashiato.Schemas.Encounter,
+    Ashiato.Schemas.ReviewEvent,
+    Ashiato.Schemas.WordState
   ]
 
   defp table_columns(table) do

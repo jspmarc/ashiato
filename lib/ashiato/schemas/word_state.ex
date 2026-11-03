@@ -1,8 +1,8 @@
-defmodule Ashiato.WordStates do
+defmodule Ashiato.Schemas.WordState do
   @moduledoc """
   FSRS materialisation, keyed by `word_id`.
 
-  Derived from — and rebuildable from — `Ashiato.ReviewEvents`; not a
+  Derived from — and rebuildable from — `Ashiato.Schemas.ReviewEvent`; not a
   first-class entity, hence the primary key being the foreign key itself.
 
   `state` is an `Ecto.Enum` backed by the `word_states_state_valid` CHECK:
@@ -27,7 +27,7 @@ defmodule Ashiato.WordStates do
 
   @primary_key {:word_id, :id, autogenerate: false}
   schema "word_states" do
-    belongs_to :word, Ashiato.Words, define_field: false, foreign_key: :word_id
+    belongs_to :word, Ashiato.Schemas.Word, define_field: false, foreign_key: :word_id
 
     field :state, Ecto.Enum,
       values: [new: 0, learning: 1, review: 2, relearning: 3],

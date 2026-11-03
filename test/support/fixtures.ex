@@ -8,14 +8,15 @@ defmodule Ashiato.Fixtures do
   a source. Tests need to build those deliberately.
   """
 
-  alias Ashiato.{Lexemes, Pages, Repo, Sources, Users, Words}
+  alias Ashiato.Repo
+  alias Ashiato.Schemas.{Lexeme, Page, Source, User, Word}
 
   @doc """
   A user. One is all this app has, but tests need more than one to prove that
   lanterns do not leak across them.
   """
   def user_fixture(attrs \\ %{}) do
-    %Users{}
+    %User{}
     |> Ecto.Changeset.change(attrs)
     |> Repo.insert!()
   end
@@ -32,7 +33,7 @@ defmodule Ashiato.Fixtures do
         kind: :game
       })
 
-    %Sources{}
+    %Source{}
     |> Ecto.Changeset.change(attrs)
     |> Repo.insert!()
   end
@@ -51,7 +52,7 @@ defmodule Ashiato.Fixtures do
         part_of_speech: "noun"
       })
 
-    %Lexemes{}
+    %Lexeme{}
     |> Ecto.Changeset.change(attrs)
     |> Repo.insert!()
   end
@@ -72,7 +73,7 @@ defmodule Ashiato.Fixtures do
         status: :uploaded
       })
 
-    %Pages{}
+    %Page{}
     |> Ecto.Changeset.change(attrs)
     |> Repo.insert!()
   end
@@ -89,7 +90,7 @@ defmodule Ashiato.Fixtures do
         lexeme_id: lexeme_fixture().id
       })
 
-    %Words{}
+    %Word{}
     |> Ecto.Changeset.change(attrs)
     |> Repo.insert!()
   end

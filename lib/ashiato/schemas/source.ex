@@ -1,4 +1,4 @@
-defmodule Ashiato.Sources do
+defmodule Ashiato.Schemas.Source do
   @moduledoc """
   Where a page came from: a game, a manga, a book — or real life.
 
@@ -17,7 +17,7 @@ defmodule Ashiato.Sources do
   use Ecto.Schema
 
   schema "sources" do
-    belongs_to :user, Ashiato.Users
+    belongs_to :user, Ashiato.Schemas.User
 
     field :name, :string
     field :kind, Ecto.Enum, values: [:game, :manga, :book, :signage, :other]
@@ -25,6 +25,6 @@ defmodule Ashiato.Sources do
 
     timestamps(type: :utc_datetime)
 
-    has_many :pages, Ashiato.Pages, foreign_key: :source_id
+    has_many :pages, Ashiato.Schemas.Page, foreign_key: :source_id
   end
 end

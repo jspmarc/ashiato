@@ -1,4 +1,4 @@
-defmodule Ashiato.Users do
+defmodule Ashiato.Schemas.User do
   @moduledoc """
   The users table.
 

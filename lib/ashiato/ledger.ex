@@ -108,28 +108,26 @@ defmodule Ashiato.Ledger do
   end
 
   @doc """
-  Grades one review of a word and advances its scheduling state (§6.4).
+  Grades one review of a word and advances its scheduling state.
 
-  FSRS computes from grades alone (§6.4); the §6.6 occurrence bands only cap
-  how far the interval may stretch. So the split is: `Ashiato.Srs.grade/3`
-  produces the next state and the *uncapped* FSRS interval, and this function
-  applies `Ashiato.Srs.final_interval/2` — the cap derived from the word's
-  confirmed, non-discarded encounters — before writing anything.
+  `Ashiato.Srs.grade/3` produces the next state and the uncapped FSRS
+  interval, this function clamps that interval with
+  `Ashiato.Srs.final_interval/2` — derived from the word's confirmed,
+  non-discarded encounters — and writes it.
 
   Everything happens in one `Repo` transaction:
 
-    1. the `Words` row is fetched for `user_id` (error if missing)
-    2. the current `WordStates` is fetched; an absent row just means *new*
-       (state 0) — the state is rebuildable from the log, per §6.8
-    3. the review is appended to `review_events` (append-only; the log is the
-       source of truth)
-    4. `word_states` is upserted from it — a mere materialisation
+    1. the `Words` row is fetched (error if missing)
+    2. the current `WordStates` is fetched; an absent row means the word is
+       new (state 0)
+    3. the review is appended to `review_events`
+    4. `word_states` is upserted
 
-  `user_id` is set programmatically, never cast (AGENTS Ecto house rule).
+  `user_id` is set programmatically, never cast.
 
-  Returns `{:ok, %WordStates{}}` (with `due_at` = `now` + the capped
-  interval) or `{:error, changeset}`. `review/2` reviews now; pass `now`
-  explicitly in tests for determinism.
+  Returns `{:ok, %WordStates{}}` with `due_at` = `now` + the capped interval,
+  or `{:error, changeset}`. `review/2` reviews now; pass `now` explicitly in
+  tests for determinism.
   """
   @spec review(integer(), Srs.grade()) :: {:ok, WordStates.t()} | {:error, Ecto.Changeset.t()}
   def review(word_id, grade), do: review(word_id, grade, DateTime.utc_now())
@@ -161,14 +159,13 @@ defmodule Ashiato.Ledger do
       Repo.get(Words, word_id) ||
         Repo.rollback(missing_word_changeset(word_id))
 
-    # a missing row means "new": the state is rebuildable from the log (§6.8)
+    # a missing row means "new"
     word_state =
       case Repo.get(WordStates, word_id) do
         %WordStates{} = existing -> existing
         nil -> new_word_state(word_id, now)
       end
 
-    # FSRS computes from the grade alone; the caps are applied below
     %{state: next, interval_days: fsrs_interval} =
       Srs.grade(word_state, grade, now)
 
@@ -189,8 +186,8 @@ defmodule Ashiato.Ledger do
     end
   end
 
-  # §6.6 counting rules, as in chrome_ratio/2: an occurrence is a *distinct
-  # page*, and unconfirmed or discarded encounters count toward nothing.
+  # An occurrence is a distinct page; unconfirmed or discarded encounters
+  # count toward nothing.
   defp encounter_counts(user_id, word_id) do
     from(e in Encounters,
       where: e.user_id == ^user_id and e.word_id == ^word_id,
@@ -200,8 +197,7 @@ defmodule Ashiato.Ledger do
     |> Repo.one()
   end
 
-  # The log is append-only: rows are only ever inserted, never updated or
-  # deleted (§6.8).
+  # The log is append-only: rows are only inserted, never updated or deleted.
   defp append_review_event(user_id, word_id, grade, now, next, interval_after) do
     %ReviewEvents{user_id: user_id, word_id: word_id}
     |> ReviewEvents.changeset(%{

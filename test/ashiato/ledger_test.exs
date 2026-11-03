@@ -200,9 +200,9 @@ defmodule Ashiato.LedgerTest do
       assert event1.interval_after == 14
       assert state1.due_at == DateTime.add(day0, 14 * 86_400, :second)
 
-      # FSRS-4.5 clamps stability at Smax = 100 days, so the uncapped interval
-      # can never exceed 100 and the 240-day band never binds: it must leave
-      # every reachable interval alone
+      # stability grows unbounded (clamped at 36500 days), so with 3
+      # encounters the 240-day band need not bind: the uncapped interval
+      # must pass through
       assert {:ok, _state2} = Ledger.review(word.id, 4, day1)
       %{interval_days: uncapped} = Srs.grade(state1, 4, day1)
 
@@ -225,9 +225,9 @@ defmodule Ashiato.LedgerTest do
       assert {:ok, _heavy2} = Ledger.review(heavy.id, 4, day1)
       assert {:ok, heavy3} = Ledger.review(heavy.id, 4, day2)
 
-      # stability saturates at Smax = 100, so the uncapped interval is 100
-      # days — past the 60-day cap, which must now bite
-      assert heavy3.stability == 100.0
+      # stability is never clamped by the cap: grows past the 60-day band,
+      # which must bite on the interval alone
+      assert_in_delta heavy3.stability, 435.7889, 0.001
       assert heavy3.due_at == DateTime.add(day2, 60 * 86_400, :second)
 
       [heavy_event3] =
@@ -247,17 +247,17 @@ defmodule Ashiato.LedgerTest do
       assert {:ok, _} = Ledger.review(single.id, 4, day1)
       assert {:ok, single3} = Ledger.review(single.id, 4, day2)
 
-      # same review schedule as the heavy word, but no cap applies: stability
-      # saturates at Smax = 100 and the interval stays the uncapped 100 days
-      assert single3.stability == 100.0
-      assert single3.due_at == DateTime.add(day2, 100 * 86_400, :second)
+      # same review schedule as the heavy word, but no cap applies: the full
+      # FSRS interval passes through
+      assert_in_delta single3.stability, 435.7889, 0.001
+      assert single3.due_at == DateTime.add(day2, 436 * 86_400, :second)
 
       [single_event3] =
         Repo.all(
           from re in ReviewEvents, where: re.word_id == ^single.id and re.reviewed_at == ^day2
         )
 
-      assert single_event3.interval_after == 100
+      assert single_event3.interval_after == 436
     end
   end
 

@@ -1,8 +1,9 @@
 defmodule Ashiato.Srs do
   @moduledoc """
   The FSRS-4.5 scheduler as pure functions over `Ashiato.WordStates`: no Repo,
-  no clock, no IO (§6.4 — FSRS computes from grades alone; `Ashiato.Ledger`
-  caps how far the interval may stretch, never the stability).
+  no clock, no IO. It computes the next state and the uncapped interval from
+  review grades alone; `Ashiato.Ledger` applies the interval cap afterwards,
+  which clamps the scheduled interval but never the stability.
 
   Sources (FSRS-4.5, 17 weights):
 
@@ -11,11 +12,11 @@ defmodule Ashiato.Srs do
     * Default parameters `w0..w16` — awesome-fsrs wiki, "FSRS-4.5" section:
       https://github.com/open-spaced-repetition/awesome-fsrs/wiki/The-Algorithm
 
-  The model contract: stability in 0.001..100.0 days, difficulty in 1.0..10.0,
-  and states 0..3 (new / learning / review / relearning). This app has no
-  minute-scale learning steps — reviews are real, days-apart events — so a
-  first "again" parks the word in learning with the interval reset to 0 rather
-  than scheduling a sub-day step.
+  Stability is clamped to 0.001..36500.0 days (100 years, as fsrs-rs does) and
+  difficulty to 1.0..10.0; states are 0..3 (new / learning / review /
+  relearning). This app has no minute-scale learning steps — reviews are real,
+  days-apart events — so a first "again" parks the word in learning with the
+  interval reset to 0 rather than scheduling a sub-day step.
 
   The curves:
 
@@ -59,7 +60,7 @@ defmodule Ashiato.Srs do
   @factor 19 / 81
 
   @s_min 0.001
-  @s_max 100.0
+  @s_max 36500.0
   @d_min 1.0
   @d_max 10.0
 
@@ -68,20 +69,15 @@ defmodule Ashiato.Srs do
   @doc """
   Grades one review and returns the next FSRS state.
 
-  `word_state` is the current `%Ashiato.WordStates{}` (state 0..3;
-  `last_reviewed_at` may be nil for a never-reviewed word, and state 1..3
-  implies `stability`/`difficulty` are set). `grade` is the FSRS grade 1..4:
-  1 again, 2 hard, 3 good, 4 easy. `now` is any `DateTime`, fractional or not.
+  `word_state` is the current `%Ashiato.WordStates{}`. State 0 means the word
+  was never reviewed; states 1..3 carry `stability`/`difficulty`, and
+  `elapsed time` since `last_reviewed_at` feeds the retrievability of this
+  review. `grade` is the FSRS grade: 1 again, 2 hard, 3 good, 4 easy.
 
   Returns `%{state: %Ashiato.WordStates{}, interval_days: integer()}` — the
   updated struct (same `word_id`, new state/stability/difficulty/reps/lapses,
   `last_reviewed_at = now`, `due_at = now + interval_days`) plus the integer
-  FSRS interval that `due_at` was computed from, uncapped: `Ashiato.Ledger`
-  needs both, since the §6.6 band cap applies after the fact.
-
-  Elapsed days `t` is `max(0, fractional days between last_reviewed_at and
-  now)` — only meaningful once the word has stability and difficulty (state
-  1, 2 or 3), from which the retrievability `R(t, S)` is computed.
+  FSRS interval that `due_at` was computed from, uncapped.
   """
   @spec grade(WordStates.t(), 1..4, DateTime.t()) :: %{
           state: WordStates.t(),
@@ -96,9 +92,9 @@ defmodule Ashiato.Srs do
   end
 
   @doc """
-  The §6.6 interval cap for a word with `occurrences` distinct confirmed
-  encounter pages: 60 days at 20+ occurrences, 120 at 8..19, 240 at 3..7, and
-  `nil` (uncapped) at 2 or fewer.
+  Interval cap for a word's encounter band: 60 days at 20+ distinct confirmed
+  encounter pages, 120 at 8..19, 240 at 3..7, and `nil` (uncapped) at 2 or
+  fewer.
   """
   @spec cap_for_band(integer()) :: 60 | 120 | 240 | nil
   def cap_for_band(occurrences) when occurrences >= 20, do: 60
@@ -107,9 +103,9 @@ defmodule Ashiato.Srs do
   def cap_for_band(_occurrences), do: nil
 
   @doc """
-  The interval a review may actually schedule: `min(fsrs_interval, cap)` where
-  the cap is the word's §6.6 band (`cap_for_band/1`). Occurrences of 2 or
-  fewer are uncapped, so the interval passes through untouched.
+  The interval a review may actually schedule: the FSRS interval clamped by
+  the word's encounter band (`cap_for_band/1`). Words with 2 or fewer
+  encounters are uncapped.
   """
   @spec final_interval(integer(), integer()) :: integer()
   def final_interval(fsrs_interval_days, occurrences) do
@@ -122,9 +118,9 @@ defmodule Ashiato.Srs do
   @doc """
   Whether a word has crossed `threshold` days of stability (default 21).
 
-  Maturity is stability-based, never interval-based: the §6.6 caps clamp the
-  interval a review schedules, so a heavy word can be due again in days while
-  its stability says otherwise. Only `stability` decides.
+  Maturity is decided by stability, never by the scheduled interval: heavy
+  words can be due again in days while their stability says they know the
+  word.
   """
   @spec mature?(WordStates.t() | map(), number()) :: boolean()
   def mature?(%{stability: stability}, threshold \\ 21) do
@@ -132,10 +128,10 @@ defmodule Ashiato.Srs do
   end
 
   @doc """
-  Whether a word is a ghost (§6.6): seen on at least 5 distinct pages at a
-  density of at least 4 pages per day seen — a burst of chrome, not
-  vocabulary the user is meeting over time. `days_seen` of 0 counts as one
-  day (`max(days_seen, 1)`), so a same-day flood of 5+ pages is a ghost.
+  Whether a word is a ghost — massed exposure, not vocabulary met over time:
+  seen on at least 5 distinct pages at a density of at least 4 pages per day
+  seen. `days_seen` of 0 counts as one day (`max(days_seen, 1)`), so a
+  same-day flood of 5+ pages is a ghost.
   """
   @spec ghost?(%{occurrences: number(), days_seen: number()}) :: boolean()
   def ghost?(%{occurrences: occurrences, days_seen: days_seen}) do
@@ -146,7 +142,9 @@ defmodule Ashiato.Srs do
   ## first review (state 0)
 
   # S0(G) = clamp(w[G-1], Smin, Smax); D0(G) = clamp(w4 - (G-3) * w5, Dmin, Dmax)
-  defp initial_review(word_state, grade, now) do
+  @spec initial_review(WordStates.t(), grade(), DateTime.t()) ::
+          %{state: WordStates.t(), interval_days: integer()}
+  defp initial_review(%WordStates{} = word_state, grade, now) do
     stability = clamp(Enum.at(@weights, grade - 1), @s_min, @s_max)
     difficulty = initial_difficulty(grade)
 
@@ -178,7 +176,9 @@ defmodule Ashiato.Srs do
 
   ## reviews of a word that has stability and difficulty (states 1..3)
 
-  defp reviewed(word_state, grade, now) do
+  @spec reviewed(WordStates.t(), grade(), DateTime.t()) ::
+          %{state: WordStates.t(), interval_days: integer()}
+  defp reviewed(%WordStates{} = word_state, grade, now) do
     retrievability =
       retrievability(elapsed_days(word_state.last_reviewed_at, now), word_state.stability)
 

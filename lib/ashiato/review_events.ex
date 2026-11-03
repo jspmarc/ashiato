@@ -1,14 +1,14 @@
 defmodule Ashiato.ReviewEvents do
   @moduledoc """
-  Append-only review log; the source of truth for scheduling (§6.8).
+  Append-only review log; the source of truth for scheduling.
 
-  Replaying a word's history `(word_id, reviewed_at)` rebuilds `word_states`,
-  which is a mere materialisation of this log.
+  Replaying a word's review events `(word_id, reviewed_at)` rebuilds
+  `word_states`, which is a materialisation of this log.
 
-  `grade` is the FSRS grade as a plain integer, 1..4 (backed by the
-  `review_events_grade_valid` CHECK): 1 = again, 2 = hard, 3 = good, 4 = easy.
-  No timestamps of our own — `reviewed_at` *is* the timestamp, with usec
-  precision. `interval_after` may be 0: a lapse resets the interval.
+  `grade` is the FSRS grade 1..4 (backed by the `review_events_grade_valid`
+  CHECK): 1 = again, 2 = hard, 3 = good, 4 = easy. `reviewed_at` is the
+  timestamp, with usec precision. `interval_after` may be 0: a lapse resets
+  the interval.
   """
 
   use Ecto.Schema
@@ -32,11 +32,8 @@ defmodule Ashiato.ReviewEvents do
   Changeset for inserting a review event.
 
   `user_id` and `word_id` are set programmatically by the ledger, never cast.
-  All review log fields are required. Two declarations, one constraint (the
-  house pattern from `Encounters.changeset/2`): `validate_number/3` rejects
-  an out-of-range grade before the database does, and the
-  `review_events_grade_valid` CHECK is declared so anything that slips past
-  still arrives as `{:error, changeset}` instead of a raise.
+  All review log fields are required; the grade range validates in the app and
+  is backed by the `review_events_grade_valid` CHECK.
   """
   def changeset(event, attrs) do
     event

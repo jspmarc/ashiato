@@ -34,13 +34,15 @@ defmodule Ashiato.Translator do
 
   require Logger
 
+  # Keyed by the string the settings table stores (`translation_provider` is JSON, so it
+  # comes back as a binary), which also accepts the atom form.
   @providers %{
-    google_free: Ashiato.Translator.GoogleFree,
-    llm: Ashiato.Translator.Llm,
-    deepl: Ashiato.Translator.Deepl,
-    google_cloud: Ashiato.Translator.GoogleCloud,
-    libretranslate: Ashiato.Translator.LibreTranslate,
-    off: Ashiato.Translator.Off
+    "google_free" => Ashiato.Translator.GoogleFree,
+    "llm" => Ashiato.Translator.Llm,
+    "deepl" => Ashiato.Translator.Deepl,
+    "google_cloud" => Ashiato.Translator.GoogleCloud,
+    "libretranslate" => Ashiato.Translator.LibreTranslate,
+    "off" => Ashiato.Translator.Off
   }
 
   @doc """
@@ -69,11 +71,14 @@ defmodule Ashiato.Translator do
   end
 
   @doc """
-  The configured provider module, from
-  `Application.get_env(:ashiato, Ashiato.Translator, [])[:provider]`.
+  The configured provider module, or `Ashiato.Translator.Off` when the configured value
+  names no provider.
 
-  Defaults to `:google_free` (D45): the only provider that works on a fresh install
-  with no key, no URL, and no local server.
+  Defaults to `:google_free` (D45): the only provider that works on a fresh install with no
+  key, no URL, and no local server. An unknown provider fails **closed**: falling back to
+  `google_free` would ship the page's dialogue to Google's undocumented endpoint because of
+  a typo in a setting, and the requirement is explicit that nothing leaves the host until
+  the user asks for it.
   """
   @spec impl() :: module()
   def impl do
@@ -82,25 +87,30 @@ defmodule Ashiato.Translator do
       |> Application.get_env(__MODULE__, [])
       |> Keyword.get(:provider, :google_free)
 
-    resolve(provider)
-  end
+    case resolve(provider) do
+      {:ok, module} ->
+        module
 
-  defp resolve(provider) when is_atom(provider) do
-    case Atom.to_string(provider) do
-      "Elixir." <> _ ->
-        provider
+      :error ->
+        Logger.warning(
+          "Unknown translation provider #{inspect(provider)}; translation disabled until it is fixed"
+        )
 
-      _ ->
-        case Map.fetch(@providers, provider) do
-          {:ok, module} ->
-            module
-
-          :error ->
-            Logger.warning("Unknown translator provider #{inspect(provider)}, using :google_free")
-            Ashiato.Translator.GoogleFree
-        end
+        Ashiato.Translator.Off
     end
   end
+
+  @spec resolve(term()) :: {:ok, module()} | :error
+  defp resolve(provider) when is_atom(provider) do
+    case Atom.to_string(provider) do
+      # a module atom was configured directly, which is how tests point at a fake
+      "Elixir." <> _ -> {:ok, provider}
+      name -> resolve(name)
+    end
+  end
+
+  defp resolve(provider) when is_binary(provider), do: Map.fetch(@providers, provider)
+  defp resolve(_provider), do: :error
 
   @doc """
   Translates a page through `impl/0`. Later waves call this, never a concrete
@@ -166,21 +176,29 @@ defmodule Ashiato.Translator do
   """
   @spec http_post(String.t(), keyword()) :: {:ok, [String.t()]} | {:error, term()}
   def http_post(url, req_opts) do
-    {decode, req_opts} = Keyword.pop(req_opts, :decode)
+    case Keyword.pop(req_opts, :decode) do
+      {nil, _opts} ->
+        {:error, :no_decoder}
 
-    case Req.post(url, [retry: false] ++ req_opts) do
-      {:ok, %Req.Response{status: 200, body: body}} -> decode.(body)
-      {:ok, %Req.Response{status: status}} -> {:error, {:http, status}}
-      {:error, exception} -> {:error, exception}
+      {decode, req_opts} ->
+        case Req.post(url, [retry: false] ++ req_opts) do
+          {:ok, %Req.Response{status: 200, body: body}} -> decode.(body)
+          {:ok, %Req.Response{status: status}} -> {:error, {:http, status}}
+          {:error, exception} -> {:error, exception}
+        end
     end
   end
 
   @doc false
   @spec langs(keyword()) :: {:ok, {String.t(), String.t()}} | {:error, :missing_target_lang}
   def langs(opts) do
-    case Keyword.fetch(opts, :target_lang) do
-      {:ok, target} -> {:ok, {Keyword.get(opts, :source_lang, "auto"), target}}
-      :error -> {:error, :missing_target_lang}
+    case Keyword.get(opts, :target_lang) do
+      target when is_binary(target) and target != "" ->
+        {:ok, {Keyword.get(opts, :source_lang, "auto"), target}}
+
+      # nil and "" would be encoded as null and come back as an opaque HTTP 400
+      _absent_or_empty ->
+        {:error, :missing_target_lang}
     end
   end
 

@@ -45,8 +45,11 @@ defmodule Ashiato.Translator.Deepl do
   defp put_source(body, "auto"), do: body
   defp put_source(body, source), do: Map.put(body, :source_lang, String.upcase(source))
 
-  defp base_url(":fx" <> _rest), do: @free_url
-  defp base_url(_key), do: @pro_url
+  # Free-tier keys end with ":fx"; matching the prefix would send every free key to the
+  # paid host and get it rejected.
+  defp base_url(key) do
+    if String.ends_with?(key, ":fx"), do: @free_url, else: @pro_url
+  end
 
   defp decode(%{"translations" => translations}) when is_list(translations) do
     if Enum.all?(translations, &match?(%{"text" => text} when is_binary(text), &1)) do

@@ -54,6 +54,22 @@ defmodule Ashiato.TranslatorTest do
     assert Translator.translate_page(["一"], target_lang: "en") == {:error, :disabled}
   end
 
+  test "impl/0 accepts the string the settings table stores" do
+    Application.put_env(:ashiato, Translator, provider: "deepl")
+    assert Translator.impl() == Translator.Deepl
+
+    Application.put_env(:ashiato, Translator, provider: "google_free")
+    assert Translator.impl() == Translator.GoogleFree
+  end
+
+  test "an unknown provider fails closed instead of sending text to google_free" do
+    Application.put_env(:ashiato, Translator, provider: "googel_free")
+
+    # a typo must not become "send the dialogue to Google"
+    assert Translator.impl() == Translator.Off
+    assert Translator.translate_page(["一"], target_lang: "en") == {:error, :disabled}
+  end
+
   test "impl/0 resolves a configured provider and defaults to google_free" do
     assert Translator.impl() == Fake
 

@@ -60,7 +60,10 @@ defmodule Ashiato.Translator.Llm do
       "exactly one per input line. No commentary, no code fences."
   end
 
-  defp decode(%{"choices" => [%{"message" => %{"content" => content}} | _]}) do
+  # A refusal or a tool-call reply carries `content: nil`; trimming it would raise in the
+  # worker, so it is treated as unparsable and the per-line fallback takes over.
+  defp decode(%{"choices" => [%{"message" => %{"content" => content}} | _]})
+       when is_binary(content) do
     case parse_array(content) do
       {:ok, lines} when is_list(lines) ->
         if Enum.all?(lines, &is_binary/1) do

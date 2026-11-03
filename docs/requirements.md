@@ -63,12 +63,14 @@ problem this app does not have.
 | **Ghost** | The scheduler mode entered on the second consecutive `again` with no pass in between. Not an FSRS state and not a memory score |
 | **Massed exposure** | High `occurrences` over few `days_seen`. A ranking/resurfacing signal, not a ghost and not a scheduler mode |
 | **Leech** | A word that repeatedly fails across normal reviews. A flag, not a scheduler |
+| **Failure streak** | `word_states.failure_streak`: consecutive `again` grades, reset by any pass. Drives remedial and ghost scheduling and never FSRS (R3.13) |
 | **Content word** | Noun, verb, adjective, adverb. Not particles, auxiliaries, or punctuation |
 | **Coverage** | Fraction of tokens in a text whose words are already known |
 | **Page** | One processed image. Identity is a hash of its normalized text |
 | **Tokens** | Raw count of a word in accepted text. Depth |
 | **Occurrences** | Number of distinct pages containing a word, once per page. Breadth |
 | **Lexeme** | A distinct lexical item — `lemma + reading + POS`. Global and shared, not owned by a user |
+| **FSRS** | Free Spaced Repetition Scheduler, **version 6** (21 weights, `w0..w20`). Owns stability, difficulty and the day-scale interval; decay is learned (`w20`) rather than fixed, and the curve factor is derived from the desired retention |
 | **Stability (S)** | FSRS variable: days until recall probability decays to 90%. "How long until I'd forget this" |
 | **Difficulty (D)** | FSRS variable, 1–10: how hard this item is *for this user*. Rises on lapses, falls on easy recalls |
 | **Retrievability (R)** | FSRS variable: probability of recall *right now*, given S and elapsed time |
@@ -414,6 +416,7 @@ FSRS computes intervals from review grades alone. The counters never touch its i
 | `occurrences` (distinct pages) | introduction order (R3.9) | change stability, difficulty, or the interval |
 | `distinct_sources` | confidence that the word is a real recurring item rather than one author's idiolect; ranking tiebreak | change the interval directly |
 | `days_seen` | retention evidence outside FSRS; massed-exposure detection; "you can suspend this" prompts | change the interval directly |
+| `failure_streak` | whether the next `due_at` is a remedial step (4h → 12h → 24h) or a ghost-mode step; reset by any pass | change stability or difficulty — those still come from FSRS alone |
 
 **Massed exposure** = high `occurrences` with low `days_seen`. Crammed exposure, fragile memory.
 Resurface these first. It is not a ghost and does not change scheduling.
@@ -542,8 +545,12 @@ minimum-encounter threshold changes. A mutable state row destroys all three.
 migration, so anything else writing to the database is rejected too. Never a native Postgres `ENUM`:
 SQLite has no equivalent and altering one is a migration hazard with no payoff. The enumerated columns
 are `sources.kind`, `pages.status`, `pages.text_origin`, `pages.image_store`, `words.suspended_reason`,
-`encounters.crop_store`, `dict_cache_entries.kind`, plus the integers `word_states.state` and
-`review_events.grade`.
+`encounters.crop_store` and `dict_cache_entries.kind`.
+
+`word_states.state` is an `Ecto.Enum` of atoms persisted as the integers 0–3 — `:new`, `:learning`,
+`:review`, `:relearning` — so the column stays an integer and the app never handles bare numbers. The
+migration's `state IN (0,1,2,3)` CHECK still guards it. `review_events.grade` is a genuine integer (1–4)
+rather than an enum, because FSRS grades are numeric by definition.
 
 **`dict_cache_entries` has no TTL and no refresh schedule.** JMdict is immutable between releases, so an
 entry keyed by `dict_version` is either current or superseded wholesale — never stale. Refresh happens

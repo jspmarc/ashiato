@@ -25,7 +25,7 @@ defmodule Ashiato.Settings do
 
   @callback get(integer(), String.t(), term()) :: term()
   @callback put(integer(), String.t(), term(), keyword()) ::
-              {:ok, Setting.t()} | {:error, Ecto.Changeset.t()}
+              {:ok, Setting.t()} | {:error, Ecto.Changeset.t() | :not_encodable}
   @callback all(integer()) :: %{optional(String.t()) => term()}
 
   # §8 defaults: a missing row must never force a caller to special-case nil
@@ -81,10 +81,27 @@ defmodule Ashiato.Settings do
   on the struct, never cast.
   """
   @spec put(integer(), String.t(), term(), keyword()) ::
-          {:ok, Setting.t()} | {:error, Ecto.Changeset.t()}
+          {:ok, Setting.t()} | {:error, Ecto.Changeset.t() | :not_encodable}
   def put(user_id, key, value, opts \\ []) do
     secret? = Keyword.get(opts, :secret, false)
-    stored = if secret?, do: encrypt(value), else: Jason.encode!(value)
+
+    with {:ok, stored} <- store_value(value, secret?) do
+      upsert(user_id, key, stored, secret?)
+    end
+  end
+
+  # Encode first, encrypt second: a pid, tuple or struct cannot be JSON, and a crash here
+  # would be an ArgumentError out of the settings UI rather than an error it can show.
+  @spec store_value(term(), boolean()) :: {:ok, String.t()} | {:error, :not_encodable}
+  defp store_value(value, secret?) do
+    case Jason.encode(value) do
+      {:ok, json} when secret? -> {:ok, encrypt(json)}
+      {:ok, json} -> {:ok, json}
+      {:error, _reason} -> {:error, :not_encodable}
+    end
+  end
+
+  defp upsert(user_id, key, stored, secret?) do
     now = Utils.utc_now()
 
     %Setting{user_id: user_id, key: key}
@@ -177,6 +194,12 @@ defmodule Ashiato.Settings do
     from(s in Setting, where: s.user_id == ^user_id)
   end
 
+  # the value column is nullable, so a hand-written or half-migrated row can hold NULL
+  defp decode(nil, key, fallback) do
+    Logger.warning("setting #{key} has no value; returning default")
+    fallback
+  end
+
   defp decode(json, key, fallback) do
     case Jason.decode(json) do
       {:ok, value} ->
@@ -188,12 +211,23 @@ defmodule Ashiato.Settings do
     end
   end
 
-  defp encrypt(value) do
+  defp encrypt(plain_json) do
     key = derived_key()
-    Jason.encode!(value) |> Plug.Crypto.MessageEncryptor.encrypt(key, key)
+    Plug.Crypto.MessageEncryptor.encrypt(plain_json, key, key)
   end
 
+  # A read must never raise: the ingest pipeline reads settings. A missing SECRET_KEY_BASE
+  # therefore degrades the read to the default and is logged without the value; only the
+  # write path refuses (storing a secret unencrypted would be worse than failing).
   defp decrypt(cipher, key, fallback) do
+    do_decrypt(cipher, key, fallback)
+  rescue
+    error in ArgumentError ->
+      Logger.warning("setting #{key} cannot be decrypted (#{Exception.message(error)})")
+      fallback
+  end
+
+  defp do_decrypt(cipher, key, fallback) do
     crypto_key = derived_key()
 
     case Plug.Crypto.MessageEncryptor.decrypt(cipher, crypto_key, crypto_key) do

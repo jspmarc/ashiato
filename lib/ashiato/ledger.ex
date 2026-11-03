@@ -20,7 +20,7 @@ defmodule Ashiato.Ledger do
   @forward %{
     uploaded: [:detecting],
     detecting: [:text_ready],
-    text_ready: [:translating],
+    text_ready: [:translating, :ready],
     translating: [:ready]
   }
 

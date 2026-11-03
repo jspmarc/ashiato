@@ -24,10 +24,11 @@ defmodule Ashiato.Repo.Migrations.CreateRootTables do
       timestamps(type: :utc_datetime)
     end
 
-    # lexemes_identity: lexical identity is global, shared by all users (§6.1, §6.2,
-    # §6.3): inflected forms collapse to the dictionary form, homophones stay
-    # apart. The find-or-create path when recording words can race safely.
-    create unique_index(:lexemes, [:lemma, :reading, :part_of_speech], name: "lexemes_identity")
+    # lexical identity is global, shared by all users (§6.1, §6.2, §6.3):
+    # inflected forms collapse to the dictionary form, homophones stay apart. The
+    # find-or-create path when recording words can race safely. The default Ecto
+    # index name lets one declared constraint match on both Postgres and SQLite.
+    create unique_index(:lexemes, [:lemma, :reading, :part_of_speech])
 
     create table(:settings) do
       add :user_id, references(:users, on_delete: :delete_all), null: false

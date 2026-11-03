@@ -30,14 +30,18 @@ defmodule Ashiato.SchemaTest do
   ]
 
   defp table_columns(table) do
-    # SELECT * reports column names as strings; the schema speaks atoms.
+    # Compare as strings: a stray column may have no atom in this VM.
     %{columns: columns} = Ecto.Adapters.SQL.query!(Repo, "SELECT * FROM #{table} LIMIT 0", [])
-    columns |> Enum.map(&String.to_existing_atom/1) |> Enum.sort()
+    Enum.sort(columns)
   end
 
   defp schema_columns(module) do
     virtual = module.__schema__(:virtual_fields)
-    Enum.sort(module.__schema__(:fields) -- virtual)
+
+    module.__schema__(:fields)
+    |> Kernel.--(virtual)
+    |> Enum.map(&Atom.to_string/1)
+    |> Enum.sort()
   end
 
   test "every schema field exists as a column in its table, and vice versa" do

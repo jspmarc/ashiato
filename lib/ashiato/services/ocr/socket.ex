@@ -24,7 +24,10 @@ defmodule Ashiato.Ocr.Socket do
         {:error, :socket_path_missing}
 
       path ->
-        case :gen_tcp.connect({:local, path}, 0, [:binary, packet: 4, active: false]) do
+        # :gen_tcp.connect/3 defaults to an infinite timeout, so a wedged service with a
+        # full listen backlog would block the ingest caller forever. The bound applies to
+        # connect as well as to recv.
+        case :gen_tcp.connect({:local, path}, 0, [:binary, packet: 4, active: false], timeout()) do
           {:ok, sock} -> round_trip(sock, kind, value)
           {:error, reason} -> {:error, reason}
         end
@@ -43,8 +46,13 @@ defmodule Ashiato.Ocr.Socket do
   end
 
   defp send_request(sock, kind, value) do
-    payload = Jason.encode!(%{"op" => "ocr", Atom.to_string(kind) => value})
-    :gen_tcp.send(sock, payload)
+    # encode/1, not encode!/1: a locator is a filesystem path or a URL and can carry bytes
+    # that are not valid UTF-8, and a raise here would escape recognise/1's contract.
+    with {:ok, payload} <- Jason.encode(%{"op" => "ocr", Atom.to_string(kind) => value}) do
+      :gen_tcp.send(sock, payload)
+    else
+      {:error, reason} -> {:error, {:encode, reason}}
+    end
   end
 
   defp decode(body) do
@@ -76,7 +84,9 @@ defmodule Ashiato.Ocr.Socket do
   defp validate_block(%{"bbox" => bbox, "text" => text, "score" => score} = block)
        when is_binary(text) and is_number(score) do
     if bbox_ok?(bbox) and score >= 0 and score <= 1 do
-      {:ok, %{bbox: bbox, text: text, score: score}}
+      # JSON `1` decodes as an integer; the line contract promises a float, and a caller
+      # comparing scores should not have to handle two numeric types.
+      {:ok, %{bbox: bbox, text: text, score: score * 1.0}}
     else
       {:error, block}
     end

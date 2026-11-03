@@ -4,7 +4,9 @@ defmodule Ashiato.OcrTest do
   rejection, and the fake's canned/recorded behaviour.
   """
 
-  use ExUnit.Case, async: true
+  # These tests write application env for `:ashiato, Ashiato.Ocr` and start a fake under a
+  # fixed registered name, so they must not run alongside another module doing the same.
+  use ExUnit.Case, async: false
 
   alias Ashiato.Ocr
   alias Ashiato.Ocr.Fake

@@ -22,6 +22,11 @@ defmodule Ashiato.OcrStub do
     Task.start_link(fn -> accept_loop(listener, handler) end)
   end
 
+  @doc """
+  Child spec with a unique id, so several stubs can be supervised in one test and each
+  is torn down independently.
+  """
+  @spec child_spec(keyword()) :: Supervisor.child_spec()
   def child_spec(opts) do
     %{id: {__MODULE__, make_ref()}, start: {__MODULE__, :start_link, [opts]}, restart: :temporary}
   end

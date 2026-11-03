@@ -10,9 +10,8 @@ defmodule Ashiato.LedgerTest do
   Both identities are enforced by unique indexes, and both are easy to get
   subtly wrong — `find_or_create_lexeme` has to survive a race, and
   `record_encounter` has to turn a duplicate into a value rather than an
-  exception. The review tests pin the log/state split: append-only events, one
-  rebuildable state row, and band caps that shorten the interval but never the
-  stability.
+  exception. The review tests pin the log/state split: append-only events and
+  one rebuildable state row.
   """
 
   use Ashiato.DataCase, async: false
@@ -80,7 +79,7 @@ defmodule Ashiato.LedgerTest do
     test "review/2 delegates to review/3 with now", %{word: word} do
       assert {:ok, %WordStates{} = state} = Ledger.review(word.id, 3)
       assert state.word_id == word.id
-      assert state.state == 2
+      assert state.state == :review
       assert length(Repo.all(ReviewEvents)) == 1
     end
 
@@ -119,12 +118,11 @@ defmodule Ashiato.LedgerTest do
 
       assert Repo.aggregate(WordStates, :count) == 1
       assert state1.word_id == word.id
-      assert state1.state == 2
+      assert state1.state == :review
       assert state1.reps == 1
       assert state1.lapses == 0
       # S0(3) = w2; D0(3) = w4 - e^(2 * w5) + 1; the interval is
-      # round(2.3065) = 2 days, uncapped because the word has no confirmed
-      # encounters yet
+      # round(2.3065) = 2 days
       assert state1.stability == 2.3065
       assert state1.difficulty == 2.118103970459015
       assert state1.last_reviewed_at == day1
@@ -147,25 +145,76 @@ defmodule Ashiato.LedgerTest do
       assert state2.due_at == DateTime.add(day2, interval * 86_400, :second)
     end
 
-    test "a lapse from review writes interval_after 0 and due_at now", %{word: word} do
+    test "a first lapse schedules the 4-hour remedial step", %{word: word} do
       day1 = ~U[2026-11-01 12:00:00.000000Z]
       day2 = ~U[2026-11-11 12:00:00Z]
 
       assert {:ok, review_state} = Ledger.review(word.id, 3, day1)
       assert {:ok, lapsed} = Ledger.review(word.id, 1, day2)
 
-      assert lapsed.state == 3
+      %{state: expected} = Srs.grade(review_state, 1, day2)
+
+      assert lapsed.state == :relearning
       assert lapsed.lapses == 1
       assert lapsed.reps == 2
-      # interval 0: due the moment the lapse happened
-      assert DateTime.truncate(lapsed.due_at, :second) == day2
-      assert lapsed.stability < review_state.stability
+      assert lapsed.failure_streak == 1
+      assert lapsed.stability == expected.stability
+      assert lapsed.due_at == DateTime.add(day2, 4, :hour)
 
       assert [lapse_event] =
                Repo.all(from re in ReviewEvents, where: re.word_id == ^word.id and re.grade == 1)
 
       assert lapse_event.interval_after == 0
       assert same_instant?(lapse_event.reviewed_at, day2)
+    end
+
+    test "consecutive agains escalate into ghost steps, and a pass clears the streak", %{
+      word: word
+    } do
+      t0 = ~U[2026-11-01 12:00:00Z]
+      assert {:ok, _} = Ledger.review(word.id, 3, t0)
+
+      failure1 = DateTime.add(t0, 86_400, :second)
+      assert {:ok, state1} = Ledger.review(word.id, 1, failure1)
+      assert state1.failure_streak == 1
+      assert state1.due_at == DateTime.add(failure1, 4, :hour)
+
+      failure2 = DateTime.add(failure1, 4 * 3_600, :second)
+      assert {:ok, state2} = Ledger.review(word.id, 1, failure2)
+      assert state2.failure_streak == 2
+      assert state2.due_at == DateTime.add(failure2, 12, :hour)
+
+      failure3 = DateTime.add(failure2, 12 * 3_600, :second)
+      assert {:ok, state3} = Ledger.review(word.id, 1, failure3)
+      assert state3.failure_streak == 3
+      assert state3.due_at == DateTime.add(failure3, 24, :hour)
+
+      failure4 = DateTime.add(failure3, 24 * 3_600, :second)
+      assert {:ok, state4} = Ledger.review(word.id, 1, failure4)
+      assert state4.failure_streak == 4
+      assert state4.due_at == DateTime.add(failure4, 24, :hour)
+
+      passed_at = DateTime.add(failure4, 24 * 3_600, :second)
+      assert {:ok, passed} = Ledger.review(word.id, 3, passed_at)
+      assert passed.failure_streak == 0
+      assert passed.state == :review
+
+      [pass_event] =
+        Repo.all(
+          from re in ReviewEvents, where: re.word_id == ^word.id and re.reviewed_at == ^passed_at
+        )
+
+      assert pass_event.interval_after > 0
+      assert passed.due_at == DateTime.add(passed_at, pass_event.interval_after * 86_400, :second)
+
+      failure_events =
+        Repo.all(
+          from re in ReviewEvents,
+            where: re.word_id == ^word.id and re.grade == 1,
+            order_by: re.reviewed_at
+        )
+
+      assert Enum.map(failure_events, & &1.interval_after) == [0, 0, 0, 0]
     end
 
     test "an unknown word or an out-of-range grade is an error, not a raise", %{word: word} do
@@ -178,48 +227,6 @@ defmodule Ashiato.LedgerTest do
       # nothing was written
       assert Repo.aggregate(ReviewEvents, :count) == 0
       assert Repo.aggregate(WordStates, :count) == 0
-    end
-
-    test "the occurrence band caps the interval, never the stability", %{user: user} do
-      source = source_fixture(user_id: user.id)
-      day0 = ~U[2026-06-01 12:00:00Z]
-      day1 = DateTime.add(day0, 86_400, :second)
-
-      # -- 3 confirmed encounters: the 240-day band ---------------------------
-      word = word_fixture(user_id: user.id)
-      add_encounters(user, source, word, 3)
-      state = seed_word_state(word.id, day0)
-
-      assert {:ok, next} = Ledger.review(word.id, 4, day1)
-      %{state: expected, interval_days: uncapped} = Srs.grade(state, 4, day1)
-
-      assert uncapped > 240
-      assert next.stability == expected.stability
-      assert next.due_at == DateTime.add(day1, 240 * 86_400, :second)
-      assert reviewed_interval(word.id, day1) == 240
-
-      # -- 20 confirmed encounters: the 60-day band bites ----------------------
-      heavy = word_fixture(user_id: user.id)
-      add_encounters(user, source, heavy, 20)
-      state = seed_word_state(heavy.id, day0)
-
-      assert {:ok, next} = Ledger.review(heavy.id, 4, day1)
-      %{interval_days: uncapped} = Srs.grade(state, 4, day1)
-
-      assert uncapped > 60
-      assert next.due_at == DateTime.add(day1, 60 * 86_400, :second)
-      assert reviewed_interval(heavy.id, day1) == 60
-
-      # -- 1 confirmed encounter: uncapped, the FSRS interval passes through --
-      single = word_fixture(user_id: user.id)
-      add_encounters(user, source, single, 1)
-      state = seed_word_state(single.id, day0)
-
-      assert {:ok, next} = Ledger.review(single.id, 4, day1)
-      %{interval_days: uncapped} = Srs.grade(state, 4, day1)
-
-      assert next.due_at == DateTime.add(day1, uncapped * 86_400, :second)
-      assert reviewed_interval(single.id, day1) == uncapped
     end
   end
 
@@ -309,36 +316,6 @@ defmodule Ashiato.LedgerTest do
 
       assert Ledger.chrome_ratio(user.id, source.id) == %{word.id => 1.0}
     end
-  end
-
-  defp add_encounters(user, source, word, count) do
-    for _ <- 1..count do
-      page = page_fixture(user_id: user.id, source_id: source.id)
-      assert {:ok, _} = record(user, source, word, page, true)
-    end
-  end
-
-  defp seed_word_state(word_id, last_reviewed_at) do
-    %WordStates{word_id: word_id}
-    |> WordStates.changeset(%{
-      state: 2,
-      stability: 1000.0,
-      difficulty: 5.0,
-      reps: 10,
-      lapses: 0,
-      due_at: last_reviewed_at,
-      last_reviewed_at: last_reviewed_at
-    })
-    |> Repo.insert!()
-  end
-
-  defp reviewed_interval(word_id, reviewed_at) do
-    [event] =
-      Repo.all(
-        from re in ReviewEvents, where: re.word_id == ^word_id and re.reviewed_at == ^reviewed_at
-      )
-
-    event.interval_after
   end
 
   # :utc_datetime and :utc_datetime_usec load back with different microsecond

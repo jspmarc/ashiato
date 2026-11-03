@@ -1,9 +1,6 @@
 defmodule Ashiato.SrsTest do
   @moduledoc """
-  The scheduler is pure — no DB — so these are plain ExUnit assertions on the
-  FSRS-4.5 contracts themselves: band caps that bite only above the cap,
-  maturity that reads stability rather than the capped interval, ghost
-  boundaries, and the state machine's lapse behaviour.
+  Scheduler contract tests — pure functions, no DB.
   """
 
   use ExUnit.Case, async: true

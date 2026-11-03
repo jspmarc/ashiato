@@ -1,19 +1,11 @@
 defmodule Ashiato.WordStates do
   @moduledoc """
-  The FSRS materialisation, keyed by `word_id` (the user is `word.user_id`).
+  FSRS materialisation, keyed by `word_id`.
 
-  Derived from — and rebuildable from — `Ashiato.ReviewEvents`; not a
-  first-class entity, hence the primary key being the foreign key itself.
-
-  `state` is a plain integer backed by the `word_states_state_valid` CHECK:
-
-    * `0` new
-    * `1` learning
-    * `2` review
-    * `3` relearning
-
-  `stability` / `difficulty` are NULL until the first review: undefined, not
-  zero. No timestamps — `last_reviewed_at` and the review log carry time.
+  `state` backed by the `word_states_state_valid` CHECK: `0` new,
+  `1` learning, `2` review, `3` relearning. `stability`/`difficulty` are
+  NULL until the first review. No timestamps — `last_reviewed_at` and
+  `Ashiato.ReviewEvents` carry time.
   """
 
   use Ecto.Schema
@@ -37,12 +29,9 @@ defmodule Ashiato.WordStates do
   @doc """
   Changeset for upserting a word state.
 
-  Only the scheduling-relevant fields are cast: state, stability, difficulty,
-  reps, lapses, due_at, last_reviewed_at.  `word_id` is the primary key and
-  is never cast — it is always the word that triggered the review. Values are
-  computed server-side (FSRS output plus the capped interval), so beyond
-  presence the `word_states_state_valid` CHECK is the only guard; the row is
-  a rebuildable materialisation of the review log (§6.8).
+  `word_id` is never cast — it is the word that triggered the review.
+  `due_at` is required (`null: false` on the column); `last_reviewed_at`
+  stays NULL until the first review.
   """
   def changeset(word_state, attrs) do
     word_state

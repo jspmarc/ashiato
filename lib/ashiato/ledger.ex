@@ -110,24 +110,12 @@ defmodule Ashiato.Ledger do
   @doc """
   Grades one review of a word and advances its scheduling state.
 
-  `Ashiato.Srs.grade/3` produces the next state and the uncapped FSRS
-  interval, this function clamps that interval with
-  `Ashiato.Srs.final_interval/2` — derived from the word's confirmed,
-  non-discarded encounters — and writes it.
-
-  Everything happens in one `Repo` transaction:
-
-    1. the `Words` row is fetched (error if missing)
-    2. the current `WordStates` is fetched; an absent row means the word is
-       new (state 0)
-    3. the review is appended to `review_events`
-    4. `word_states` is upserted
-
-  `user_id` is set programmatically, never cast.
+  Fetches the word (error if missing), computes the next state with
+  `Ashiato.Srs.grade/3`, clamps the interval (`Ashiato.Srs.final_interval/2`),
+  and writes the review event and materialised state in one transaction.
 
   Returns `{:ok, %WordStates{}}` with `due_at` = `now` + the capped interval,
-  or `{:error, changeset}`. `review/2` reviews now; pass `now` explicitly in
-  tests for determinism.
+  or `{:error, changeset}`.
   """
   @spec review(integer(), Srs.grade()) :: {:ok, WordStates.t()} | {:error, Ecto.Changeset.t()}
   def review(word_id, grade), do: review(word_id, grade, DateTime.utc_now())
@@ -135,13 +123,15 @@ defmodule Ashiato.Ledger do
   @spec review(integer(), Srs.grade(), DateTime.t()) ::
           {:ok, WordStates.t()} | {:error, Ecto.Changeset.t()}
   def review(word_id, grade, now) when is_integer(grade) and grade in 1..4 do
-    fn ->
-      do_review(word_id, grade, now)
-    end
-    |> Repo.transaction()
+    Repo.transaction(fn ->
+      case do_review(word_id, grade, now) do
+        {:ok, word_state} -> word_state
+        {:error, changeset} -> Repo.rollback(changeset)
+      end
+    end)
     |> case do
-      {:ok, {:ok, word_state}} -> {:ok, word_state}
-      {:error, %Ecto.Changeset{} = changeset} -> {:error, changeset}
+      {:ok, word_state} -> {:ok, word_state}
+      {:error, changeset} -> {:error, changeset}
     end
   end
 
@@ -152,42 +142,43 @@ defmodule Ashiato.Ledger do
      |> Ecto.Changeset.add_error(:grade, "must be an FSRS grade between 1 and 4")}
   end
 
-  # Runs inside a transaction; returns {:ok, %WordStates{}} or rolls back with
-  # a changeset.
+  @spec do_review(integer(), Srs.grade(), DateTime.t()) ::
+          {:ok, WordStates.t()} | {:error, Ecto.Changeset.t()}
   defp do_review(word_id, grade, now) do
-    word =
-      Repo.get(Words, word_id) ||
-        Repo.rollback(missing_word_changeset(word_id))
+    case Repo.get(Words, word_id) do
+      nil ->
+        {:error, missing_word_changeset(word_id)}
 
-    # a missing row means "new"
-    word_state =
-      case Repo.get(WordStates, word_id) do
-        %WordStates{} = existing -> existing
-        nil -> new_word_state(word_id, now)
-      end
+      word ->
+        # a missing row means "new"
+        word_state =
+          case Repo.get(WordStates, word_id) do
+            %WordStates{} = existing -> existing
+            nil -> new_word_state(word_id, now)
+          end
 
-    %{state: next, interval_days: fsrs_interval} =
-      Srs.grade(word_state, grade, now)
+        %{state: next, interval_days: fsrs_interval} =
+          Srs.grade(word_state, grade, now)
 
-    {occurrences, _days_seen} = encounter_counts(word.user_id, word_id)
-    final_interval = Srs.final_interval(fsrs_interval, occurrences)
+        {occurrences, _days_seen} = encounter_counts(word.user_id, word_id)
+        next_interval = Srs.final_interval(fsrs_interval, occurrences)
 
-    # word_states columns are second-precision (:utc_datetime); the log row
-    # keeps the full usec `now`
-    second = DateTime.truncate(now, :second)
-    due_at = DateTime.add(second, final_interval, :day)
+        # word_states columns are second-precision (:utc_datetime); the log
+        # row keeps the full usec `now`
+        second = DateTime.truncate(now, :second)
+        due_at = DateTime.add(second, next_interval, :day)
 
-    with {:ok, _event} <-
-           append_review_event(word.user_id, word_id, grade, now, next, final_interval),
-         {:ok, word_state} <- upsert_word_state(word_id, next, due_at, second) do
-      {:ok, word_state}
-    else
-      {:error, %Ecto.Changeset{} = changeset} -> Repo.rollback(changeset)
+        with {:ok, _event} <-
+               append_review_event(word.user_id, word_id, grade, now, next, next_interval),
+             {:ok, word_state} <- upsert_word_state(word_id, next, due_at, second) do
+          {:ok, word_state}
+        end
     end
   end
 
   # An occurrence is a distinct page; unconfirmed or discarded encounters
   # count toward nothing.
+  @spec encounter_counts(integer(), integer()) :: {integer(), integer()}
   defp encounter_counts(user_id, word_id) do
     from(e in Encounters,
       where: e.user_id == ^user_id and e.word_id == ^word_id,
@@ -198,6 +189,15 @@ defmodule Ashiato.Ledger do
   end
 
   # The log is append-only: rows are only inserted, never updated or deleted.
+  @spec append_review_event(
+          integer(),
+          integer(),
+          Srs.grade(),
+          DateTime.t(),
+          WordStates.t(),
+          integer()
+        ) ::
+          {:ok, ReviewEvents.t()} | {:error, Ecto.Changeset.t()}
   defp append_review_event(user_id, word_id, grade, now, next, interval_after) do
     %ReviewEvents{user_id: user_id, word_id: word_id}
     |> ReviewEvents.changeset(%{
@@ -210,6 +210,8 @@ defmodule Ashiato.Ledger do
     |> Repo.insert()
   end
 
+  @spec upsert_word_state(integer(), WordStates.t(), DateTime.t(), DateTime.t()) ::
+          {:ok, WordStates.t()} | {:error, Ecto.Changeset.t()}
   defp upsert_word_state(word_id, next, due_at, last_reviewed_at) do
     %WordStates{word_id: word_id}
     |> WordStates.changeset(%{
@@ -237,6 +239,7 @@ defmodule Ashiato.Ledger do
     )
   end
 
+  @spec new_word_state(integer(), DateTime.t()) :: WordStates.t()
   defp new_word_state(word_id, now) do
     %WordStates{
       word_id: word_id,
@@ -249,6 +252,7 @@ defmodule Ashiato.Ledger do
     }
   end
 
+  @spec missing_word_changeset(integer()) :: Ecto.Changeset.t()
   defp missing_word_changeset(word_id) do
     %WordStates{word_id: word_id}
     |> Ecto.Changeset.change()

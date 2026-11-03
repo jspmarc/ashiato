@@ -1,9 +1,9 @@
 defmodule Ashiato.Srs do
   @moduledoc """
-  The FSRS-4.5 scheduler as pure functions over `Ashiato.WordStates`: no Repo,
-  no clock, no IO. It computes the next state and the uncapped interval from
-  review grades alone; `Ashiato.Ledger` applies the interval cap afterwards,
-  which clamps the scheduled interval but never the stability.
+  FSRS-4.5 scheduler as pure functions over `Ashiato.WordStates`: no Repo,
+  no clock, no IO. It returns the uncapped interval from review grades;
+  `Ashiato.Ledger` applies the interval cap afterwards, clamping the
+  scheduled interval, never the stability.
 
   Sources (FSRS-4.5, 17 weights):
 
@@ -12,19 +12,16 @@ defmodule Ashiato.Srs do
     * Default parameters `w0..w16` — awesome-fsrs wiki, "FSRS-4.5" section:
       https://github.com/open-spaced-repetition/awesome-fsrs/wiki/The-Algorithm
 
-  Stability is clamped to 0.001..36500.0 days (100 years, as fsrs-rs does) and
+  Stability clamps to 0.001..36500.0 days (100 years, as fsrs-rs does);
   difficulty to 1.0..10.0; states are 0..3 (new / learning / review /
-  relearning). This app has no minute-scale learning steps — reviews are real,
-  days-apart events — so a first "again" parks the word in learning with the
-  interval reset to 0 rather than scheduling a sub-day step.
+  relearning).
 
-  The curves:
+  Curves:
 
       R(t, S) = (1 + FACTOR * t / S) ** DECAY          # retrievability
       I(r, S) = S / FACTOR * (r ** (1/DECAY) - 1)      # interval for retention r
 
-  with DECAY = -0.5 and FACTOR = 19/81, so `I(0.9, S)` is exactly `S`: at the
-  default desired retention of 0.9, a day count is a day count.
+  with DECAY = -0.5 and FACTOR = 19/81, so `I(0.9, S)` is exactly `S`.
   """
 
   alias Ashiato.WordStates
@@ -66,18 +63,20 @@ defmodule Ashiato.Srs do
 
   @desired_retention 0.9
 
+  @maturity_days 21
+  @ghost_min_occurrences 5
+  @ghost_min_density 4.0
+  @ghost_min_days 1
+
   @doc """
   Grades one review and returns the next FSRS state.
 
-  `word_state` is the current `%Ashiato.WordStates{}`. State 0 means the word
-  was never reviewed; states 1..3 carry `stability`/`difficulty`, and
-  `elapsed time` since `last_reviewed_at` feeds the retrievability of this
-  review. `grade` is the FSRS grade: 1 again, 2 hard, 3 good, 4 easy.
+  `word_state` is the current `%Ashiato.WordStates{}` — state 0 (never
+  reviewed) or 1..3 (stability/difficulty set) — `grade` the FSRS grade,
+  `now` the review instant.
 
-  Returns `%{state: %Ashiato.WordStates{}, interval_days: integer()}` — the
-  updated struct (same `word_id`, new state/stability/difficulty/reps/lapses,
-  `last_reviewed_at = now`, `due_at = now + interval_days`) plus the integer
-  FSRS interval that `due_at` was computed from, uncapped.
+  Returns `%{state: %Ashiato.WordStates{}, interval_days: integer()}` with
+  `due_at = now + interval_days`; `interval_days` is uncapped.
   """
   @spec grade(WordStates.t(), 1..4, DateTime.t()) :: %{
           state: WordStates.t(),
@@ -92,9 +91,8 @@ defmodule Ashiato.Srs do
   end
 
   @doc """
-  Interval cap for a word's encounter band: 60 days at 20+ distinct confirmed
-  encounter pages, 120 at 8..19, 240 at 3..7, and `nil` (uncapped) at 2 or
-  fewer.
+  Interval cap for a word's band of distinct confirmed encounter pages:
+  60 at 20+, 120 at 8..19, 240 at 3..7, `nil` (uncapped) at 2 or fewer.
   """
   @spec cap_for_band(integer()) :: 60 | 120 | 240 | nil
   def cap_for_band(occurrences) when occurrences >= 20, do: 60
@@ -116,27 +114,23 @@ defmodule Ashiato.Srs do
   end
 
   @doc """
-  Whether a word has crossed `threshold` days of stability (default 21).
-
-  Maturity is decided by stability, never by the scheduled interval: heavy
-  words can be due again in days while their stability says they know the
-  word.
+  Whether `stability` has reached `threshold` days (default
+  `#{@maturity_days}`).
   """
   @spec mature?(WordStates.t() | map(), number()) :: boolean()
-  def mature?(%{stability: stability}, threshold \\ 21) do
+  def mature?(%{stability: stability}, threshold \\ @maturity_days) do
     not is_nil(stability) and stability >= threshold
   end
 
   @doc """
-  Whether a word is a ghost — massed exposure, not vocabulary met over time:
-  seen on at least 5 distinct pages at a density of at least 4 pages per day
-  seen. `days_seen` of 0 counts as one day (`max(days_seen, 1)`), so a
-  same-day flood of 5+ pages is a ghost.
+  Whether a word is a ghost: at least `#{@ghost_min_occurrences}` distinct
+  pages at a density of at least `#{@ghost_min_density}` pages per day seen.
+  A `days_seen` of 0 counts as one day, so a same-day flood is a ghost.
   """
   @spec ghost?(%{occurrences: number(), days_seen: number()}) :: boolean()
   def ghost?(%{occurrences: occurrences, days_seen: days_seen}) do
-    density = occurrences / max(days_seen, 1)
-    occurrences >= 5 and density >= 4
+    density = occurrences / max(days_seen, @ghost_min_days)
+    occurrences >= @ghost_min_occurrences and density >= @ghost_min_density
   end
 
   ## first review (state 0)
@@ -170,6 +164,7 @@ defmodule Ashiato.Srs do
     %{state: next, interval_days: interval_days}
   end
 
+  @spec initial_difficulty(grade()) :: float()
   defp initial_difficulty(grade) do
     clamp(Enum.at(@weights, 4) - (grade - 3) * Enum.at(@weights, 5), @d_min, @d_max)
   end
@@ -201,6 +196,8 @@ defmodule Ashiato.Srs do
   # state 1 (learning), again: the word is re-introduced from its initial
   # values rather than computed from the curve — this app has no learning
   # steps to forget into
+  @spec transition(WordStates.t(), grade(), float()) ::
+          {1 | 2 | 3, float(), float(), non_neg_integer()}
   defp transition(%WordStates{state: 1}, 1, _retrievability) do
     {1, clamp(Enum.at(@weights, 0), @s_min, @s_max), initial_difficulty(1), 0}
   end
@@ -219,11 +216,14 @@ defmodule Ashiato.Srs do
     {2, stability, next_difficulty(d, grade), success_interval(stability)}
   end
 
+  # Lapse counter increment: 1 for `again` (grade 1), 0 for passes.
+  @spec lapse_delta(grade()) :: 0 | 1
   defp lapse_delta(1), do: 1
   defp lapse_delta(_grade), do: 0
 
   # D' = clamp(w7 * w4 + (1 - w7) * (D - w6 * (G - 3)), Dmin, Dmax) — mean
   # reversion toward D0(3) = w4 after the linear shift
+  @spec next_difficulty(float(), grade()) :: float()
   defp next_difficulty(difficulty, grade) do
     reverted =
       Enum.at(@weights, 7) * Enum.at(@weights, 4) +
@@ -233,6 +233,7 @@ defmodule Ashiato.Srs do
   end
 
   # Sf = min(w11 * D^-w12 * ((S + 1)^w13 - 1) * e^(w14 * (1 - R)), S), clamped
+  @spec post_lapse_stability(float(), float(), float()) :: float()
   defp post_lapse_stability(stability, difficulty, retrievability) do
     min(
       Enum.at(@weights, 11) * :math.pow(difficulty, -Enum.at(@weights, 12)) *
@@ -245,6 +246,7 @@ defmodule Ashiato.Srs do
 
   # Sr = S * (1 + e^w8 * (11 - D) * S^-w9 * (e^(w10 * (1 - R)) - 1) * H_G * E_G),
   # clamped; H_G = w15 on hard, E_G = w16 on easy, 1 otherwise
+  @spec post_success_stability(float(), float(), float(), grade()) :: float()
   defp post_success_stability(stability, difficulty, retrievability, grade) do
     hard_penalty = if grade == 2, do: Enum.at(@weights, 15), else: 1
     easy_bonus = if grade == 4, do: Enum.at(@weights, 16), else: 1
@@ -258,26 +260,32 @@ defmodule Ashiato.Srs do
     |> clamp(@s_min, @s_max)
   end
 
+  @spec retrievability(float(), float()) :: float()
   defp retrievability(elapsed_days, stability) do
     :math.pow(1 + @factor * elapsed_days / stability, @decay)
   end
 
+  @spec success_interval(float()) :: integer()
   defp success_interval(stability) do
     max(1, round(interval_for(stability)))
   end
 
   # I(r, S) = S / FACTOR * (r ** (1/DECAY) - 1) — at r = 0.9 this is S
+  @spec interval_for(float()) :: float()
   defp interval_for(stability) do
     stability / @factor * (:math.pow(@desired_retention, 1 / @decay) - 1)
   end
 
+  @spec elapsed_days(DateTime.t() | nil, DateTime.t()) :: float()
   defp elapsed_days(nil, _now), do: 0.0
 
   defp elapsed_days(last_reviewed_at, now) do
     max(0.0, DateTime.diff(now, last_reviewed_at) / 86_400.0)
   end
 
+  @spec add_days(DateTime.t(), number()) :: DateTime.t()
   defp add_days(now, days), do: DateTime.add(now, days * 86_400, :second)
 
+  @spec clamp(number(), number(), number()) :: number()
   defp clamp(value, lo, hi), do: value |> min(hi) |> max(lo)
 end

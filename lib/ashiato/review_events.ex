@@ -1,14 +1,10 @@
 defmodule Ashiato.ReviewEvents do
   @moduledoc """
-  Append-only review log; the source of truth for scheduling.
+  Append-only review log.
 
-  Replaying a word's review events `(word_id, reviewed_at)` rebuilds
-  `word_states`, which is a materialisation of this log.
-
-  `grade` is the FSRS grade 1..4 (backed by the `review_events_grade_valid`
-  CHECK): 1 = again, 2 = hard, 3 = good, 4 = easy. `reviewed_at` is the
-  timestamp, with usec precision. `interval_after` may be 0: a lapse resets
-  the interval.
+  `grade` is 1..4 (backed by the `review_events_grade_valid` CHECK):
+  1 = again, 2 = hard, 3 = good, 4 = easy. `reviewed_at` has usec precision.
+  `interval_after` may be 0 — a lapse resets it.
   """
 
   use Ecto.Schema

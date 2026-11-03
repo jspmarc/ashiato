@@ -37,9 +37,14 @@ defmodule Ashiato.Ledger do
   @doc """
   Finds the lexeme matching `(lemma, reading, part_of_speech)` or creates it.
 
-  Fetch-first; on an insert the `lexemes_identity` unique constraint can fire
-  if a concurrent caller won the race — we then fetch the winner's row, so
-  `{:ok, %Lexemes{}}` is returned either way.
+  Safe under races. The common path is fetch-first; if the row does not exist
+  we insert, and if we lose the race against a concurrent caller the declared
+  `lexemes_identity` unique constraint surfaces as `{:error, changeset}`, after
+  which we fetch the row the winner just wrote. Returns `{:ok, %Lexemes{}}`
+  whether we created it or not.
+
+  `reading` is normalised `nil` → `""` to match the database default, so the
+  `lexemes_identity` unique index actually bites (multiple NULLs would pass).
   """
   @spec find_or_create_lexeme(String.t(), String.t() | nil, String.t() | nil) ::
           {:ok, Lexemes.t()} | {:error, Ecto.Changeset.t()}
@@ -62,6 +67,9 @@ defmodule Ashiato.Ledger do
             {:ok, lexeme}
 
           {:error, changeset} ->
+            # A uniqueness race: the winner's row must be there now. Should the
+            # failure have been a validation error instead, the refetch finds
+            # nothing and we surface the original changeset as-is.
             case Repo.get_by(Lexemes, identity) do
               %Lexemes{} = existing -> {:ok, existing}
               nil -> {:error, changeset}
@@ -71,11 +79,21 @@ defmodule Ashiato.Ledger do
   end
 
   @doc """
-  Records one sighting of a word on one page. `{:ok, %Encounters{}}` either
-  way.
+  Records one sighting of a word on one page. Returns `{:ok, %Encounters{}}`
+  whether it was just inserted or already existed.
 
-  Idempotent against the `one_encounter_per_word_per_page` constraint: on
-  conflict the insert is a no-op and the existing row is fetched and returned.
+  Idempotent against `one_encounter_per_word_per_page`
+  (`(user_id, word_id, text_hash)`): on conflict the insert is a no-op — the
+  declaration in `Encounters.changeset/2` turns the constraint violation into
+  `{:error, changeset}` instead of a raise — and the row that already exists is
+  fetched and returned. A duplicate therefore never raises and never writes;
+  since encounters are only ever soft-deleted (`discarded_at`), that row is
+  still there to find.
+
+  `attrs` may be a map or keyword list with atom keys and must include
+  `user_id`, `word_id`, `page_id`, `source_id`, `text_hash`, `crop_key`,
+  `seen_on` (a `Date`), and optionally `confirmed` (default `false`) and
+  `bbox`. `user_id` is set programmatically, never cast.
   """
   @spec record_encounter(keyword() | map()) ::
           {:ok, Encounters.t()} | {:error, Ecto.Changeset.t()}
@@ -104,14 +122,22 @@ defmodule Ashiato.Ledger do
   end
 
   @doc """
-  Chrome detection for one source: for each word, the fraction of that
-  source's pages on which it appears.
+  Chrome detection for one source: for each word, the fraction of that source's
+  pages on which the word appears.
 
-  An occurrence is a *distinct page*, and unconfirmed or soft-deleted
-  encounters count toward nothing. The denominator is every page of the
-  source, so empty sources return an empty map, never `0.0`. A result word
-  that only appears in *some* of the sources it is met in is not chrome-like:
-  the caller needs `chrome_ratio/2` for every source to decide that.
+  This is a **query, never stored state** — re-run it whenever pages or
+  encounters change, so re-tuning the threshold costs nothing but time (§6.6).
+  It is what decides `words.chrome_like` (§6.5): a word whose ratio clears the
+  configured threshold (default 50%) is *chrome-like in this source*, but the
+  `chrome_like` flag is only ever set when the word is chrome-like in **every**
+  source it appears in — otherwise a HUD word met in one game would suppress
+  real vocabulary read in a manga.
+
+  Counting rules: an occurrence is a *distinct page* (counted once per page,
+  breadth, not raw token count), and unconfirmed or soft-deleted (discarded)
+  encounters count toward nothing (R2.8). The denominator is every page of the
+  source. Returns a map of `word_id => ratio` in 0.0..1.0, empty when the
+  source has no pages yet.
   """
   @spec chrome_ratio(integer(), integer()) :: %{optional(integer()) => float()}
   def chrome_ratio(user_id, source_id) do

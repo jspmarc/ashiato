@@ -15,6 +15,10 @@ defmodule Ashiato.Ocr.Socket do
   # cannot hang the caller forever, not to cap legitimate work.
   @default_timeout 60_000
 
+  # A framed reply is one JSON object; a corrupt 4-byte length prefix would otherwise let
+  # the socket buffer gigabytes into the caller before any timeout fires.
+  @max_reply_bytes 4_000_000
+
   @doc "Runs OCR for one image locator against the configured socket."
   @spec recognise(Ashiato.Ocr.locator()) ::
           {:ok, [Ashiato.Ocr.line()]} | {:error, term()}
@@ -27,12 +31,17 @@ defmodule Ashiato.Ocr.Socket do
         # :gen_tcp.connect/3 defaults to an infinite timeout, so a wedged service with a
         # full listen backlog would block the ingest caller forever. The bound applies to
         # connect as well as to recv.
-        case :gen_tcp.connect({:local, path}, 0, [:binary, packet: 4, active: false], timeout()) do
+        opts = [:binary, packet: 4, active: false, packet_size: @max_reply_bytes]
+
+        case :gen_tcp.connect({:local, path}, 0, opts, timeout()) do
           {:ok, sock} -> round_trip(sock, kind, value)
           {:error, reason} -> {:error, reason}
         end
     end
   end
+
+  @spec recognise(term()) :: {:error, :invalid_locator}
+  def recognise(_locator), do: {:error, :invalid_locator}
 
   defp round_trip(sock, kind, value) do
     try do

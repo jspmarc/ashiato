@@ -68,6 +68,12 @@ defmodule Ashiato.OcrTest do
       assert_receive {:request, %{"op" => "ocr", "url" => ^url}}
     end
 
+    test "a locator that is not a path or url is refused, not raised" do
+      assert Socket.recognise(nil) == {:error, :invalid_locator}
+      assert Socket.recognise({:path, 123}) == {:error, :invalid_locator}
+      assert Socket.recognise("just-a-string") == {:error, :invalid_locator}
+    end
+
     test "missing socket file is a clean error", %{socket_path: path} do
       assert Socket.recognise({:path, path}) == {:error, :enoent}
     end

@@ -59,12 +59,18 @@ problem this app does not have.
 | **Encounter** | One observed occurrence of a word: source, date, line crop, normalized text |
 | **Source** | Where an encounter came from — a game, a manga, a book, optionally a chapter |
 | **Mature** | A word whose FSRS **stability** is at or above the maturity threshold (default 21 days, configurable). A derived predicate, never a stored flag |
+| **Remedial step** | A short sub-day delay after a failed review: 4h → 12h → 24h; 24h repeats until a pass. It sets `due_at`, not stability |
+| **Ghost** | The scheduler mode entered on the second consecutive `again` with no pass in between. Not an FSRS state and not a memory score |
+| **Massed exposure** | High `occurrences` over few `days_seen`. A ranking/resurfacing signal, not a ghost and not a scheduler mode |
+| **Leech** | A word that repeatedly fails across normal reviews. A flag, not a scheduler |
+| **Failure streak** | `word_states.failure_streak`: consecutive `again` grades, reset by any pass. Drives remedial and ghost scheduling and never FSRS (R3.13) |
 | **Content word** | Noun, verb, adjective, adverb. Not particles, auxiliaries, or punctuation |
 | **Coverage** | Fraction of tokens in a text whose words are already known |
 | **Page** | One processed image. Identity is a hash of its normalized text |
 | **Tokens** | Raw count of a word in accepted text. Depth |
 | **Occurrences** | Number of distinct pages containing a word, once per page. Breadth |
 | **Lexeme** | A distinct lexical item — `lemma + reading + POS`. Global and shared, not owned by a user |
+| **FSRS** | Free Spaced Repetition Scheduler, **version 6** (21 weights, `w0..w20`). Owns stability, difficulty and the day-scale interval; decay is learned (`w20`) rather than fixed, and the curve factor is derived from the desired retention |
 | **Stability (S)** | FSRS variable: days until recall probability decays to 90%. "How long until I'd forget this" |
 | **Difficulty (D)** | FSRS variable, 1–10: how hard this item is *for this user*. Rises on lapses, falls on easy recalls |
 | **Retrievability (R)** | FSRS variable: probability of recall *right now*, given S and elapsed time |
@@ -89,8 +95,8 @@ schedulers reviewing one thing fight each other and produce worse results than e
 **P3. A kanji is known when ≥1 word containing it is mature AND it appears in ≥2 distinct words.**
 *Mature* means that word's FSRS **stability** has reached the maturity threshold (default 21 days) —
 the point at which recall is projected to survive weeks without review. Stability is used rather than
-interval because interval is clamped by the frequency caps (R3.5), which would otherwise make maturity
-depend on the cap. Derived from review history, never set by hand.
+interval because stability is FSRS's own measure of memory strength, while the interval is a
+scheduling choice. Derived from review history, never set by hand.
 The second clause is the load-bearing one. A kanji known from a single word is word knowledge
 wearing a character's costume.
 
@@ -99,9 +105,10 @@ wearing a character's costume.
 diversity), `days_seen` (distinct calendar days). `days_seen` is the strongest retention signal;
 spaced encounter beats massed encounter. Raw token depth is tracked separately as `tokens` (§6.5).
 
-**P5. Recall sets the interval; frequency sets the ceiling.**
-FSRS owns scheduling. Frequency caps how far an interval may stretch (R3.5). Letting appearance count
-drive review frequency starves the deck — twenty top words would consume every slot forever.
+**P5. Recall sets the interval. Frequency only decides what to study next.**
+FSRS owns scheduling. Encounters, occurrences, and `days_seen` decide introduction order and
+resurfacing; they never change the due date. Capping intervals by frequency would override FSRS and
+double-count a signal the app already has: a frequent word will meet you again in real material.
 
 How the counters and the scheduler actually combine is specified in §6.4.
 
@@ -185,14 +192,14 @@ or introduction (§6.5).
 | R3.2 | M | Card front = the line crop where the word was met, **with the target word named beneath it, not masked**. Card back = word, reading, meaning, kanji. One card per word. |
 | R3.3 | M | Grading updates FSRS state for that word. |
 | R3.4 | M | A word is not introduced to the queue until it has been encountered at least N times, N configurable (default 2), with a force-add override. |
-| R3.5 | M | Interval caps by frequency band: top band ≤ 60 days, next band ≤ 120 days, tail unbounded. |
 | R3.6 | M | When a word is encountered in new material while its interval is long, resurface it immediately rather than waiting for its due date. |
 | R3.7 | S | Opt-in kanji discrimination drill: minimal pairs (e.g. 待/持/時/特), multiple choice, back of card explains the distinguishing radical. Generated only for kanji with ≥2 encountered words. Minimum-encounter threshold configurable, force-add available. |
 | R3.8 | M | Suspend a word indefinitely; suspend + mark mastered (excluded from queue, still counted in coverage). |
 | R3.9 | M | New-card introduction ordered by priority (frequency within own material × novelty), capped per day. |
 | R3.10 | S | Filter new-card introduction by JLPT level relative to the user's own level setting. |
-| R3.11 | S | Flag and surface leeches: words met often but repeatedly failed. |
+| R3.11 | S | Flag and surface leeches: words met often but repeatedly failed. A leech flag does not change scheduling. |
 | R3.12 | M | A word met in several pages shows one occurrence per review, chosen deterministically by `reps mod occurrence_count`, so every context is eventually seen and any card is reproducible. Never show a discarded or unconfirmed encounter. |
+| R3.13 | M | A first `again` schedules a 4-hour remedial step. A second consecutive `again` with no pass in between enters ghost mode: 12 hours, then 24 hours, repeating 24 hours until a pass. A pass clears the failure streak and returns the word to normal FSRS scheduling. Remedial steps set `due_at` only; FSRS stability and difficulty still update normally. |
 
 **Acceptance (R3.2):** grading a word card never advances a kanji card, and a kanji is never presented
 as "what does this mean".
@@ -401,24 +408,32 @@ dictionary-owned (P9) and live in `dict_cache`.
 ### 6.4 How the scheduling inputs interact
 
 FSRS computes intervals from review grades alone. The counters never touch its internals — they decide
-*what to study next* and *how far an interval may stretch*.
+*what to study next*.
 
 | Signal | Drives | Never does |
 |---|---|---|
 | FSRS grades | stability, difficulty, interval | — |
-| `occurrences` (distinct pages) | introduction order (R3.9); the frequency band that caps the interval (R3.5) | change stability or difficulty |
+| `occurrences` (distinct pages) | introduction order (R3.9) | change stability, difficulty, or the interval |
 | `distinct_sources` | confidence that the word is a real recurring item rather than one author's idiolect; ranking tiebreak | change the interval directly |
-| `days_seen` | retention evidence outside FSRS; ghost detection; "you can suspend this" prompts | change the interval directly |
+| `days_seen` | retention evidence outside FSRS; massed-exposure detection; "you can suspend this" prompts | change the interval directly |
+| `failure_streak` | whether the next `due_at` is a remedial step (4h → 12h → 24h) or a ghost-mode step; reset by any pass | change stability or difficulty — those still come from FSRS alone |
 
-Two derived rules:
-
-- `final_interval = min(fsrs_interval, cap_for_band(occurrences))`
-- **Ghost** = high `occurrences` with low `days_seen`. Massed exposure, fragile memory. Resurface
-  these first.
+**Massed exposure** = high `occurrences` with low `days_seen`. Crammed exposure, fragile memory.
+Resurface these first. It is not a ghost and does not change scheduling.
 
 A re-encounter (R3.6) is a genuine review event and *does* feed FSRS. That is the only place the
 ledger changes scheduling, and it does so honestly — by supplying a new observation rather than by
 faking an interval.
+
+**Remedial steps and ghosts.** FSRS owns stability, difficulty, and the day-scale interval. A first
+`again` schedules a 4-hour remedial step. A second consecutive `again` with no pass in between enters
+ghost mode: 12 hours, then 24 hours, repeating 24 hours until a pass. A pass clears the failure streak
+and returns the word to normal FSRS scheduling.
+
+The FSRS state still updates on every review; remedial steps only override `due_at`.
+`review_events.interval_after` records `0` for a remedial step because the step is not an FSRS
+interval. FSRS applies its normal elapsed-day rule to the next review: 4h rounds same-day, while
+12h and 24h count as one day.
 
 ### 6.5 Counting rules
 
@@ -460,36 +475,19 @@ tuning costs nothing but time.
 mature(word)  ⇔  stability ≥ maturity_threshold      # default 21 days
 ```
 
-Stability, not interval: interval is clamped by the band caps below, and an interval-based definition
-would make maturity depend on the cap — with a cap set below the threshold, no word could ever mature.
-Stability is FSRS's own measure of memory strength and is unaffected by the clamp.
+Stability, not interval: stability is FSRS's own measure of memory strength, while the interval is a
+scheduling choice.
 
-**Frequency bands and interval caps (R3.5)**
-
-| Band | `occurrences` | Cap |
-|---|---|---|
-| 0 | ≥ 20 | 60 days |
-| 1 | 8–19 | 120 days |
-| 2 | 3–7 | 240 days |
-| 3 | ≤ 2 | none |
-
-```
-final_interval = min( fsrs_interval, cap_for_band(occurrences) )
-```
-
-The cap only bites on words FSRS wants to schedule far out — i.e. ones you keep getting right. That is
-intentional: high-utility words should be re-proved occasionally, not retired.
-
-**Ghost (massed exposure)**
+**Massed exposure**
 
 ```
 density = occurrences / max(days_seen, 1)
-ghost   ⇔  occurrences ≥ 5  AND  density ≥ 4
+massed  ⇔  occurrences ≥ 5  AND  density ≥ 4
 ```
 
 Five or more sightings crammed into one or two days is the signature of a word seen repeatedly in a
-single session — memorised in the moment, gone in a week. Ghosts are resurfaced first and never
-trusted as known.
+single session — memorised in the moment, gone in a week. Massed words are resurfaced first and never
+trusted as known. This is a ranking/resurfacing signal, not ghost mode.
 
 **Introduction priority (R3.9)**
 
@@ -547,8 +545,12 @@ minimum-encounter threshold changes. A mutable state row destroys all three.
 migration, so anything else writing to the database is rejected too. Never a native Postgres `ENUM`:
 SQLite has no equivalent and altering one is a migration hazard with no payoff. The enumerated columns
 are `sources.kind`, `pages.status`, `pages.text_origin`, `pages.image_store`, `words.suspended_reason`,
-`encounters.crop_store`, `dict_cache_entries.kind`, plus the integers `word_states.state` and
-`review_events.grade`.
+`encounters.crop_store` and `dict_cache_entries.kind`.
+
+`word_states.state` is an `Ecto.Enum` of atoms persisted as the integers 0–3 — `:new`, `:learning`,
+`:review`, `:relearning` — so the column stays an integer and the app never handles bare numbers. The
+migration's `state IN (0,1,2,3)` CHECK still guards it. `review_events.grade` is a genuine integer (1–4)
+rather than an enum, because FSRS grades are numeric by definition.
 
 **`dict_cache_entries` has no TTL and no refresh schedule.** JMdict is immutable between releases, so an
 entry keyed by `dict_version` is either current or superseded wholesale — never stale. Refresh happens
@@ -887,12 +889,10 @@ switch means no translate affordance anywhere in the UI — hidden, not failing.
 | `ocr_provider` | `paddleocr_vl` | OCR recognition backend |
 | Min encounters — words | 2 | Queue-entry threshold (R3.4) |
 | Min encounters — kanji | 2 | Discrimination-drill threshold (R3.7) |
+| Remedial / ghost steps | 4h / 12h / 24h | First failure 4h, second consecutive 12h, third+ 24h repeating until a pass (R3.13) |
 | Maturity threshold | 21 days (stability) | Defines *mature* for P3 |
-| Band caps | 60 / 120 / 240 / none | Occurrence bands ≥20 / 8–19 / 3–7 / ≤2 (§6.6) |
 | User JLPT level | unset | Gates new-card introduction (R3.10) |
 | New cards per day | 10 | Introduction cap (R3.9) |
-| Frequency cap — top band | 60 days | R3.5 |
-| Frequency cap — second band | 120 days | R3.5 |
 | Chrome page-ratio | 0.5 | Chrome flagging (§6.5) |
 | Page image TTL | 30 days | R2.6 |
 | Image store | `local` | `local` or `s3` |
@@ -932,7 +932,7 @@ switch means no translate affordance anywhere in the UI — hidden, not failing.
 | D4 | Dictionary as external HTTP service | Bundled `dict_*` tables in the ledger DB | Installation cost; reference data is large and shared |
 | D5 | Word-level frequency counter | Kanji-level counter | Words are what is met and what carry readings |
 | D6 | Per-line crop as card front | Text-only cards | Trains recognition in the source font; also the OCR audit trail |
-| D7 | Interval caps by frequency band | Frequency-driven review frequency | Caps encode the intuition without starving the queue |
+| D7 | No interval caps by frequency band; FSRS owns the due date | Frequency-band interval caps | Caps override FSRS, increase workload, and double-count a signal the ledger already has: frequent words reappear in real reading |
 | D8 | Re-encounter resurfacing | Random sampling of year-old cards | Uses a signal generic SRS apps do not have |
 | D9 | Kanji discrimination = minimal pairs | Masked-glyph production card | Masking tests production; the reading, not vision, would disambiguate |
 | D10 | Import as known baseline | Import SRS intervals | Foreign intervals and local FSRS parameters do not merge |
@@ -949,7 +949,7 @@ switch means no translate affordance anywhere in the UI — hidden, not failing.
 | D16 | Store lemma/reading/POS, cache dictionary fields | Store everything in the ledger | Dictionary updates must not rewrite the ledger |
 | D17 | Every table carries `user_id` from the start | Add it when multi-user arrives | One column now, a migration and a data backfill later |
 | D18 | Shared `lexemes` table + per-user `words` | Store lemma/reading on every user's word row | Readings stored once globally; per-user cost is one join row |
-| D19 | Maturity defined on FSRS **stability** | Interval ≥ 21 days (Anki's convention) | Interval is clamped by the frequency caps, so maturity would depend on the cap |
+| D19 | Maturity defined on FSRS **stability** | Interval ≥ 21 days (Anki's convention) | Stability is memory strength; interval is a scheduling choice. Maturity should not depend on scheduler policy |
 | D20 | Pod `ashiato` = web + OCR; dictionary stays a separate service | All three in one pod, or one fat container | OCR is heavy and crashy and must be co-located; the dictionary is shared, versioned, and has its own release cadence |
 | D21 | OCR behind a provider behaviour | Commit to one OCR backend | Accuracy on game UI text varies wildly; the backend must be swappable by config |
 | D22 | Ruby off in-game when photographing | Keep furigana on for the camera | Ruby reads as stray glyphs to every backend; the tokenizer already supplies readings |
@@ -973,6 +973,7 @@ switch means no translate affordance anywhere in the UI — hidden, not failing.
 | D41 | `int` primary keys everywhere | UUIDs, or `bigint` | UUIDs serve row-merging, which this does not do; the 2.1 B ceiling is 300× beyond a heavy decade, and `int`→`bigint` is one ALTER |
 | D42 | No `ocr_raw` column | Keep model output for audit | A fixture corpus with ground truth measures OCR accuracy better; retaining per-page output stores the same bytes twice on pages nobody corrected |
 | D26 | Recogniser language must match the material | One recogniser for everything | A mismatched character set produces confident lookalike errors (power→Dower) |
+| D48 | Remedial steps 4h → 12h → 24h; ghost mode starts on the second consecutive `again` | Native FSRS interval immediately after the first lapse | Anki schedules a relearning step before FSRS resumes; ghost needs a second failure, not the first |
 
 ---
 

@@ -19,10 +19,15 @@ defmodule Ashiato.Ledger do
   alias Ashiato.Lexemes
   alias Ashiato.Pages
   alias Ashiato.Repo
+  alias Ashiato.ReviewEvents
   alias Ashiato.Sources
+  alias Ashiato.Srs
   alias Ashiato.Utils
   alias Ashiato.WordStates
   alias Ashiato.Words
+
+  @grade_again 1
+  @remedial_hours {4, 12, 24}
 
   # A word enters the queue only after being met on this many distinct pages;
   # `introduce_words/3` lets a caller override it.
@@ -127,6 +132,165 @@ defmodule Ashiato.Ledger do
           nil -> {:error, changeset}
         end
     end
+  end
+
+  @doc """
+  Grades one review of a word and advances its scheduling state.
+
+  Fetches the word (error if missing), computes the next state with
+  `Ashiato.Srs.grade/3`, applies the remedial schedule on `again`, and writes
+  the review event and materialised state in one transaction.
+
+  Everything happens in one `Repo` transaction:
+
+    1. the `Words` row is fetched for `user_id` (error if missing)
+    2. the current `WordStates` is fetched; an absent row just means *new*
+       (state :new) — the state is rebuildable from the log, per §6.8
+    3. the review is appended to `review_events` (append-only; the log is the
+       source of truth)
+    4. `word_states` is upserted from it — a mere materialisation
+
+  `user_id` is set programmatically, never cast (AGENTS Ecto house rule).
+
+  Returns `{:ok, %WordStates{}}` (with `due_at` = `now` + the scheduled
+  interval) or `{:error, changeset}`. `review/2` reviews now; pass `now`
+  explicitly in tests for determinism.
+  """
+  @spec review(integer(), Srs.grade()) :: {:ok, WordStates.t()} | {:error, Ecto.Changeset.t()}
+  def review(word_id, grade), do: review(word_id, grade, DateTime.utc_now())
+
+  @spec review(integer(), Srs.grade(), DateTime.t()) ::
+          {:ok, WordStates.t()} | {:error, Ecto.Changeset.t()}
+  def review(word_id, grade, now) when is_integer(grade) and grade in 1..4 do
+    Repo.transaction(fn ->
+      case do_review(word_id, grade, now) do
+        {:ok, word_state} -> word_state
+        {:error, changeset} -> Repo.rollback(changeset)
+      end
+    end)
+    |> case do
+      {:ok, word_state} -> {:ok, word_state}
+      {:error, changeset} -> {:error, changeset}
+    end
+  end
+
+  def review(_word_id, _grade, _now) do
+    {:error,
+     %ReviewEvents{}
+     |> Ecto.Changeset.change()
+     |> Ecto.Changeset.add_error(:grade, "must be an FSRS grade between 1 and 4")}
+  end
+
+  @spec do_review(integer(), Srs.grade(), DateTime.t()) ::
+          {:ok, WordStates.t()} | {:error, Ecto.Changeset.t()}
+  defp do_review(word_id, grade, now) do
+    case Repo.get(Words, word_id) do
+      nil ->
+        {:error, missing_word_changeset(word_id)}
+
+      word ->
+        # a missing row means "new"
+        word_state =
+          case Repo.get(WordStates, word_id) do
+            %WordStates{} = existing -> existing
+            nil -> new_word_state(word_id, now)
+          end
+
+        %{state: next, interval_days: interval} = Srs.grade(word_state, grade, now)
+
+        # word_states columns are second-precision (:utc_datetime); the log
+        # row keeps the full usec `now`
+        second = DateTime.truncate(now, :second)
+
+        {failure_streak, due_at, interval_after} =
+          schedule(grade, word_state.failure_streak, second, interval)
+
+        with {:ok, _event} <-
+               append_review_event(
+                 word.user_id,
+                 word_id,
+                 grade,
+                 now,
+                 next,
+                 interval_after
+               ),
+             {:ok, word_state} <-
+               upsert_word_state(word_id, next, due_at, second, failure_streak) do
+          {:ok, word_state}
+        end
+    end
+  end
+
+  defp schedule(@grade_again, failure_streak, now, _interval) do
+    streak = failure_streak + 1
+    step = elem(@remedial_hours, min(streak, tuple_size(@remedial_hours)) - 1)
+    {streak, DateTime.add(now, step, :hour), 0}
+  end
+
+  defp schedule(_grade, _failure_streak, now, interval) do
+    {0, DateTime.add(now, interval, :day), interval}
+  end
+
+  # The log is append-only: rows are only inserted, never updated or deleted.
+  @spec append_review_event(
+          integer(),
+          integer(),
+          Srs.grade(),
+          DateTime.t(),
+          WordStates.t(),
+          integer()
+        ) ::
+          {:ok, ReviewEvents.t()} | {:error, Ecto.Changeset.t()}
+  defp append_review_event(user_id, word_id, grade, now, next, interval_after) do
+    %ReviewEvents{user_id: user_id, word_id: word_id}
+    |> ReviewEvents.changeset(%{
+      grade: grade,
+      reviewed_at: now,
+      stability_after: next.stability,
+      difficulty_after: next.difficulty,
+      interval_after: interval_after
+    })
+    |> Repo.insert()
+  end
+
+  @spec upsert_word_state(integer(), WordStates.t(), DateTime.t(), DateTime.t(), integer()) ::
+          {:ok, WordStates.t()} | {:error, Ecto.Changeset.t()}
+  defp upsert_word_state(word_id, next, due_at, last_reviewed_at, failure_streak) do
+    attrs = %{
+      state: next.state,
+      stability: next.stability,
+      difficulty: next.difficulty,
+      reps: next.reps,
+      lapses: next.lapses,
+      failure_streak: failure_streak,
+      due_at: due_at,
+      last_reviewed_at: last_reviewed_at
+    }
+
+    %WordStates{word_id: word_id}
+    |> WordStates.changeset(attrs)
+    |> Repo.insert(on_conflict: [set: Map.to_list(attrs)], conflict_target: :word_id)
+  end
+
+  @spec new_word_state(integer(), DateTime.t()) :: WordStates.t()
+  defp new_word_state(word_id, now) do
+    %WordStates{
+      word_id: word_id,
+      state: :new,
+      stability: nil,
+      difficulty: nil,
+      reps: 0,
+      lapses: 0,
+      failure_streak: 0,
+      due_at: now
+    }
+  end
+
+  @spec missing_word_changeset(integer()) :: Ecto.Changeset.t()
+  defp missing_word_changeset(word_id) do
+    %WordStates{word_id: word_id}
+    |> Ecto.Changeset.change()
+    |> Ecto.Changeset.add_error(:word_id, "does not exist")
   end
 
   @doc """
@@ -429,7 +593,7 @@ defmodule Ashiato.Ledger do
 
   @spec introduce_word(Words.t(), DateTime.t()) :: Words.t()
   defp introduce_word(word, due_at) do
-    %WordStates{word_id: word.id, state: 0, due_at: due_at}
+    %WordStates{word_id: word.id, state: :new, due_at: due_at}
     |> Repo.insert(on_conflict: :nothing, conflict_target: [:word_id])
     |> case do
       # `on_conflict: :nothing` also reports {:ok, _} when a concurrent caller

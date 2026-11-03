@@ -65,7 +65,35 @@ defmodule Ashiato.TokenizerTest do
     start_supervised!({Fake, tokens: tokens})
 
     assert {:ok, ^tokens} = Fake.tokenize("はし 橋 箸")
-    assert tokens |> Enum.uniq_by(&{&1.lemma, &1.reading}) |> length() == 3
+  end
+
+  test "impl/0 routes through the configured implementation" do
+    start_supervised!({Fake, tokens: [token("橋", "橋", "ハシ")]})
+    Application.put_env(:ashiato, Tokenizer, impl: Fake)
+    on_exit(fn -> Application.delete_env(:ashiato, Tokenizer) end)
+
+    # the exact hook wave 3 configures: behaviour in, concrete module out
+    assert Tokenizer.tokenize("橋") == {:ok, [token("橋", "橋", "ハシ")]}
+    assert Fake.calls() == ["橋"]
+  end
+
+  test "a non-200 reply is an error tuple, not a crash" do
+    stub_reply(fn conn -> Plug.Conn.send_resp(conn, 500, "boom") end)
+
+    assert Tokenizer.Http.tokenize("食べた") == {:error, {:unexpected_status, 500}}
+  end
+
+  test "a 200 reply without a token list is rejected, not read as an empty page" do
+    stub_reply(fn conn -> Req.Test.json(conn, %{"nope" => []}) end)
+
+    assert {:error, {:malformed_reply, %{"nope" => []}}} = Tokenizer.Http.tokenize("食べた")
+  end
+
+  test "a malformed token names the entry instead of raising" do
+    stub_reply(fn conn -> Req.Test.json(conn, %{"tokens" => [%{"surface" => "食べ"}]}) end)
+
+    assert Tokenizer.Http.tokenize("食べた") ==
+             {:error, {:malformed_token, %{"surface" => "食べ"}}}
   end
 
   test "fake returns {:error, reason} when configured" do
@@ -77,5 +105,16 @@ defmodule Ashiato.TokenizerTest do
 
   defp token(surface, lemma, reading, part_of_speech \\ "名詞") do
     %{surface: surface, lemma: lemma, reading: reading, part_of_speech: part_of_speech}
+  end
+
+  # Points the HTTP client at a Req.Test stub: no socket, no service.
+  defp stub_reply(plug) do
+    Application.put_env(:ashiato, Tokenizer,
+      base_url: "https://jp-dict.test",
+      plug: {Req.Test, Tokenizer.Http}
+    )
+
+    on_exit(fn -> Application.delete_env(:ashiato, Tokenizer) end)
+    Req.Test.stub(Tokenizer.Http, plug)
   end
 end

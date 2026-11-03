@@ -15,6 +15,13 @@ defmodule Ashiato.Tokenizer.Http do
   """
 
   @impl true
+  @doc """
+  Posts `text` to the tokenizer and maps the reply onto `t:Ashiato.Tokenizer.token/1` maps.
+
+  A non-200 reply, a malformed envelope, or one malformed token each come back as
+  `{:error, term()}`: this runs on the ingest pipeline, where raising would take the caller's
+  supervision tree down over a bad service reply.
+  """
   @spec tokenize(String.t()) :: {:ok, [Ashiato.Tokenizer.token()]} | {:error, term()}
   def tokenize(text) do
     response = Req.post!(req(), url: "/tokenize", json: %{text: text})
@@ -61,22 +68,47 @@ defmodule Ashiato.Tokenizer.Http do
   end
 
   defp parse(%Req.Response{status: 200, body: body}) do
-    {:ok, Enum.map(body["tokens"] || [], &parse_token/1)}
+    case body do
+      # the envelope is part of the contract too: a 200 without a token list is a broken
+      # reply, not an empty page, and must not record zero encounters silently.
+      %{"tokens" => tokens} when is_list(tokens) -> parse_tokens(tokens)
+      _ -> {:error, {:malformed_reply, body}}
+    end
   end
 
   defp parse(%Req.Response{status: status}), do: {:error, {:unexpected_status, status}}
+
+  defp parse_tokens(tokens) do
+    Enum.reduce_while(tokens, {:ok, []}, fn entry, {:ok, acc} ->
+      case parse_token(entry) do
+        {:ok, token} -> {:cont, {:ok, [token | acc]}}
+        :error -> {:halt, {:error, {:malformed_token, entry}}}
+      end
+    end)
+    |> case do
+      {:ok, acc} -> {:ok, Enum.reverse(acc)}
+      {:error, _} = error -> error
+    end
+  end
 
   defp parse_token(%{
          "surface" => surface,
          "lemma" => lemma,
          "reading" => reading,
          "part_of_speech" => part_of_speech
-       }) do
-    %{
-      surface: surface,
-      lemma: lemma,
-      reading: to_hiragana(reading),
-      part_of_speech: part_of_speech
-    }
+       })
+       when is_binary(surface) and is_binary(lemma) and is_binary(reading) and
+              is_binary(part_of_speech) do
+    {:ok,
+     %{
+       surface: surface,
+       lemma: lemma,
+       reading: to_hiragana(reading),
+       part_of_speech: part_of_speech
+     }}
   end
+
+  # A token missing a field would otherwise raise inside String.codepoints/1 and surface
+  # from the blanket rescue as an opaque exception instead of naming the bad entry.
+  defp parse_token(_entry), do: :error
 end

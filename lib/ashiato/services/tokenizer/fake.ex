@@ -32,6 +32,9 @@ defmodule Ashiato.Tokenizer.Fake do
   end
 
   @impl true
+  @doc """
+  Returns the canned tokens (or the canned error) and records the input.
+  """
   @spec tokenize(String.t()) :: {:ok, [Ashiato.Tokenizer.token()]} | {:error, term()}
   def tokenize(text) do
     Agent.get_and_update(__MODULE__, fn state ->

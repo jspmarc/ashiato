@@ -11,6 +11,8 @@ defmodule Ashiato.Settings.Fake do
 
   alias Ashiato.Schemas.Setting
 
+  @doc "Starts the in-memory store; one per test."
+  @spec start_link(keyword()) :: Agent.on_start()
   def start_link(_opts \\ []) do
     Agent.start_link(fn -> %{} end, name: __MODULE__)
   end
@@ -201,6 +203,35 @@ defmodule Ashiato.SettingsTest do
 
       impl.put(user.id, "translation_enabled", false, [])
       refute Settings.translate_capable?(user.id)
+    end
+
+    test "a stored null key does not fall through to the environment", %{user: user} do
+      System.put_env("DEEPL_API_KEY", "dl-from-env")
+      on_exit(fn -> System.delete_env("DEEPL_API_KEY") end)
+
+      impl = Settings.impl()
+      impl.put(user.id, "translation_enabled", true, [])
+      impl.put(user.id, "translation_provider", "deepl", [])
+      # the user cleared the key: the row exists and holds JSON null
+      impl.put(user.id, "deepl_api_key", nil, [])
+
+      refute Settings.translate_capable?(user.id)
+    end
+
+    test "translate_capable? covers the google_cloud and llm branches", %{user: user} do
+      impl = Settings.impl()
+      impl.put(user.id, "translation_enabled", true, [])
+
+      impl.put(user.id, "translation_provider", "google_cloud", [])
+      refute Settings.translate_capable?(user.id)
+      impl.put(user.id, "google_cloud_api_key", "gc-1", [])
+      assert Settings.translate_capable?(user.id)
+
+      impl.put(user.id, "translation_provider", "llm", [])
+      impl.put(user.id, "OPENAI_API_KEY", "", [])
+      refute Settings.translate_capable?(user.id)
+      impl.put(user.id, "OPENAI_API_KEY", "sk-1", [])
+      assert Settings.translate_capable?(user.id)
     end
   end
 end

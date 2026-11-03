@@ -1,0 +1,194 @@
+defmodule Ashiato.Translator do
+  @moduledoc """
+  Translation provider behaviour (D44, D45).
+
+  A page is translated in **one request** so cross-line context survives. Providers
+  return line-aligned text; when a page reply does not carry the same number of
+  lines as the input — or cannot be interpreted at all — the shared wrapper in this
+  module falls back to one request per line, so the rule lives in exactly one place
+  and no provider can forget it.
+
+  Options accepted by `translate_page/2`:
+
+    * `:source_lang` — ISO code of the source language, e.g. `"ja"`. Defaults to
+      `"auto"`, which every provider either supports natively or omits.
+    * `:target_lang` — ISO code of the target language, e.g. `"en"`. Required;
+      without it providers return `{:error, :missing_target_lang}`.
+    * `:api_key` — credential for `deepl` and `google_cloud`, optional for
+      `libretranslate`. Passed in by the settings context; never logged.
+    * `:base_url` — self-hosted instance root for `libretranslate`.
+    * `:model` — model name for `llm`; see `Ashiato.Translator.Llm`.
+
+  Known providers, selectable as `config :ashiato, Ashiato.Translator, provider: ...`
+  by atom: `:google_free` (default), `:llm`, `:deepl`, `:google_cloud`,
+  `:libretranslate`, `:off` — or directly as a module.
+
+  **No caching in this module.** `dict_cache_entries.kind` forbids `"translation"`;
+  caching waits for a migration that widens the CHECK constraint. Nothing here logs
+  the text being translated or any credential, and an unconfigured provider returns
+  `{:error, :not_configured}` instead of raising.
+  """
+
+  @callback translate_page(lines :: [String.t()], opts :: keyword()) ::
+              {:ok, [String.t()]} | {:error, term()}
+
+  require Logger
+
+  @providers %{
+    google_free: Ashiato.Translator.GoogleFree,
+    llm: Ashiato.Translator.Llm,
+    deepl: Ashiato.Translator.Deepl,
+    google_cloud: Ashiato.Translator.GoogleCloud,
+    libretranslate: Ashiato.Translator.LibreTranslate,
+    off: Ashiato.Translator.Off
+  }
+
+  @doc """
+  Includes the shared page-then-per-line wrapper in a provider module.
+
+  A provider only defines `page_request(lines, opts) :: {:ok, [String.t()]} |
+  {:error, term()}` — the attempt to translate the whole page in one request — and
+  this macro turns it into a full `translate_page/2` implementation with the
+  fallback rule applied.
+  """
+  defmacro __using__(_opts) do
+    quote do
+      @behaviour Ashiato.Translator
+
+      # Providers call the shared helpers by their short name (`Translator.langs/1`,
+      # `Translator.http_post/2`), so the alias belongs in the macro, not in each file.
+      alias Ashiato.Translator
+
+      @doc false
+      @impl Ashiato.Translator
+      @spec translate_page([String.t()], keyword()) :: {:ok, [String.t()]} | {:error, term()}
+      def translate_page(lines, opts) do
+        Ashiato.Translator.page_with_fallback(lines, opts, &page_request/2)
+      end
+    end
+  end
+
+  @doc """
+  The configured provider module, from
+  `Application.get_env(:ashiato, Ashiato.Translator, [])[:provider]`.
+
+  Defaults to `:google_free` (D45): the only provider that works on a fresh install
+  with no key, no URL, and no local server.
+  """
+  @spec impl() :: module()
+  def impl do
+    provider =
+      :ashiato
+      |> Application.get_env(__MODULE__, [])
+      |> Keyword.get(:provider, :google_free)
+
+    resolve(provider)
+  end
+
+  defp resolve(provider) when is_atom(provider) do
+    case Atom.to_string(provider) do
+      "Elixir." <> _ ->
+        provider
+
+      _ ->
+        case Map.fetch(@providers, provider) do
+          {:ok, module} ->
+            module
+
+          :error ->
+            Logger.warning("Unknown translator provider #{inspect(provider)}, using :google_free")
+            Ashiato.Translator.GoogleFree
+        end
+    end
+  end
+
+  @doc """
+  Translates a page through `impl/0`. Later waves call this, never a concrete
+  provider module.
+  """
+  @spec translate_page([String.t()], keyword()) :: {:ok, [String.t()]} | {:error, term()}
+  def translate_page(lines, opts), do: impl().translate_page(lines, opts)
+
+  @doc """
+  The shared page→per-line rule (D44): accept a page reply only when it is
+  line-aligned. A reply with a different line count, or one that cannot be
+  interpreted (`:unparsable`), is retried as one request per line. Any other error
+  is returned as-is — in particular `:not_configured` never triggers per-line
+  traffic.
+  """
+  @spec page_with_fallback(
+          [String.t()],
+          keyword(),
+          ([String.t()], keyword() -> {:ok, [String.t()]} | {:error, term()})
+        ) :: {:ok, [String.t()]} | {:error, term()}
+  def page_with_fallback([], _opts, _page_request), do: {:ok, []}
+
+  def page_with_fallback(lines, opts, page_request) do
+    case page_request.(lines, opts) do
+      {:ok, translated} when length(translated) == length(lines) ->
+        {:ok, translated}
+
+      {:ok, _misaligned} ->
+        per_line(lines, opts, page_request)
+
+      {:error, :unparsable} ->
+        per_line(lines, opts, page_request)
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp per_line(lines, opts, page_request) do
+    lines
+    |> Enum.map(&line_result(&1, opts, page_request))
+    |> collect()
+  end
+
+  defp line_result(line, opts, page_request) do
+    case page_request.([line], opts) do
+      {:ok, [translated]} -> {:ok, translated}
+      {:ok, _misaligned} -> {:error, :misaligned_line}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp collect(results) do
+    Enum.find(results, &match?({:error, _}, &1)) ||
+      {:ok, Enum.map(results, fn {:ok, translated} -> translated end)}
+  end
+
+  @doc """
+  Posts to `url` with `retry: false` — a failed page is surfaced to the caller
+  rather than silently re-sent, which would double-charge a paid API. A non-200
+  reply is reduced to its status: the body may echo the text being translated, so
+  it is never kept or logged. `:decode` in `req_opts` receives the 200 body.
+  """
+  @spec http_post(String.t(), keyword()) :: {:ok, [String.t()]} | {:error, term()}
+  def http_post(url, req_opts) do
+    {decode, req_opts} = Keyword.pop(req_opts, :decode)
+
+    case Req.post(url, [retry: false] ++ req_opts) do
+      {:ok, %Req.Response{status: 200, body: body}} -> decode.(body)
+      {:ok, %Req.Response{status: status}} -> {:error, {:http, status}}
+      {:error, exception} -> {:error, exception}
+    end
+  end
+
+  @doc false
+  @spec langs(keyword()) :: {:ok, {String.t(), String.t()}} | {:error, :missing_target_lang}
+  def langs(opts) do
+    case Keyword.fetch(opts, :target_lang) do
+      {:ok, target} -> {:ok, {Keyword.get(opts, :source_lang, "auto"), target}}
+      :error -> {:error, :missing_target_lang}
+    end
+  end
+
+  @doc false
+  @spec split_trim(String.t()) :: [String.t()]
+  def split_trim(text), do: text |> String.split("\n") |> Enum.map(&String.trim/1)
+
+  @doc false
+  @spec configured?(term()) :: boolean()
+  def configured?(value), do: is_binary(value) and value != ""
+end

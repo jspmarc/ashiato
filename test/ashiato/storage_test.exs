@@ -13,7 +13,9 @@ defmodule Ashiato.StorageTest do
   test ever touches the default `tmp/storage` or another test's files.
   """
 
-  use ExUnit.Case, async: false, tmp_dir: true
+  use ExUnit.Case, async: false
+
+  @moduletag :tmp_dir
 
   alias Ashiato.Storage
   alias Ashiato.Storage.{Fake, Local}
@@ -71,7 +73,6 @@ defmodule Ashiato.StorageTest do
       :ok
     end
 
-    @tag :tmp_dir
     test "put writes the file and get reads it back" do
       assert :ok = Local.put("pages/1.jpg", <<1, 2, 3>>)
       path = Path.join(Local.root(), "pages/1.jpg")
@@ -79,12 +80,10 @@ defmodule Ashiato.StorageTest do
       assert {:ok, <<1, 2, 3>>} = Local.get("pages/1.jpg")
     end
 
-    @tag :tmp_dir
     test "get of a missing key is an error tuple, not a raise" do
       assert {:error, :enoent} = Local.get("pages/missing.jpg")
     end
 
-    @tag :tmp_dir
     test "put overwrites atomically: the second write fully replaces the first" do
       :ok = Local.put("pages/1.jpg", "first")
       :ok = Local.put("pages/1.jpg", "second")
@@ -96,7 +95,6 @@ defmodule Ashiato.StorageTest do
       assert [_only] = Path.wildcard(Path.join(dir, "*"), match_dot: true)
     end
 
-    @tag :tmp_dir
     test "delete removes the file and is idempotent" do
       :ok = Local.put("pages/1.jpg", <<1>>)
       assert :ok = Local.delete("pages/1.jpg")
@@ -104,7 +102,6 @@ defmodule Ashiato.StorageTest do
       assert :ok = Local.delete("pages/1.jpg")
     end
 
-    @tag :tmp_dir
     test "presigned_get returns a file:// URL pointing at an existing file" do
       :ok = Local.put("pages/1.jpg", <<1, 2, 3>>)
 
@@ -113,7 +110,6 @@ defmodule Ashiato.StorageTest do
       assert {:ok, <<1, 2, 3>>} = File.read(path)
     end
 
-    @tag :tmp_dir
     test "a traversal key is rejected and writes nothing outside the root" do
       escape_path = Path.expand(Path.join(Local.root(), "../escape"))
 
@@ -124,6 +120,19 @@ defmodule Ashiato.StorageTest do
       assert {:error, :invalid_key} = Local.presigned_get("../escape", 300)
 
       refute File.exists?(escape_path)
+    end
+
+    @tag :tmp_dir
+    test "a symlink inside the root cannot reach outside it", %{tmp_dir: tmp_dir} do
+      outside = Path.join(tmp_dir, "outside")
+      File.mkdir_p!(outside)
+      File.write!(Path.join(outside, "secret.txt"), "not yours")
+      File.ln_s!(outside, Path.join(Local.root(), "link"))
+
+      assert {:error, :invalid_key} = Local.get("link/secret.txt")
+      assert {:error, :invalid_key} = Local.put("link/secret.txt", "rewritten")
+      assert {:error, :invalid_key} = Local.delete("link/secret.txt")
+      assert File.read!(Path.join(outside, "secret.txt")) == "not yours"
     end
 
     defp path_for(key), do: Path.join(Local.root(), key)

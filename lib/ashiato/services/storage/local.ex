@@ -77,16 +77,34 @@ defmodule Ashiato.Storage.Local do
       root = Path.expand(root())
       path = Path.expand(Path.join(root, key))
 
-      # the final say on containment: expand resolves any leftovers the
-      # lexical checks could miss
-      if String.starts_with?(path, root <> "/") do
-        {:ok, path}
-      else
-        {:error, :invalid_key}
+      cond do
+        # the lexical check resolves `..` the key may still carry
+        not String.starts_with?(path, root <> "/") -> {:error, :invalid_key}
+        escapes_via_symlink?(root, path) -> {:error, :invalid_key}
+        true -> {:ok, path}
       end
     else
       {:error, :invalid_key}
     end
+  end
+
+  # A lexical check cannot see a symlink that already exists inside the root: `link/secret`
+  # passes it and reads, overwrites or deletes a file outside. Rather than resolve targets
+  # (Elixir has no realpath), the store refuses to traverse a symlink at all — an image
+  # store has no legitimate use for one, and refusing is the smaller rule to reason about.
+  defp escapes_via_symlink?(root, path) do
+    path
+    |> Path.relative_to(root)
+    |> Path.split()
+    |> Enum.reduce_while(root, fn part, dir ->
+      next = Path.join(dir, part)
+
+      case :file.read_link(next) do
+        {:ok, _target} -> {:halt, :symlink}
+        {:error, _not_a_link_or_absent} -> {:cont, next}
+      end
+    end)
+    |> Kernel.==(:symlink)
   end
 
   defp write_atomically(path, binary) do

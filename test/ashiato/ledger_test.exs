@@ -12,7 +12,7 @@ defmodule Ashiato.LedgerTest do
 
   import Ashiato.Fixtures
 
-  alias Ashiato.{Encounters, Ledger, Lexemes, Repo, WordStates}
+  alias Ashiato.{Encounters, Ledger, Lexemes, Pages, Repo, WordStates}
 
   describe "find_or_create_lexeme/3" do
     test "creates the lexeme the first time and returns the same row the second" do
@@ -474,5 +474,131 @@ defmodule Ashiato.LedgerTest do
       )
 
     Ledger.record_encounter(attrs)
+  end
+
+  # The interesting behaviour is concurrency: a stale fenced write is discarded
+  # rather than raising, and pages only move forward.
+  describe "page lifecycle and revision fencing" do
+    setup do
+      user = user_fixture()
+      source = source_fixture(user_id: user.id)
+
+      {:ok, %{user: user, source: source}}
+    end
+
+    test "create_page/1 builds an uploaded page and sets user_id without casting",
+         %{user: user, source: source} do
+      n = System.unique_integer([:positive])
+
+      assert {:ok, page} =
+               Ledger.create_page(%{
+                 user_id: user.id,
+                 source_id: source.id,
+                 image_key: "pages/#{n}.jpg",
+                 text_hash: "hash-#{n}"
+               })
+
+      assert page.status == :uploaded
+      assert page.revision == 1
+      assert page.user_id == user.id
+    end
+
+    test "create_page/1 rejects a duplicate (user_id, text_hash) as an error, not a raise",
+         %{user: user, source: source} do
+      n = System.unique_integer([:positive])
+
+      attrs = %{
+        user_id: user.id,
+        source_id: source.id,
+        image_key: "pages/#{n}.jpg",
+        text_hash: "hash-#{n}"
+      }
+
+      assert {:ok, _} = Ledger.create_page(attrs)
+      assert {:error, changeset} = Ledger.create_page(attrs)
+      assert "has already been taken" in errors_on(changeset).user_id
+    end
+
+    test "accept_text/2 sets accepted_text and bumps revision in one write",
+         %{user: user, source: source} do
+      page = make_page(user, source)
+      assert {:ok, page} = Ledger.accept_text(page, "冷たいな！？")
+
+      assert page.accepted_text == "冷たいな！？"
+      assert page.revision == 2
+    end
+
+    test "a correction with a stale revision is rejected as :superseded",
+         %{user: user, source: source} do
+      page = make_page(user, source)
+      stale = page
+
+      assert {:ok, _} = Ledger.accept_text(page, "正しく読めた")
+      assert {:error, :superseded} = Ledger.accept_text(stale, "別の修正")
+      assert %{accepted_text: "正しく読めた", revision: 2} = Repo.get!(Pages, page.id)
+    end
+
+    test "a matching revision write succeeds and does not bump revision",
+         %{user: user, source: source} do
+      page = make_page(user, source)
+      assert {:ok, page} = Ledger.finish_page(page, :detecting)
+
+      assert page.status == :detecting
+      assert page.revision == 1
+    end
+
+    test "a stale revision write is discarded as :superseded", %{user: user, source: source} do
+      page = make_page(user, source)
+
+      # a correction landed while the job was working: revision bumped
+      assert {:ok, _} = Ledger.accept_text(page, "正しく読めた")
+
+      # the job still carries the page it read at the start (revision 1)
+      assert {:error, :superseded} = Ledger.finish_page(page, :detecting)
+    end
+
+    test "backward transitions are rejected", %{user: user, source: source} do
+      page = make_page(user, source)
+      assert {:ok, page} = Ledger.transition(page, :detecting)
+      assert {:ok, page} = Ledger.transition(page, :text_ready)
+
+      assert {:error, :invalid_transition} = Ledger.transition(page, :uploaded)
+      assert {:error, :invalid_transition} = Ledger.transition(page, :detecting)
+
+      assert {:ok, page} = Ledger.transition(page, :translating)
+      assert {:error, :invalid_transition} = Ledger.transition(page, :text_ready)
+
+      assert {:ok, page} = Ledger.transition(page, :ready)
+      assert {:error, :invalid_transition} = Ledger.transition(page, :failed)
+    end
+
+    test ":failed is reachable from every non-terminal state", %{user: user, source: source} do
+      for status <- [:uploaded, :detecting, :text_ready, :translating] do
+        page = make_page(user, source, status: status)
+        assert {:ok, page} = Ledger.transition(page, :failed)
+        assert page.status == :failed
+      end
+    end
+  end
+
+  defp make_page(user, source, attrs \\ %{}) do
+    n = System.unique_integer([:positive])
+    attrs = Map.new(attrs)
+
+    {:ok, page} =
+      Ledger.create_page(
+        Map.merge(
+          %{
+            user_id: user.id,
+            source_id: source.id,
+            image_key: "pages/#{n}.jpg",
+            text_hash: "hash-#{n}",
+            status: :uploaded
+          },
+          attrs
+        )
+      )
+
+    page
   end
 end

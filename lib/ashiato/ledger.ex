@@ -32,17 +32,28 @@ defmodule Ashiato.Ledger do
   # pages — strictly more, so exactly half does not clear it.
   @chrome_threshold 0.5
 
+  # Forward edges of the ingest pipeline; `:failed` is reachable from any non-terminal state.
+  @forward %{
+    uploaded: [:detecting],
+    detecting: [:text_ready],
+    text_ready: [:translating, :ready],
+    translating: [:ready]
+  }
+
+  @non_terminal [:uploaded, :detecting, :text_ready, :translating]
+
   @doc """
   Finds the lexeme matching `(lemma, reading, part_of_speech)` or creates it.
 
   Safe under races. The common path is fetch-first; if the row does not exist
   we insert, and if we lose the race against a concurrent caller the declared
-  `lexemes_identity` unique constraint surfaces as `{:error, changeset}`, after
-  which we fetch the row the winner just wrote. Returns `{:ok, %Lexemes{}}`
-  whether we created it or not.
+  `lexemes_lemma_reading_part_of_speech_index` unique constraint surfaces as
+  `{:error, changeset}`, after which we fetch the row the winner just wrote.
+  Returns `{:ok, %Lexemes{}}` whether we created it or not.
 
   `reading` is normalised `nil` → `""` to match the database default, so the
-  `lexemes_identity` unique index actually bites (multiple NULLs would pass).
+  `lexemes_lemma_reading_part_of_speech_index` unique index actually bites
+  (multiple NULLs would pass).
   """
   @spec find_or_create_lexeme(String.t(), String.t() | nil, String.t() | nil) ::
           {:ok, Lexemes.t()} | {:error, Ecto.Changeset.t()}
@@ -80,7 +91,7 @@ defmodule Ashiato.Ledger do
   Records one sighting of a word on one page. Returns `{:ok, %Encounters{}}`
   whether it was just inserted or already existed.
 
-  Idempotent against `one_encounter_per_word_per_page`
+  Idempotent against `encounters_user_id_word_id_text_hash_index`
   (`(user_id, word_id, text_hash)`): on conflict the insert is a no-op — the
   declaration in `Encounters.changeset/2` turns the constraint violation into
   `{:error, changeset}` instead of a raise — and the row that already exists is
@@ -192,6 +203,90 @@ defmodule Ashiato.Ledger do
         |> Ecto.Changeset.change(known: true)
         |> Repo.update()
     end
+  end
+
+  @doc """
+  Creates a page. `attrs` must carry `user_id`, `source_id`, `image_key` and
+  `text_hash`; `status` defaults to `:uploaded`. A duplicate
+  `(user_id, text_hash)` — the same screen re-uploaded — returns
+  `{:error, changeset}` instead of inserting.
+  """
+  @spec create_page(map() | keyword()) :: {:ok, Pages.t()} | {:error, Ecto.Changeset.t()}
+  def create_page(attrs) do
+    attrs = Map.new(attrs)
+    user_id = Map.fetch!(attrs, :user_id)
+    attrs = attrs |> Map.delete(:user_id) |> Map.put_new(:status, :uploaded)
+
+    %Pages{user_id: user_id}
+    |> Pages.changeset(attrs)
+    |> Repo.insert()
+  end
+
+  @doc """
+  Accepts corrected text for a page: sets `accepted_text` and bumps `revision`
+  in a single write. The bump is what makes an in-flight job notice that the
+  page moved on and discard its own result.
+
+  Fenced on the `revision` the caller read: a correction arriving with a stale
+  struct matches no rows and returns `{:error, :superseded}`, so two concurrent
+  corrections cannot both write the same revision.
+  """
+  @spec accept_text(Pages.t(), String.t()) ::
+          {:ok, Pages.t()} | {:error, :superseded}
+  def accept_text(%Pages{} = page, text) do
+    query = from(p in Pages, where: p.id == ^page.id and p.revision == ^page.revision)
+
+    {count, _} =
+      Repo.update_all(query, set: [accepted_text: text, revision: page.revision + 1])
+
+    case count do
+      0 -> {:error, :superseded}
+      1 -> {:ok, Repo.get!(Pages, page.id)}
+    end
+  end
+
+  @doc """
+  Writes a job's final status, but only while the page still carries the
+  `revision` the job started from. A stale write matches no rows and returns
+  `{:error, :superseded}`; a move the pipeline forbids returns
+  `{:error, :invalid_transition}`.
+  """
+  @spec finish_page(Pages.t(), atom()) ::
+          {:ok, Pages.t()} | {:error, :superseded | :invalid_transition}
+  def finish_page(%Pages{} = page, status) do
+    unless valid_transition?(page.status, status) do
+      {:error, :invalid_transition}
+    else
+      query = from(p in Pages, where: p.id == ^page.id and p.revision == ^page.revision)
+
+      {count, _} =
+        Repo.update_all(query, set: [status: status])
+
+      case count do
+        0 -> {:error, :superseded}
+        1 -> {:ok, Repo.get!(Pages, page.id)}
+      end
+    end
+  end
+
+  @doc """
+  Moves a page to the next status in the ingest pipeline, or to `:failed` from
+  any non-terminal state. Anything else returns `{:error, :invalid_transition}`.
+  """
+  @spec transition(Pages.t(), atom()) :: {:ok, Pages.t()} | {:error, :invalid_transition}
+  def transition(%Pages{} = page, status) do
+    unless valid_transition?(page.status, status) do
+      {:error, :invalid_transition}
+    else
+      page
+      |> Pages.changeset(%{status: status})
+      |> Repo.update()
+    end
+  end
+
+  defp valid_transition?(from, to) do
+    to in Map.get(@forward, from, []) or
+      (to == :failed and from in @non_terminal)
   end
 
   @doc """

@@ -7,6 +7,10 @@ defmodule Ashiato.Ledger do
   Identity is global (`Ashiato.Lexemes`, shared by all users); everything this
   module writes downstream of it is per user, carried explicitly via `user_id`
   on the arguments.
+
+  Beyond identity and encounters, this module owns the boundary of the review
+  queue: which words qualify for introduction, the known and suspended markers,
+  and the `chrome_like` flag, including how it suspends and un-suspends words.
   """
 
   import Ecto.Query
@@ -15,6 +19,18 @@ defmodule Ashiato.Ledger do
   alias Ashiato.Lexemes
   alias Ashiato.Pages
   alias Ashiato.Repo
+  alias Ashiato.Sources
+  alias Ashiato.Utils
+  alias Ashiato.WordStates
+  alias Ashiato.Words
+
+  # A word enters the queue only after being met on this many distinct pages;
+  # `introduce_words/3` lets a caller override it.
+  @min_encounters 2
+
+  # Chrome-like in a source means appearing on more than this fraction of its
+  # pages — strictly more, so exactly half does not clear it.
+  @chrome_threshold 0.5
 
   # Forward edges of the ingest pipeline; `:failed` is reachable from any non-terminal state.
   @forward %{
@@ -143,6 +159,53 @@ defmodule Ashiato.Ledger do
   end
 
   @doc """
+  Introduces words to the review queue: each qualifying lexeme gets the
+  `word_states` row whose absence marks it as not yet introduced. A lexeme
+  qualifies when it has been met on at least `:min_encounters` distinct pages
+  and is not known, suspended, chrome-like, or already queued.
+
+  `:force` bypasses the occurrence threshold only, minting the `words` row for a
+  lexeme never met; a known, suspended, chrome-like, or already-introduced word
+  is still skipped. `:min_encounters` overrides the threshold. Returns the
+  introduced words in the order the lexeme ids were given.
+  """
+  @spec introduce_words(integer(), [integer()], keyword()) ::
+          {:ok, [Words.t()]} | {:error, term()}
+  def introduce_words(user_id, lexeme_ids, opts \\ []) do
+    force? = Keyword.get(opts, :force, false)
+    min_encounters = Keyword.get(opts, :min_encounters, @min_encounters)
+    lexeme_ids = Enum.uniq(lexeme_ids)
+
+    Repo.transaction(fn ->
+      due_at = Utils.utc_now()
+      words = resolve_words(user_id, lexeme_ids, force?)
+
+      words
+      |> qualify(user_id, min_encounters, force?)
+      |> Enum.map(&introduce_word(&1, due_at))
+      |> in_lexeme_order(lexeme_ids)
+    end)
+  end
+
+  @doc """
+  Marks the user's copy of a lexeme as already known, so it never becomes a
+  card; encounters keep counting. Returns `{:error, :not_found}` when the user
+  has no `words` row for that lexeme.
+  """
+  @spec mark_known(integer(), integer()) :: {:ok, Words.t()} | {:error, :not_found}
+  def mark_known(user_id, lexeme_id) do
+    case Repo.get_by(Words, user_id: user_id, lexeme_id: lexeme_id) do
+      nil ->
+        {:error, :not_found}
+
+      %Words{} = word ->
+        word
+        |> Ecto.Changeset.change(known: true)
+        |> Repo.update()
+    end
+  end
+
+  @doc """
   Creates a page. `attrs` must carry `user_id`, `source_id`, `image_key` and
   `text_hash`; `status` defaults to `:uploaded`. A duplicate
   `(user_id, text_hash)` — the same screen re-uploaded — returns
@@ -225,4 +288,237 @@ defmodule Ashiato.Ledger do
     to in Map.get(@forward, from, []) or
       (to == :failed and from in @non_terminal)
   end
+
+  @doc """
+  Suspends the user's copy of a lexeme: out of the review queue, history and
+  coverage untouched. `reason` is one of `:manual | :chrome | :mastered |
+  :leech`, and `:mastered` also stamps `mastered_at`.
+
+  An existing suspension keeps its reason, so `:chrome` never overwrites a
+  `:manual`, `:mastered` or `:leech` one — that is what lets clearing the chrome
+  flag remove only its own suspensions. Returns `{:error, changeset}` for a bad
+  reason and `{:error, :not_found}` when there is no `words` row.
+  """
+  @spec mark_suspended(integer(), integer(), atom()) ::
+          {:ok, Words.t()} | {:error, Ecto.Changeset.t()} | {:error, :not_found}
+  def mark_suspended(user_id, lexeme_id, reason) do
+    case Repo.get_by(Words, user_id: user_id, lexeme_id: lexeme_id) do
+      nil ->
+        {:error, :not_found}
+
+      %Words{} = word ->
+        reason =
+          if word.suspended and not is_nil(word.suspended_reason) do
+            word.suspended_reason
+          else
+            reason
+          end
+
+        word
+        |> Ecto.Changeset.cast(%{suspended: true, suspended_reason: reason}, [
+          :suspended,
+          :suspended_reason
+        ])
+        |> mastered_at(reason)
+        |> Repo.update()
+    end
+  end
+
+  @doc """
+  Recomputes `words.chrome_like` for one user. A word is chrome-like only when
+  `chrome_ratio/2` clears the threshold in every source it appears in, so a word
+  common in one game but rare in a manga stays unflagged.
+
+  Flagging suspends the word with reason `:chrome`; clearing the flag
+  un-suspends it only if that was its reason, so manual and mastered suspensions
+  survive. Returns the user's chrome-like words after the run.
+  """
+  @spec update_chrome_like(integer()) :: {:ok, [Words.t()]}
+  def update_chrome_like(user_id) do
+    chrome_ids = chrome_word_ids(user_id)
+
+    Repo.transaction(fn ->
+      flagged_at = Utils.utc_now()
+
+      flag_chrome(user_id, chrome_ids, flagged_at)
+      suspend_chrome(user_id, chrome_ids, flagged_at)
+      unflag_chrome(user_id, chrome_ids, flagged_at)
+      unsuspend_chrome(user_id, chrome_ids, flagged_at)
+
+      chrome_words(user_id)
+    end)
+  end
+
+  # ── introduction ────────────────────────────────────────────────────────────
+
+  # Resolves lexeme ids to this user's `words` rows; `:force` mints the missing
+  # ones, since a never-met lexeme has no encounters to score (R3.4 force-add).
+  @spec resolve_words(integer(), [integer()], boolean()) :: [Words.t()]
+  defp resolve_words(user_id, lexeme_ids, force?) do
+    existing =
+      Repo.all(from(w in Words, where: w.user_id == ^user_id and w.lexeme_id in ^lexeme_ids))
+
+    if force? do
+      covered = MapSet.new(existing, & &1.lexeme_id)
+
+      minted =
+        for lexeme_id <- lexeme_ids, not MapSet.member?(covered, lexeme_id) do
+          {:ok, word} = find_or_create_word(user_id, lexeme_id)
+          word
+        end
+
+      existing ++ minted
+    else
+      existing
+    end
+  end
+
+  # Fetch-first, so a lost insert race ends with the winner's row rather than a
+  # raise. `Words` has no changeset (both fields are set on the struct), so one
+  # is built here.
+  @spec find_or_create_word(integer(), integer()) :: {:ok, Words.t()}
+  defp find_or_create_word(user_id, lexeme_id) do
+    case Repo.get_by(Words, user_id: user_id, lexeme_id: lexeme_id) do
+      %Words{} = word ->
+        {:ok, word}
+
+      nil ->
+        %Words{user_id: user_id, lexeme_id: lexeme_id}
+        |> Ecto.Changeset.change()
+        |> Ecto.Changeset.unique_constraint([:user_id, :lexeme_id])
+        |> Repo.insert()
+        |> case do
+          {:ok, word} ->
+            {:ok, word}
+
+          # lost the race: the concurrent caller's row is there now
+          {:error, _changeset} ->
+            {:ok, Repo.get_by!(Words, user_id: user_id, lexeme_id: lexeme_id)}
+        end
+    end
+  end
+
+  # The qualifying half of the introduction query; ordering and the daily cap
+  # belong to the caller. `:force` runs the same query with the threshold ignored.
+  @spec qualify([Words.t()], integer(), pos_integer(), boolean()) :: [Words.t()]
+  defp qualify(words, user_id, min_encounters, force?) do
+    word_ids = Enum.map(words, & &1.id)
+
+    rows =
+      from(w in Words,
+        where: w.user_id == ^user_id and w.id in ^word_ids,
+        where: w.known == false and w.suspended == false and w.chrome_like == false,
+        # anti-join: `is_nil` below keeps only words with no word_states row — not yet introduced
+        left_join: ws in WordStates,
+        on: ws.word_id == w.id,
+        where: is_nil(ws.word_id),
+        # distinct pages; unconfirmed and discarded encounters count toward nothing
+        left_join: e in Encounters,
+        on: e.word_id == w.id and e.confirmed == true and is_nil(e.discarded_at),
+        group_by: w.id,
+        select: {w, count(e.page_id, :distinct)}
+      )
+      |> Repo.all()
+
+    if force? do
+      Enum.map(rows, &elem(&1, 0))
+    else
+      for {word, occurrences} <- rows, occurrences >= min_encounters, do: word
+    end
+  end
+
+  @spec introduce_word(Words.t(), DateTime.t()) :: Words.t()
+  defp introduce_word(word, due_at) do
+    %WordStates{word_id: word.id, state: 0, due_at: due_at}
+    |> Repo.insert(on_conflict: :nothing, conflict_target: [:word_id])
+    |> case do
+      # `on_conflict: :nothing` also reports {:ok, _} when a concurrent caller
+      # won the row; the word is introduced either way.
+      {:ok, _} ->
+        word
+
+      {:error, changeset} ->
+        Repo.rollback(changeset)
+    end
+  end
+
+  @spec in_lexeme_order([Words.t()], [integer()]) :: [Words.t()]
+  defp in_lexeme_order(introduced, lexeme_ids) do
+    by_lexeme = Map.new(introduced, &{&1.lexeme_id, &1})
+    for(lexeme_id <- lexeme_ids, word = Map.get(by_lexeme, lexeme_id), do: word)
+  end
+
+  # ── chrome_like ─────────────────────────────────────────────────────────────
+
+  # One chrome_ratio/2 pass per source, then one ratio list per word. The lists
+  # are never empty, so `all?/1` here is never vacuously true.
+  @spec chrome_word_ids(integer()) :: [integer()]
+  defp chrome_word_ids(user_id) do
+    ratios_by_word =
+      user_id
+      |> source_ids()
+      |> Enum.flat_map(&chrome_ratio(user_id, &1))
+      |> Enum.group_by(fn {word_id, _ratio} -> word_id end, fn {_word_id, ratio} -> ratio end)
+
+    for {word_id, ratios} <- ratios_by_word, Enum.all?(ratios, &(&1 > @chrome_threshold)) do
+      word_id
+    end
+  end
+
+  @spec source_ids(integer()) :: [integer()]
+  defp source_ids(user_id) do
+    Repo.all(from(s in Sources, where: s.user_id == ^user_id, select: s.id))
+  end
+
+  @spec flag_chrome(integer(), [integer()], DateTime.t()) :: {non_neg_integer(), nil}
+  defp flag_chrome(user_id, chrome_ids, flagged_at) do
+    from(w in Words,
+      where: w.user_id == ^user_id and w.id in ^chrome_ids and w.chrome_like == false
+    )
+    |> Repo.update_all(set: [chrome_like: true, updated_at: flagged_at])
+  end
+
+  # Suspends rather than deletes, so card history and coverage survive.
+  @spec suspend_chrome(integer(), [integer()], DateTime.t()) :: {non_neg_integer(), nil}
+  defp suspend_chrome(user_id, chrome_ids, flagged_at) do
+    from(w in Words,
+      where: w.user_id == ^user_id and w.id in ^chrome_ids and w.suspended == false
+    )
+    |> Repo.update_all(set: [suspended: true, suspended_reason: :chrome, updated_at: flagged_at])
+  end
+
+  # A word that has stopped appearing anywhere loses the flag too, not just one
+  # that is now rare.
+  @spec unflag_chrome(integer(), [integer()], DateTime.t()) :: {non_neg_integer(), nil}
+  defp unflag_chrome(user_id, chrome_ids, flagged_at) do
+    from(w in Words,
+      where: w.user_id == ^user_id and w.chrome_like == true and w.id not in ^chrome_ids
+    )
+    |> Repo.update_all(set: [chrome_like: false, updated_at: flagged_at])
+  end
+
+  # Only a `:chrome` suspension is restored, which is why the reason is stored
+  # rather than inferred.
+  @spec unsuspend_chrome(integer(), [integer()], DateTime.t()) :: {non_neg_integer(), nil}
+  defp unsuspend_chrome(user_id, chrome_ids, flagged_at) do
+    from(w in Words,
+      where:
+        w.user_id == ^user_id and w.suspended == true and w.suspended_reason == :chrome and
+          w.id not in ^chrome_ids
+    )
+    |> Repo.update_all(set: [suspended: false, suspended_reason: nil, updated_at: flagged_at])
+  end
+
+  @spec chrome_words(integer()) :: [Words.t()]
+  defp chrome_words(user_id) do
+    Repo.all(from(w in Words, where: w.user_id == ^user_id and w.chrome_like == true))
+  end
+
+  # ── shared ──────────────────────────────────────────────────────────────────
+
+  @spec mastered_at(Ecto.Changeset.t(), atom()) :: Ecto.Changeset.t()
+  defp mastered_at(changeset, :mastered),
+    do: Ecto.Changeset.change(changeset, mastered_at: Utils.utc_now())
+
+  defp mastered_at(changeset, _reason), do: changeset
 end

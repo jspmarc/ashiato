@@ -1,8 +1,7 @@
 defmodule Ashiato.Srs do
   @moduledoc """
   The FSRS-6 scheduler as pure functions over `Ashiato.WordStates`: no Repo,
-  no clock, no IO (§6.4 — FSRS computes from grades alone; `Ashiato.Ledger`
-  caps how far the interval may stretch, never the stability).
+  no clock, no IO (§6.4 — FSRS computes from grades alone).
 
   Sources (FSRS-6, 21 weights):
 
@@ -11,12 +10,10 @@ defmodule Ashiato.Srs do
     * Default parameters `w0..w20` — the wiki's "FSRS-6" section.
 
   The model contract: stability in 0.0001..36500.0 days, difficulty in
-  1.0..10.0, and states 0..3 (new / learning / review / relearning). This app
-  has no minute-scale learning steps — reviews are real, days-apart events — so
-  a first "again" parks the word in learning with the interval reset to 0
-  rather than scheduling a sub-day step. Same-day reviews still use FSRS-6's
-  short-term stability formula, because a re-encounter can arrive before the
-  day is over.
+  1.0..10.0, and states `:new`, `:learning`, `:review`, `:relearning`. Sub-day
+  remedial steps are scheduler state outside this module (R3.13); same-day
+  reviews still use FSRS-6's short-term stability formula, because a remedial
+  step or a re-encounter can arrive before the day is over.
 
   The curves:
 
@@ -33,27 +30,36 @@ defmodule Ashiato.Srs do
   @typedoc "The FSRS grade: 1 = again, 2 = hard, 3 = good, 4 = easy."
   @type grade :: 1..4
 
+  @grade_again 1
+  @grade_hard 2
+  @grade_good 3
+  @grade_easy 4
+
   # FSRS-6 default weights w0..w20 (awesome-fsrs wiki, "FSRS-6" section):
   # w0..w3 initial stability per grade, w4..w5 initial difficulty,
   # w6..w7 difficulty updates and mean reversion, w8..w10 post-success growth,
   # w11..w14 post-lapse stability, w15 hard penalty, w16 easy bonus,
   # w17..w19 short-term stability, w20 trainable forgetting-curve decay.
   @weights [
+    # 0
     0.212,
     1.2931,
     2.3065,
     8.2956,
     6.4133,
+    # 5
     0.8334,
     3.0194,
     0.001,
     1.8722,
     0.1666,
+    # 10
     0.796,
     1.4835,
     0.0614,
     0.2629,
     1.6483,
+    # 15
     0.6014,
     1.8729,
     0.5425,
@@ -72,35 +78,36 @@ defmodule Ashiato.Srs do
   @d_max 10.0
 
   @maturity_days 21
-  @ghost_min_occurrences 5
-  @ghost_min_density 4.0
-  @ghost_min_days 1
+  @massed_min_occurrences 5
+  @massed_min_density 4.0
+  @massed_min_days 1
 
   @doc """
   Grades one review and returns the next FSRS state.
 
-  `word_state` is the current `%Ashiato.WordStates{}` (state 0..3;
-  `last_reviewed_at` may be nil for a never-reviewed word, and state 1..3
-  implies `stability`/`difficulty` are set). `grade` is the FSRS grade 1..4:
-  1 again, 2 hard, 3 good, 4 easy. `now` is any `DateTime`, fractional or not.
+  `word_state` is the current `%Ashiato.WordStates{}` (state `:new`,
+  `:learning`, `:review` or `:relearning`; `last_reviewed_at` may be nil for a
+  never-reviewed word, and the latter three imply `stability`/`difficulty` are
+  set). `grade` is the FSRS grade 1..4: 1 again, 2 hard, 3 good, 4 easy. `now`
+  is any `DateTime`, fractional or not.
 
   Returns `%{state: %Ashiato.WordStates{}, interval_days: integer()}` — the
   updated struct (same `word_id`, new state/stability/difficulty/reps/lapses,
   `last_reviewed_at = now`, `due_at = now + interval_days`) plus the integer
-  FSRS interval that `due_at` was computed from, uncapped: `Ashiato.Ledger`
-  needs both, since the §6.6 band cap applies after the fact.
+  FSRS interval that `due_at` was computed from.
 
   Elapsed days `t` is `max(0, round(days between last_reviewed_at and now))`,
   as in FSRS-6 — only meaningful once the word has stability and difficulty
-  (state 1, 2 or 3), from which the retrievability `R(t, S)` is computed.
-  `t == 0` selects the short-term stability formula.
+  (`:learning`, `:review` or `:relearning`), from which the retrievability
+  `R(t, S)` is computed. `t == 0` selects the short-term stability formula.
   """
-  @spec grade(WordStates.t(), 1..4, DateTime.t()) :: %{
+  @spec grade(WordStates.t(), grade(), DateTime.t()) :: %{
           state: WordStates.t(),
           interval_days: integer()
         }
-  def grade(%WordStates{} = word_state, grade, %DateTime{} = now) when grade in 1..4 do
-    if word_state.state == 0 do
+  def grade(%WordStates{} = word_state, grade, %DateTime{} = now)
+      when grade in [@grade_again, @grade_hard, @grade_good, @grade_easy] do
+    if word_state.state == :new do
       initial_review(word_state, grade, now)
     else
       reviewed(word_state, grade, now)
@@ -108,35 +115,10 @@ defmodule Ashiato.Srs do
   end
 
   @doc """
-  The §6.6 interval cap for a word with `occurrences` distinct confirmed
-  encounter pages: 60 days at 20+ occurrences, 120 at 8..19, 240 at 3..7, and
-  `nil` (uncapped) at 2 or fewer.
-  """
-  @spec cap_for_band(integer()) :: 60 | 120 | 240 | nil
-  def cap_for_band(occurrences) when occurrences >= 20, do: 60
-  def cap_for_band(occurrences) when occurrences >= 8, do: 120
-  def cap_for_band(occurrences) when occurrences >= 3, do: 240
-  def cap_for_band(_occurrences), do: nil
-
-  @doc """
-  The interval a review may actually schedule: `min(fsrs_interval, cap)` where
-  the cap is the word's §6.6 band (`cap_for_band/1`). Occurrences of 2 or
-  fewer are uncapped, so the interval passes through untouched.
-  """
-  @spec final_interval(integer(), integer()) :: integer()
-  def final_interval(fsrs_interval_days, occurrences) do
-    case cap_for_band(occurrences) do
-      nil -> fsrs_interval_days
-      cap -> min(fsrs_interval_days, cap)
-    end
-  end
-
-  @doc """
   Whether a word has crossed `threshold` days of stability (default 21).
 
-  Maturity is stability-based, never interval-based: the §6.6 caps clamp the
-  interval a review schedules, so a heavy word can be due again in days while
-  its stability says otherwise. Only `stability` decides.
+  Maturity is stability-based, never interval-based: stability is FSRS's own
+  measure of memory strength, while the interval is a scheduling choice.
   """
   @spec mature?(WordStates.t() | map(), number()) :: boolean()
   def mature?(%{stability: stability}, threshold \\ @maturity_days) do
@@ -144,18 +126,18 @@ defmodule Ashiato.Srs do
   end
 
   @doc """
-  Whether a word is a ghost (§6.6): seen on at least 5 distinct pages at a
-  density of at least 4 pages per day seen — a burst of chrome, not
+  Whether a word is a massed-exposure case (§6.6): seen on at least 5 distinct
+  pages at a density of at least 4 pages per day seen — a burst, not
   vocabulary the user is meeting over time. `days_seen` of 0 counts as one
-  day (`max(days_seen, 1)`), so a same-day flood of 5+ pages is a ghost.
+  day (`max(days_seen, 1)`), so a same-day flood of 5+ pages qualifies.
   """
-  @spec ghost?(%{occurrences: number(), days_seen: number()}) :: boolean()
-  def ghost?(%{occurrences: occurrences, days_seen: days_seen}) do
-    density = occurrences / max(days_seen, @ghost_min_days)
-    occurrences >= @ghost_min_occurrences and density >= @ghost_min_density
+  @spec massed_exposure?(%{occurrences: number(), days_seen: number()}) :: boolean()
+  def massed_exposure?(%{occurrences: occurrences, days_seen: days_seen}) do
+    density = occurrences / max(days_seen, @massed_min_days)
+    occurrences >= @massed_min_occurrences and density >= @massed_min_density
   end
 
-  ## first review (state 0)
+  ## first review (state :new)
 
   # S0(G) = clamp(w[G-1], Smin, Smax);
   # D0(G) = clamp(w4 - e^(w5 * (G - 1)) + 1, Dmin, Dmax)
@@ -166,11 +148,11 @@ defmodule Ashiato.Srs do
     difficulty = initial_difficulty(grade)
 
     {state, interval_days, lapses} =
-      if grade == 1 do
+      if grade == @grade_again do
         # learning: due now, no interval to speak of
-        {1, 0, 1}
+        {:learning, 0, 1}
       else
-        {2, success_interval(stability), 0}
+        {:review, success_interval(stability), 0}
       end
 
     next = %WordStates{
@@ -201,7 +183,7 @@ defmodule Ashiato.Srs do
     Enum.at(@weights, 4) - :math.exp(Enum.at(@weights, 5) * (grade - 1)) + 1
   end
 
-  ## reviews of a word that has stability and difficulty (states 1..3)
+  ## reviews of a word that has stability and difficulty (:learning, :review, :relearning)
 
   @spec reviewed(WordStates.t(), grade(), DateTime.t()) ::
           %{state: WordStates.t(), interval_days: integer()}
@@ -232,43 +214,52 @@ defmodule Ashiato.Srs do
           {1 | 2 | 3, float(), float(), non_neg_integer()}
   defp transition(%WordStates{state: state, stability: s, difficulty: d}, grade, 0, _r) do
     stability = short_term_stability(s, grade)
-    interval_days = if grade == 1, do: 0, else: success_interval(stability)
+    interval_days = if grade == @grade_again, do: 0, else: success_interval(stability)
 
     {next_state(state, grade), stability, next_difficulty(d, grade), interval_days}
   end
 
   # again after a day or more (lapse): relearning; post-lapse stability Sf is
-  # capped at S / e^(w17 * w18)
-  defp transition(%WordStates{state: state, stability: s, difficulty: d}, 1, _elapsed, r) do
-    {next_state(state, 1), post_lapse_stability(s, d, r), next_difficulty(d, 1), 0}
+  # capped at S / e^(w17 * w18), and the due date follows FSRS
+  defp transition(
+         %WordStates{state: state, stability: s, difficulty: d},
+         @grade_again,
+         _elapsed,
+         r
+       ) do
+    stability = post_lapse_stability(s, d, r)
+
+    {next_state(state, @grade_again), stability, next_difficulty(d, @grade_again),
+     success_interval(stability)}
   end
 
   # good/hard/easy after a day or more: the interval stretches by the FSRS
   # growth factor (hard and easy scaled by w15/w16), difficulty mean-reverts
   # toward D0(4)
   defp transition(%WordStates{state: state, stability: s, difficulty: d}, grade, _elapsed, r)
-       when grade >= 2 do
+       when grade >= @grade_hard do
     stability = post_success_stability(s, d, r, grade)
     {next_state(state, grade), stability, next_difficulty(d, grade), success_interval(stability)}
   end
 
-  defp next_state(1, 1), do: 1
-  defp next_state(_state, 1), do: 3
-  defp next_state(_state, _grade), do: 2
+  defp next_state(:learning, @grade_again), do: :learning
+  defp next_state(_state, @grade_again), do: :relearning
+  defp next_state(_state, _grade), do: :review
 
   @spec lapse_delta(grade()) :: 0 | 1
-  defp lapse_delta(1), do: 1
+  defp lapse_delta(@grade_again), do: 1
   defp lapse_delta(_grade), do: 0
 
   # D' = D + ((10 - D) / 9) * (-w6 * (G - 3)); then mean reversion toward
   # D0(4): D'' = w7 * D0(4) + (1 - w7) * D'
   @spec next_difficulty(float(), grade()) :: float()
   defp next_difficulty(difficulty, grade) do
-    delta_d = -Enum.at(@weights, 6) * (grade - 3)
+    delta_d = -Enum.at(@weights, 6) * (grade - @grade_good)
     shifted = difficulty + (10 - difficulty) / 9 * delta_d
 
     reverted =
-      Enum.at(@weights, 7) * initial_difficulty_raw(4) + (1 - Enum.at(@weights, 7)) * shifted
+      Enum.at(@weights, 7) * initial_difficulty_raw(@grade_easy) +
+        (1 - Enum.at(@weights, 7)) * shifted
 
     clamp(reverted, @d_min, @d_max)
   end
@@ -293,10 +284,10 @@ defmodule Ashiato.Srs do
   @spec short_term_stability(float(), grade()) :: float()
   defp short_term_stability(stability, grade) do
     increment =
-      :math.exp(Enum.at(@weights, 17) * (grade - 3 + Enum.at(@weights, 18))) *
+      :math.exp(Enum.at(@weights, 17) * (grade - @grade_good + Enum.at(@weights, 18))) *
         :math.pow(stability, -Enum.at(@weights, 19))
 
-    increment = if grade >= 2, do: max(increment, 1.0), else: increment
+    increment = if grade >= @grade_hard, do: max(increment, 1.0), else: increment
 
     (stability * increment)
     |> clamp(@s_min, @s_max)
@@ -306,15 +297,15 @@ defmodule Ashiato.Srs do
   # clamped; H_G = w15 on hard, E_G = w16 on easy, 1 otherwise
   @spec post_success_stability(float(), float(), float(), grade()) :: float()
   defp post_success_stability(stability, difficulty, retrievability, grade) do
-    hard_penalty = if grade == 2, do: Enum.at(@weights, 15), else: 1
-    easy_bonus = if grade == 4, do: Enum.at(@weights, 16), else: 1
+    hard_penalty = if grade == @grade_hard, do: Enum.at(@weights, 15), else: 1
+    easy_bonus = if grade == @grade_easy, do: Enum.at(@weights, 16), else: 1
 
-    (stability *
-       (1 +
-          :math.exp(Enum.at(@weights, 8)) * (11 - difficulty) *
-            :math.pow(stability, -Enum.at(@weights, 9)) *
-            (:math.exp(Enum.at(@weights, 10) * (1 - retrievability)) - 1) * hard_penalty *
-            easy_bonus))
+    f_d = 11 - difficulty
+    f_g = hard_penalty * easy_bonus * :math.exp(Enum.at(@weights, 8))
+    f_s = :math.pow(stability, -Enum.at(@weights, 9))
+    f_r = :math.exp(Enum.at(@weights, 10) * (1 - retrievability)) - 1
+
+    (stability * (1 + f_g * f_d * f_s * f_r))
     |> clamp(@s_min, @s_max)
   end
 

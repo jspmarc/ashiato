@@ -19,6 +19,7 @@ defmodule Ashiato.Dictionary.Fake do
   use Agent
 
   @impl true
+  @doc "Canned single lookup; counts one call."
   @spec lookup(String.t()) :: {:ok, map()} | {:error, :not_found}
   def lookup(term) do
     Agent.get_and_update(__MODULE__, fn state ->
@@ -32,6 +33,7 @@ defmodule Ashiato.Dictionary.Fake do
   end
 
   @impl true
+  @doc "Canned batch lookup; counts one call. Unknown terms come back as an error."
   @spec lookup_many([String.t()]) ::
           {:ok, %{String.t() => map()}} | {:error, {:not_found, [String.t()]}}
   def lookup_many(terms) do
@@ -49,8 +51,20 @@ defmodule Ashiato.Dictionary.Fake do
   end
 
   @impl true
+  @doc """
+  The canned dictionary release, which `set_version/1` replaces. Each call is counted:
+  the memo in `Ashiato.Dictionary` is what keeps a cache hit from asking for it.
+  """
   @spec dict_version() :: {:ok, String.t()}
-  def dict_version, do: Agent.get(__MODULE__, &{:ok, &1.version})
+  def dict_version do
+    Agent.get_and_update(__MODULE__, fn state ->
+      {{:ok, state.version}, %{state | version_calls: state.version_calls + 1}}
+    end)
+  end
+
+  @doc "How many `dict_version/0` calls were made (the memo is meant to keep this at one)."
+  @spec version_calls() :: non_neg_integer()
+  def version_calls, do: Agent.get(__MODULE__, & &1.version_calls)
 
   @doc "How many raw dictionary lookups the façade has made so far."
   @spec calls() :: non_neg_integer()
@@ -65,7 +79,8 @@ defmodule Ashiato.Dictionary.Fake do
     state = %{
       version: Keyword.get(opts, :version, "test-dict-1"),
       entries: Keyword.get(opts, :entries, %{}),
-      calls: 0
+      calls: 0,
+      version_calls: 0
     }
 
     Agent.start_link(fn -> state end, name: __MODULE__)

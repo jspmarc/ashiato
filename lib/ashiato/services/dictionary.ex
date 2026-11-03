@@ -25,10 +25,11 @@ defmodule Ashiato.Dictionary do
   There is no TTL (§6.9): JMdict is immutable between releases, so a row is
   either current or superseded wholesale. **A version bump mutates nothing** —
   old rows simply stop matching and a fresh row is inserted, because the ledger
-  must not silently rewrite what it claims you studied (P9). Note that building
-  the cache key needs the service's `dict_version/0`, a cheap metadata call; the
-  "no network on a cache hit" guarantee is about dictionary lookups, which is
-  what `Ashiato.Dictionary.Fake.calls/0` counts.
+  must not silently rewrite what it claims you studied (P9).
+
+  The `dict_version/0` needed to build the key is memoised (`current_version/1`), so a
+  cache hit makes no network call and keeps working while the service is down. Only a
+  miss talks to the service.
 
   Callbacks are the raw service calls; `Http` and `Fake` implement them.
   """
@@ -40,6 +41,12 @@ defmodule Ashiato.Dictionary do
   alias Ashiato.Utils
 
   @type entry :: map()
+
+  # How long a fetched `dict_version` is trusted before the service is asked again. Long
+  # enough that a page's worth of lookups asks once, short enough that a JMdict release is
+  # picked up without a restart.
+  @version_ttl_ms 300_000
+  @version_key {__MODULE__, :dict_version}
 
   @callback lookup(term :: String.t()) :: {:ok, entry()} | {:error, term()}
   @callback lookup_many(terms :: [String.t()]) ::
@@ -67,7 +74,8 @@ defmodule Ashiato.Dictionary do
   def lookup(term) do
     impl = service()
 
-    with {:ok, dict_version} <- impl.dict_version() do
+    with :ok <- validate_term(term),
+         {:ok, dict_version} <- current_version(impl) do
       kind = kind_for(term)
 
       case Repo.get_by(DictCacheEntry, kind: kind, cache_key: term, dict_version: dict_version) do
@@ -96,7 +104,8 @@ defmodule Ashiato.Dictionary do
   def lookup_many(terms) do
     impl = service()
 
-    with {:ok, dict_version} <- impl.dict_version() do
+    with :ok <- validate_terms(terms),
+         {:ok, dict_version} <- current_version(impl) do
       terms = Enum.uniq(terms)
       cached = cached_payloads(terms, dict_version)
       missing = Enum.reject(terms, &Map.has_key?(cached, &1))
@@ -119,6 +128,70 @@ defmodule Ashiato.Dictionary do
       end
     end
   end
+
+  @doc """
+  The service's `dict_version/0`, memoised so a cache hit makes no network call.
+
+  The version is part of the cache key, so it has to be known before a row can be matched.
+  Asking the service on every lookup would mean a cache hit still hit the network — and a
+  cached word would become unavailable the moment the service went down, which is the
+  opposite of the degradation §7.1 asks for. The memo expires after #{@version_ttl_ms} ms;
+  when the service is unreachable the last known version is reused for as long as it takes.
+
+  The scheduled JMdict release check (§6.9) and tests call `forget_version/0` to pick up a
+  new release immediately instead of waiting for the expiry.
+  """
+  @spec current_version(module()) :: {:ok, String.t()} | {:error, term()}
+  def current_version(impl) do
+    now = System.monotonic_time(:millisecond)
+
+    case :persistent_term.get(@version_key, nil) do
+      {version, fetched_at} when now - fetched_at < @version_ttl_ms ->
+        {:ok, version}
+
+      memo ->
+        case impl.dict_version() do
+          {:ok, version} ->
+            :persistent_term.put(@version_key, {version, now})
+            {:ok, version}
+
+          error ->
+            # stale-but-usable beats unavailable: the cache still serves what it has
+            case memo do
+              {version, _fetched_at} -> {:ok, version}
+              nil -> error
+            end
+        end
+    end
+  end
+
+  @doc """
+  Drops the memoised `dict_version/0`, so the next lookup asks the service again.
+
+  Called by the scheduled release check and by tests; nothing on the request path needs it.
+  """
+  @spec forget_version() :: :ok
+  def forget_version do
+    :persistent_term.erase(@version_key)
+    :ok
+  end
+
+  # A term reaches this module from OCR and tokenizer output, so it can carry bytes that are
+  # not valid UTF-8. Jason would raise while encoding the request body, breaking the
+  # `{:error, term()}` contract on the ingest path.
+  @spec validate_term(String.t()) :: :ok | {:error, :invalid_term}
+  defp validate_term(term) when is_binary(term) do
+    if String.valid?(term), do: :ok, else: {:error, :invalid_term}
+  end
+
+  defp validate_term(_term), do: {:error, :invalid_term}
+
+  @spec validate_terms([String.t()]) :: :ok | {:error, :invalid_term}
+  defp validate_terms(terms) when is_list(terms) do
+    if Enum.all?(terms, &match?(:ok, validate_term(&1))), do: :ok, else: {:error, :invalid_term}
+  end
+
+  defp validate_terms(_terms), do: {:error, :invalid_term}
 
   # kind is half of the cache identity, so deriving it from the term (one
   # codepoint → KANJIDIC2 shape, otherwise JMdict) keeps the key deterministic.

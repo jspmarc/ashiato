@@ -15,10 +15,17 @@ defmodule Ashiato.DictionaryTest do
   @entry_b %{"gloss" => "bridge", "reading" => "はし"}
   @entry_c %{"gloss" => "chopsticks", "reading" => "はし"}
 
-  # The fake is selected through the same application config production uses.
+  # The fake is selected through the same application config production uses, and the
+  # memoised dict_version is process-global, so each test starts from a cold memo.
   setup do
     Application.put_env(:ashiato, Dictionary, service: Dictionary.Fake)
-    on_exit(fn -> Application.delete_env(:ashiato, Dictionary) end)
+    Dictionary.forget_version()
+
+    on_exit(fn ->
+      Application.delete_env(:ashiato, Dictionary)
+      Dictionary.forget_version()
+    end)
+
     :ok
   end
 
@@ -33,6 +40,26 @@ defmodule Ashiato.DictionaryTest do
     assert Repo.aggregate(DictCacheEntry, :count) == 1
   end
 
+  test "a cache hit does not even ask for the dictionary version" do
+    start_supervised!({Dictionary.Fake, version: "2026-1", entries: %{"食べる" => @entry_a}})
+
+    assert {:ok, @entry_a} = Dictionary.lookup("食べる")
+    assert Dictionary.Fake.version_calls() == 1
+
+    # the version is part of the cache key, so an un-memoised version call would mean a
+    # cache hit still touches the network -- and dies with the service
+    assert {:ok, @entry_a} = Dictionary.lookup("食べる")
+    assert Dictionary.Fake.version_calls() == 1
+  end
+
+  test "a term that is not valid UTF-8 is refused before any request" do
+    start_supervised!({Dictionary.Fake, version: "2026-1", entries: %{}})
+
+    assert Dictionary.lookup(<<"食べ", 0xFF>>) == {:error, :invalid_term}
+    assert Dictionary.lookup_many([<<"食べ", 0xFF>>]) == {:error, :invalid_term}
+    assert Dictionary.Fake.calls() == 0
+  end
+
   test "a version bump ignores the old row and inserts a new one, leaving the old row untouched" do
     start_supervised!({Dictionary.Fake, version: "2026-1", entries: %{"食べる" => @entry_a}})
 
@@ -41,6 +68,9 @@ defmodule Ashiato.DictionaryTest do
     snapshot = Map.take(old, [:id, :kind, :cache_key, :dict_version, :payload, :fetched_at])
 
     Dictionary.Fake.set_version("2026-2")
+    # a new release is picked up by the scheduled check (§6.9) flipping the memo, not by
+    # each lookup asking the service
+    Dictionary.forget_version()
 
     assert {:ok, @entry_a} = Dictionary.lookup("食べる")
     assert Dictionary.Fake.calls() == 2

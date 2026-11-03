@@ -17,26 +17,44 @@ defmodule Ashiato.Dictionary.Http do
   @behaviour Ashiato.Dictionary
 
   @impl true
+  @doc """
+  Looks up one term. A reply whose `entry` is not an object is a broken reply, not a
+  `nil` result: caching `nil` would hand wave 3 something that crashes on the first map
+  access, far from here.
+  """
   @spec lookup(String.t()) :: {:ok, map()} | {:error, term()}
   def lookup(term) do
     case request(:post, "/lookup", %{term: term}) do
-      {:ok, %{"entry" => entry}} -> {:ok, entry}
+      {:ok, %{"entry" => entry}} when is_map(entry) -> {:ok, entry}
       {:ok, _body} -> {:error, :unexpected_response}
       {:error, reason} -> {:error, reason}
     end
   end
 
   @impl true
+  @doc """
+  Looks up many terms in one request; every value in the reply must be an object.
+  """
   @spec lookup_many([String.t()]) :: {:ok, %{String.t() => map()}} | {:error, term()}
   def lookup_many(terms) do
     case request(:post, "/lookup_many", %{terms: terms}) do
-      {:ok, %{"entries" => entries}} when is_map(entries) -> {:ok, entries}
-      {:ok, _body} -> {:error, :unexpected_response}
-      {:error, reason} -> {:error, reason}
+      {:ok, %{"entries" => entries}} when is_map(entries) ->
+        if Enum.all?(Map.values(entries), &is_map/1),
+          do: {:ok, entries},
+          else: {:error, :unexpected_response}
+
+      {:ok, _body} ->
+        {:error, :unexpected_response}
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 
   @impl true
+  @doc """
+  The dictionary release identifier the cache is keyed by.
+  """
   @spec dict_version() :: {:ok, String.t()} | {:error, term()}
   def dict_version do
     case request(:get, "/version", nil) do

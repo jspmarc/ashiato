@@ -23,6 +23,7 @@ defmodule Ashiato.Storage.Fake do
   end
 
   @impl true
+  @doc "Stores `binary` in the in-process map and records the call."
   @spec put(String.t(), binary()) :: :ok | {:error, term()}
   def put(key, binary) do
     with :ok <- check(key) do
@@ -37,6 +38,7 @@ defmodule Ashiato.Storage.Fake do
   end
 
   @impl true
+  @doc "Reads a stored binary; an unset key is `{:error, :enoent}`, like the local store."
   @spec get(String.t()) :: {:ok, binary()} | {:error, term()}
   def get(key) do
     with :ok <- check(key) do
@@ -65,6 +67,7 @@ defmodule Ashiato.Storage.Fake do
   end
 
   @impl true
+  @doc "Deletes a key. Idempotent, so wave-3 tests can call it twice."
   @spec delete(String.t()) :: :ok | {:error, term()}
   def delete(key) do
     with :ok <- check(key) do

@@ -28,6 +28,12 @@ defmodule Ashiato.Storage.Local do
   end
 
   @impl true
+  @doc """
+  Writes `binary` at `key`, creating directories as needed.
+
+  The write lands through a same-directory temporary file and a rename, so a concurrent
+  reader sees either the previous object or the new one, never a partial image.
+  """
   @spec put(String.t(), binary()) :: :ok | {:error, term()}
   def put(key, binary) do
     with {:ok, path} <- resolve(key),
@@ -37,6 +43,7 @@ defmodule Ashiato.Storage.Local do
   end
 
   @impl true
+  @doc "Reads the object at `key`; a missing key is an error tuple, not a raise."
   @spec get(String.t()) :: {:ok, binary()} | {:error, term()}
   def get(key) do
     with {:ok, path} <- resolve(key) do
@@ -60,6 +67,7 @@ defmodule Ashiato.Storage.Local do
   end
 
   @impl true
+  @doc "Deletes the object at `key`. Idempotent: an absent key is `:ok`."
   @spec delete(String.t()) :: :ok | {:error, term()}
   def delete(key) do
     with {:ok, path} <- resolve(key) do

@@ -44,27 +44,28 @@ defmodule Ashiato.TokenizerTest do
               ]}
   end
 
-  test "kana is not converted to kanji, through the fake" do
-    start_supervised!({Fake, tokens: [token("たべる", "たべる", "タベル")]})
+  test "the measured behaviours survive the mapping: kana kept, inflection normalised, homophones distinct" do
+    stub_reply(fn conn ->
+      Req.Test.json(conn, %{
+        "tokens" => [
+          %{"surface" => "はし", "lemma" => "はし", "reading" => "ハシ", "part_of_speech" => "名詞"},
+          %{"surface" => "橋", "lemma" => "橋", "reading" => "ハシ", "part_of_speech" => "名詞"},
+          %{"surface" => "箸", "lemma" => "箸", "reading" => "ハシ", "part_of_speech" => "名詞"},
+          %{"surface" => "食べた", "lemma" => "食べる", "reading" => "タベタ", "part_of_speech" => "動詞"}
+        ]
+      })
+    end)
 
-    assert {:ok, [token]} = Fake.tokenize("たべる")
-    assert token.surface == "たべる"
-    assert token.lemma == "たべる"
-    assert Fake.calls() == ["たべる"]
-  end
+    assert {:ok, tokens} = Tokenizer.tokenize("はし 橋 箸 食べた")
 
-  test "inflection is normalised to the dictionary form, through the fake" do
-    start_supervised!({Fake, tokens: [token("食べ", "食べる", "タベ", "動詞")]})
-
-    assert {:ok, [token]} = Fake.tokenize("食べた")
-    assert token.lemma == "食べる"
-  end
-
-  test "homophones stay three distinct tokens, through the fake" do
-    tokens = [token("はし", "はし", "ハシ"), token("橋", "橋", "ハシ"), token("箸", "箸", "ハシ")]
-    start_supervised!({Fake, tokens: tokens})
-
-    assert {:ok, ^tokens} = Fake.tokenize("はし 橋 箸")
+    # kana is never converted to kanji: the lemma keeps the orthography on screen
+    assert Enum.at(tokens, 0).lemma == "はし"
+    # a shared reading is not an identity: three lemmas stay three tokens
+    assert tokens |> Enum.take(3) |> Enum.map(& &1.lemma) |> Enum.uniq() |> length() == 3
+    # the reading is part of identity, so it is normalised for all three (same ハシ)
+    assert tokens |> Enum.take(3) |> Enum.map(& &1.reading) |> Enum.uniq() == ["はし"]
+    # inflection is normalised to the dictionary form
+    assert Enum.at(tokens, 3).lemma == "食べる"
   end
 
   test "impl/0 routes through the configured implementation" do
@@ -86,14 +87,14 @@ defmodule Ashiato.TokenizerTest do
   test "a 200 reply without a token list is rejected, not read as an empty page" do
     stub_reply(fn conn -> Req.Test.json(conn, %{"nope" => []}) end)
 
-    assert {:error, {:malformed_reply, %{"nope" => []}}} = Tokenizer.Http.tokenize("食べた")
+    assert {:error, {:malformed_reply, {:map, ["nope"]}}} = Tokenizer.Http.tokenize("食べた")
   end
 
   test "a malformed token names the entry instead of raising" do
     stub_reply(fn conn -> Req.Test.json(conn, %{"tokens" => [%{"surface" => "食べ"}]}) end)
 
-    assert Tokenizer.Http.tokenize("食べた") ==
-             {:error, {:malformed_token, %{"surface" => "食べ"}}}
+    # the error names the position, not the page text: this term ends up in a log
+    assert Tokenizer.Http.tokenize("食べた") == {:error, {:malformed_token, 0}}
   end
 
   test "fake returns {:error, reason} when configured" do

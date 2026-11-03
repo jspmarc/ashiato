@@ -72,17 +72,19 @@ defmodule Ashiato.Tokenizer.Http do
       # the envelope is part of the contract too: a 200 without a token list is a broken
       # reply, not an empty page, and must not record zero encounters silently.
       %{"tokens" => tokens} when is_list(tokens) -> parse_tokens(tokens)
-      _ -> {:error, {:malformed_reply, body}}
+      _ -> {:error, {:malformed_reply, shape(body)}}
     end
   end
 
   defp parse(%Req.Response{status: status}), do: {:error, {:unexpected_status, status}}
 
   defp parse_tokens(tokens) do
-    Enum.reduce_while(tokens, {:ok, []}, fn entry, {:ok, acc} ->
+    tokens
+    |> Enum.with_index()
+    |> Enum.reduce_while({:ok, []}, fn {entry, index}, {:ok, acc} ->
       case parse_token(entry) do
         {:ok, token} -> {:cont, {:ok, [token | acc]}}
-        :error -> {:halt, {:error, {:malformed_token, entry}}}
+        :error -> {:halt, {:error, {:malformed_token, index}}}
       end
     end)
     |> case do
@@ -111,4 +113,10 @@ defmodule Ashiato.Tokenizer.Http do
   # A token missing a field would otherwise raise inside String.codepoints/1 and surface
   # from the blanket rescue as an opaque exception instead of naming the bad entry.
   defp parse_token(_entry), do: :error
+
+  # An error term reaches logs, and a reply here can be a whole page of the user's text.
+  # The shape is enough to debug a provider that changed its contract; the content is not
+  # something to write down.
+  defp shape(body) when is_map(body), do: {:map, body |> Map.keys() |> Enum.sort()}
+  defp shape(_body), do: :not_an_object
 end

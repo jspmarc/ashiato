@@ -1,9 +1,9 @@
 # Bootstrap seeds: safe to re-run.
 #
 # Idempotent by existence checks, not upserts, because the default source has
-# `name IS NULL` and `sources_identity` is a partial index exempting NULL
-# names — the database cannot stop a second default source, so we check first.
-# Running twice leaves exactly one user and one default source.
+# `name IS NULL` and `sources_user_id_name_chapter_index` is a partial index
+# exempting NULL names — the database cannot stop a second default source, so we
+# check first. Running twice leaves exactly one user and one default source.
 
 import Ecto.Query
 

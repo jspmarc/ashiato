@@ -1,0 +1,315 @@
+defmodule Ashiato.SrsTest do
+  @moduledoc """
+  Scheduler contract tests — pure functions, no DB.
+  """
+
+  use ExUnit.Case, async: true
+
+  alias Ashiato.Srs
+  alias Ashiato.WordStates
+
+  @now ~U[2026-11-01 12:00:00Z]
+
+  describe "mature?/2" do
+    test "stability drives maturity, not the due date" do
+      mature = %WordStates{
+        state: :review,
+        stability: 30.0,
+        difficulty: 5.0,
+        due_at: DateTime.add(@now, 60, :day)
+      }
+
+      assert Srs.mature?(mature)
+      assert Srs.mature?(mature, 30)
+      refute Srs.mature?(mature, 31)
+    end
+
+    test "a word below the threshold is not mature, however long its interval" do
+      young = %WordStates{state: :review, stability: 20.9, due_at: DateTime.add(@now, 400, :day)}
+      refute Srs.mature?(young)
+      assert Srs.mature?(young, 20)
+    end
+
+    test "a never-reviewed word is not mature" do
+      refute Srs.mature?(%WordStates{state: :new, stability: nil})
+    end
+  end
+
+  describe "massed_exposure?/1" do
+    test "massed-exposure detection at the boundaries" do
+      # density = occurrences / max(days_seen, 1); massed from 5 occurrences
+      # and density >= 4
+      refute Srs.massed_exposure?(%{occurrences: 4, days_seen: 1})
+      assert Srs.massed_exposure?(%{occurrences: 5, days_seen: 1})
+      refute Srs.massed_exposure?(%{occurrences: 5, days_seen: 2})
+      assert Srs.massed_exposure?(%{occurrences: 8, days_seen: 2})
+      refute Srs.massed_exposure?(%{occurrences: 7, days_seen: 2})
+      refute Srs.massed_exposure?(%{occurrences: 5, days_seen: 3})
+      assert Srs.massed_exposure?(%{occurrences: 20, days_seen: 1})
+    end
+
+    test "no days seen counts as one day" do
+      assert Srs.massed_exposure?(%{occurrences: 5, days_seen: 0})
+      refute Srs.massed_exposure?(%{occurrences: 4, days_seen: 0})
+    end
+  end
+
+  describe "grade/3 first review" do
+    test "grade 1 seeds the word as learning, due now, with the lapse counted" do
+      %{state: next, interval_days: interval} =
+        Srs.grade(%WordStates{word_id: 7, state: :new, due_at: @now}, 1, @now)
+
+      assert interval == 0
+      assert next.word_id == 7
+      assert next.state == :learning
+      assert next.reps == 1
+      assert next.lapses == 1
+      # S0(1) = w0; D0(1) = w4 - e^(w5 * 0) + 1 = w4
+      assert_in_delta next.stability, 0.212, 1.0e-12
+      assert_in_delta next.difficulty, 6.4133, 1.0e-12
+      assert next.due_at == @now
+      assert next.last_reviewed_at == @now
+    end
+
+    test "grade 2 seeds the word as review, due the next day" do
+      %{state: next, interval_days: interval} =
+        Srs.grade(%WordStates{word_id: 7, state: :new, due_at: @now}, 2, @now)
+
+      assert next.state == :review
+      assert next.reps == 1
+      assert next.lapses == 0
+      # S0(2) = w1; D0(2) = w4 - e^w5 + 1
+      assert_in_delta next.stability, 1.2931, 1.0e-12
+      assert_in_delta next.difficulty, 5.112170705601055, 1.0e-12
+      # I(0.9, S) is S: max(1, round(1.2931)) = 1 day
+      assert interval == 1
+      assert next.due_at == DateTime.add(@now, 1, :day)
+      assert next.last_reviewed_at == @now
+    end
+
+    test "grade 3 seeds the word as review, due in two days" do
+      %{state: next, interval_days: interval} =
+        Srs.grade(%WordStates{word_id: 7, state: :new, due_at: @now}, 3, @now)
+
+      assert next.state == :review
+      assert next.reps == 1
+      assert next.lapses == 0
+      # S0(3) = w2; D0(3) = w4 - e^(2 * w5) + 1
+      assert_in_delta next.stability, 2.3065, 1.0e-12
+      assert_in_delta next.difficulty, 2.118103970459015, 1.0e-12
+      # I(0.9, S) is S: round(2.3065) = 2 days
+      assert interval == 2
+      assert next.due_at == DateTime.add(@now, 2, :day)
+      assert next.last_reviewed_at == @now
+    end
+
+    test "grade 4 seeds the word as review, due after the S0 interval" do
+      %{state: next, interval_days: interval} =
+        Srs.grade(%WordStates{word_id: 7, state: :new, due_at: @now}, 4, @now)
+
+      assert next.state == :review
+      assert next.reps == 1
+      assert next.lapses == 0
+      # S0(4) = w3; D0(4) = w4 - e^(3 * w5) + 1, clamped to Dmin
+      assert_in_delta next.stability, 8.2956, 1.0e-12
+      assert_in_delta next.difficulty, 1.0, 1.0e-12
+      # I(0.9, S) is S: round(8.2956) = 8 days
+      assert interval == 8
+      assert next.due_at == DateTime.add(@now, 8, :day)
+      assert next.last_reviewed_at == @now
+    end
+
+    test "grades 2 and 3 seed review with their own S0/D0" do
+      # S0(G) = w[G-1]; D0(G) = w4 - e^(w5 * (G - 1)) + 1
+      for {grade, s0, d0} <-
+            [{2, 1.2931, 5.112170705601055}, {3, 2.3065, 2.118103970459015}] do
+        %{state: next, interval_days: interval} =
+          Srs.grade(%WordStates{word_id: 7, state: :new, due_at: @now}, grade, @now)
+
+        assert next.state == :review
+        assert next.reps == 1
+        assert next.lapses == 0
+        assert_in_delta next.stability, s0, 1.0e-12
+        assert_in_delta next.difficulty, d0, 1.0e-12
+        # I(0.9, S) is S, floored at a whole day
+        assert interval == max(1, round(s0))
+        assert next.due_at == DateTime.add(@now, interval, :day)
+        assert next.last_reviewed_at == @now
+      end
+    end
+  end
+
+  describe "grade/3 lapses" do
+    test "a lapse from review drops to relearning, schedules the FSRS interval, counts the lapse" do
+      state = %WordStates{
+        word_id: 3,
+        state: :review,
+        stability: 40.0,
+        difficulty: 5.0,
+        reps: 5,
+        lapses: 0,
+        last_reviewed_at: DateTime.add(@now, -40, :day)
+      }
+
+      %{state: next, interval_days: interval} = Srs.grade(state, 1, @now)
+
+      assert interval == max(1, round(next.stability))
+      assert next.state == :relearning
+      assert next.due_at == DateTime.add(@now, interval, :day)
+      assert next.reps == 6
+      assert next.lapses == 1
+      # Sf never exceeds the stability that was just failed
+      assert next.stability < state.stability
+      assert next.last_reviewed_at == @now
+    end
+
+    test "failing a learning word applies post-lapse stability and stays in learning" do
+      state = %WordStates{
+        word_id: 1,
+        state: :learning,
+        stability: 0.212,
+        difficulty: 6.4133,
+        reps: 1,
+        lapses: 1,
+        last_reviewed_at: DateTime.add(@now, -1, :day)
+      }
+
+      %{state: next, interval_days: interval} = Srs.grade(state, 1, @now)
+
+      assert interval == max(1, round(next.stability))
+      assert next.state == :learning
+      assert next.due_at == DateTime.add(@now, interval, :day)
+      assert next.reps == 2
+      assert next.lapses == 2
+      # FSRS-6 post-lapse stability is capped at S / e^(w17 * w18)
+      assert_in_delta next.stability, 0.10088578982099844, 1.0e-12
+      assert_in_delta next.difficulty, 8.806304468856837, 1.0e-12
+    end
+
+    test "failing a relearning word keeps it there with its FSRS interval" do
+      state = %WordStates{
+        word_id: 2,
+        state: :relearning,
+        stability: 5.0,
+        difficulty: 6.0,
+        reps: 7,
+        lapses: 2,
+        last_reviewed_at: DateTime.add(@now, -5, :day)
+      }
+
+      %{state: next, interval_days: interval} = Srs.grade(state, 1, @now)
+
+      assert interval == max(1, round(next.stability))
+      assert next.state == :relearning
+      assert next.due_at == DateTime.add(@now, interval, :day)
+      assert next.reps == 8
+      assert next.lapses == 3
+      assert next.stability < state.stability
+    end
+  end
+
+  describe "grade/3 passes" do
+    test "passing a learning word graduates it to review" do
+      state = %WordStates{
+        word_id: 1,
+        state: :learning,
+        stability: 0.4872,
+        difficulty: 7.6214,
+        reps: 1,
+        lapses: 1,
+        last_reviewed_at: @now
+      }
+
+      %{state: next, interval_days: interval} = Srs.grade(state, 2, @now)
+
+      assert next.state == :review
+      assert next.reps == 2
+      assert next.lapses == 1
+      # same-day hard: the short-term increment is floored at 1, so S stays
+      assert_in_delta next.stability, 0.4872, 1.0e-9
+      assert interval == 1
+      assert next.due_at == DateTime.add(@now, 1, :day)
+    end
+
+    test "a same-day good review grows stability by the short-term formula" do
+      state = %WordStates{
+        word_id: 1,
+        state: :learning,
+        stability: 0.212,
+        difficulty: 6.4133,
+        reps: 1,
+        lapses: 1,
+        last_reviewed_at: @now
+      }
+
+      %{state: next, interval_days: interval} = Srs.grade(state, 3, @now)
+
+      assert next.state == :review
+      assert_in_delta next.stability, 0.24668918777567272, 1.0e-12
+      assert interval == 1
+    end
+
+    test "passing a relearning word returns it to review" do
+      state = %WordStates{
+        word_id: 2,
+        state: :relearning,
+        stability: 3.0,
+        difficulty: 7.0,
+        reps: 6,
+        lapses: 1,
+        last_reviewed_at: @now
+      }
+
+      %{state: next, interval_days: interval} = Srs.grade(state, 3, @now)
+
+      assert next.state == :review
+      assert next.reps == 7
+      assert next.lapses == 1
+      assert_in_delta next.stability, 3.0, 1.0e-9
+      assert interval == 3
+      assert next.due_at == DateTime.add(@now, 3, :day)
+    end
+
+    test "a good review from review grows stability and schedules the interval" do
+      state = %WordStates{
+        word_id: 4,
+        state: :review,
+        stability: 10.0,
+        difficulty: 5.0,
+        reps: 3,
+        lapses: 0,
+        last_reviewed_at: DateTime.add(@now, -10, :day)
+      }
+
+      %{state: next, interval_days: interval} = Srs.grade(state, 3, @now)
+
+      assert next.state == :review
+      assert next.reps == 4
+      assert next.lapses == 0
+      assert next.stability > state.stability
+      # the interval solves R(t, S') = 0.9, which is S' in whole days
+      assert interval == max(1, round(next.stability))
+      assert next.due_at == DateTime.add(@now, interval, :day)
+    end
+
+    test "hard grows stability less than good, easy more" do
+      state = %WordStates{
+        word_id: 4,
+        state: :review,
+        stability: 10.0,
+        difficulty: 5.0,
+        reps: 3,
+        lapses: 0,
+        last_reviewed_at: DateTime.add(@now, -10, :day)
+      }
+
+      hard = Srs.grade(state, 2, @now)
+      good = Srs.grade(state, 3, @now)
+      easy = Srs.grade(state, 4, @now)
+
+      assert hard.state.stability < good.state.stability
+      assert good.state.stability < easy.state.stability
+      assert easy.state.stability > state.stability
+    end
+  end
+end

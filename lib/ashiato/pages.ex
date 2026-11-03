@@ -2,19 +2,19 @@ defmodule Ashiato.Pages do
   @moduledoc """
   One photographed / uploaded screen (or one PDF page).
 
-  Page identity is `(user_id, text_hash)` unique — `one_page_per_distinct_text`.
-  The hash is a SHA-256 of the *normalised* text: a fixed 64 bytes whatever the
-  page length (a Postgres btree entry caps around 2.7 kB, so raw text would not
-  fit), and normalization happens once here rather than on every lookup.
-  Re-uploading the same screen therefore creates nothing new.
+  Page identity is `(user_id, text_hash)`, unique via
+  `pages_user_id_text_hash_index`.
+  The hash is a SHA-256 of the normalised text: a fixed 64 bytes whatever the
+  page length, since a raw-text index entry would outgrow the btree.
 
-  Migration deviation from the ERD (migration is authoritative): `text_origin`
-  was created `null: true`, so the schema keeps it nil-able even though the ERD
-  note reads "not null". `revision` defaults to 1 in the database and is bumped
-  on re-photograph or correction, discarding stale job results.
+  `text_origin` stays nullable because the migration allows NULL.
+  `revision` defaults to 1 and is bumped whenever the page's content changes,
+  which is what discards stale job results.
   """
 
   use Ecto.Schema
+
+  import Ecto.Changeset
 
   schema "pages" do
     belongs_to :user, Ashiato.Users
@@ -40,5 +40,29 @@ defmodule Ashiato.Pages do
     timestamps(type: :utc_datetime)
 
     has_many :encounters, Ashiato.Encounters, foreign_key: :page_id
+  end
+
+  @doc """
+  Changeset for creating a page, and for its status and revision updates.
+  `user_id` is set on the struct, not cast. The unique constraint turns a
+  re-upload of the same screen into an error rather than a raise.
+  """
+  def changeset(page, attrs) do
+    page
+    |> cast(attrs, [
+      :source_id,
+      :document_id,
+      :page_index,
+      :image_key,
+      :image_store,
+      :image_expires_at,
+      :text_origin,
+      :accepted_text,
+      :text_hash,
+      :revision,
+      :status
+    ])
+    |> validate_required([:source_id, :image_key, :text_hash, :status])
+    |> unique_constraint([:user_id, :text_hash])
   end
 end

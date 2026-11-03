@@ -1,14 +1,21 @@
 defmodule Ashiato.LedgerTest do
   @moduledoc """
-  The ledger's two identities are the whole contract, so these tests are about
-  idempotency rather than happy paths:
+  The ledger's identities are the foundation, and the review pipeline sits on
+  top of them:
 
     * a lexeme is one row per `lemma + reading + part_of_speech`, globally
     * an encounter is one row per `(user, word, page text hash)`
+    * a review appends exactly one log row and upserts the one state row
 
-  Both are enforced by unique indexes, and both are easy to get subtly wrong —
-  `find_or_create_lexeme` has to survive a race, and `record_encounter` has to
-  turn a duplicate into a value rather than an exception.
+  Both identities are enforced by unique indexes, and both are easy to get
+  subtly wrong — `find_or_create_lexeme` has to survive a race, and
+  `record_encounter` has to turn a duplicate into a value rather than an
+  exception. The review tests pin the log/state split: append-only events and
+  one rebuildable state row.
+
+  They also cover the introduction threshold and the derived `chrome_like` flag,
+  including its hand-off with suspensions, and the page lifecycle with its
+  revision fencing.
 
   The coverage and kanji queries at the bottom are tested the way
   `docs/kanji-review.md` derives them: fixtures whose numbers can be stated by
@@ -20,7 +27,7 @@ defmodule Ashiato.LedgerTest do
 
   import Ashiato.Fixtures
 
-  alias Ashiato.{Encounters, Ledger, Lexemes, Repo, WordStates}
+  alias Ashiato.{Encounters, Ledger, Lexemes, Pages, Repo, ReviewEvents, Srs, WordStates}
 
   describe "find_or_create_lexeme/3" do
     test "creates the lexeme the first time and returns the same row the second" do
@@ -41,8 +48,7 @@ defmodule Ashiato.LedgerTest do
     end
 
     test "a nil reading is normalised to an empty string" do
-      # NULL is distinct in a unique index, so storing nil would create a new
-      # row on every call. The database default is "" for exactly this reason.
+      # NULL is distinct in a unique index, so nil would insert a new row every call.
       assert {:ok, first} = Ledger.find_or_create_lexeme("ねこ", nil, "noun")
       assert {:ok, second} = Ledger.find_or_create_lexeme("ねこ", nil, "noun")
 
@@ -67,6 +73,168 @@ defmodule Ashiato.LedgerTest do
                1
 
       assert Repo.aggregate(Lexemes, :count) == 1
+    end
+  end
+
+  describe "review/2 and review/3" do
+    setup do
+      user = user_fixture()
+      word = word_fixture(user_id: user.id)
+
+      {:ok, %{user: user, word: word}}
+    end
+
+    test "review/2 delegates to review/3 with now", %{word: word} do
+      assert {:ok, %WordStates{} = state} = Ledger.review(word.id, 3)
+      assert state.word_id == word.id
+      assert state.state == :review
+      assert length(Repo.all(ReviewEvents)) == 1
+    end
+
+    test "appends exactly one review_events row per grade", %{word: word} do
+      day1 = ~U[2026-11-01 12:00:00.000000Z]
+      day2 = ~U[2026-11-02 12:00:00.000000Z]
+
+      assert {:ok, _} = Ledger.review(word.id, 3, day1)
+      assert Repo.aggregate(ReviewEvents, :count) == 1
+
+      assert {:ok, _} = Ledger.review(word.id, 4, day2)
+
+      # exactly one row per grade, in reviewed_at order
+      events = Repo.all(from re in ReviewEvents, order_by: re.reviewed_at)
+      assert [first, second] = events
+
+      assert first.grade == 3
+      # :utc_datetime_usec loads back with usec precision ({0, 6}), so compare
+      # the instant, not the struct
+      assert same_instant?(first.reviewed_at, day1)
+      # every review yields a new state: never "not computed"
+      assert first.stability_after
+      assert first.difficulty_after
+      assert first.interval_after in 0..36500
+
+      assert second.grade == 4
+      assert same_instant?(second.reviewed_at, day2)
+      assert second.stability_after
+      assert second.difficulty_after
+      assert second.interval_after in 0..36500
+    end
+
+    test "upserts the single word_states row for the word", %{word: word} do
+      day1 = ~U[2026-11-01 12:00:00Z]
+      assert {:ok, state1} = Ledger.review(word.id, 3, day1)
+
+      assert Repo.aggregate(WordStates, :count) == 1
+      assert state1.word_id == word.id
+      assert state1.state == :review
+      assert state1.reps == 1
+      assert state1.lapses == 0
+      # S0(3) = w2; D0(3) = w4 - e^(2 * w5) + 1; the interval is
+      # round(2.3065) = 2 days
+      assert state1.stability == 2.3065
+      assert state1.difficulty == 2.118103970459015
+      assert state1.last_reviewed_at == day1
+      assert state1.due_at == DateTime.add(day1, 2 * 86_400, :second)
+
+      day2 = ~U[2026-11-02 12:00:00Z]
+      assert {:ok, state2} = Ledger.review(word.id, 4, day2)
+      # the upsert replaced the row, it did not add one
+      assert Repo.aggregate(WordStates, :count) == 1
+
+      # and the row mirrors the FSRS result for the state review 1 left behind
+      %{state: expected, interval_days: interval} = Srs.grade(state1, 4, day2)
+
+      assert state2.state == expected.state
+      assert state2.stability == expected.stability
+      assert state2.difficulty == expected.difficulty
+      assert state2.reps == expected.reps
+      assert state2.lapses == expected.lapses
+      assert state2.last_reviewed_at == day2
+      assert state2.due_at == DateTime.add(day2, interval * 86_400, :second)
+    end
+
+    test "a first lapse schedules the 4-hour remedial step", %{word: word} do
+      day1 = ~U[2026-11-01 12:00:00.000000Z]
+      day2 = ~U[2026-11-11 12:00:00Z]
+
+      assert {:ok, review_state} = Ledger.review(word.id, 3, day1)
+      assert {:ok, lapsed} = Ledger.review(word.id, 1, day2)
+
+      %{state: expected} = Srs.grade(review_state, 1, day2)
+
+      assert lapsed.state == :relearning
+      assert lapsed.lapses == 1
+      assert lapsed.reps == 2
+      assert lapsed.failure_streak == 1
+      assert lapsed.stability == expected.stability
+      assert lapsed.due_at == DateTime.add(day2, 4, :hour)
+
+      assert [lapse_event] =
+               Repo.all(from re in ReviewEvents, where: re.word_id == ^word.id and re.grade == 1)
+
+      assert lapse_event.interval_after == 0
+      assert same_instant?(lapse_event.reviewed_at, day2)
+    end
+
+    test "consecutive agains escalate into ghost steps, and a pass clears the streak", %{
+      word: word
+    } do
+      t0 = ~U[2026-11-01 12:00:00Z]
+      assert {:ok, _} = Ledger.review(word.id, 3, t0)
+
+      failure1 = DateTime.add(t0, 86_400, :second)
+      assert {:ok, state1} = Ledger.review(word.id, 1, failure1)
+      assert state1.failure_streak == 1
+      assert state1.due_at == DateTime.add(failure1, 4, :hour)
+
+      failure2 = DateTime.add(failure1, 4 * 3_600, :second)
+      assert {:ok, state2} = Ledger.review(word.id, 1, failure2)
+      assert state2.failure_streak == 2
+      assert state2.due_at == DateTime.add(failure2, 12, :hour)
+
+      failure3 = DateTime.add(failure2, 12 * 3_600, :second)
+      assert {:ok, state3} = Ledger.review(word.id, 1, failure3)
+      assert state3.failure_streak == 3
+      assert state3.due_at == DateTime.add(failure3, 24, :hour)
+
+      failure4 = DateTime.add(failure3, 24 * 3_600, :second)
+      assert {:ok, state4} = Ledger.review(word.id, 1, failure4)
+      assert state4.failure_streak == 4
+      assert state4.due_at == DateTime.add(failure4, 24, :hour)
+
+      passed_at = DateTime.add(failure4, 24 * 3_600, :second)
+      assert {:ok, passed} = Ledger.review(word.id, 3, passed_at)
+      assert passed.failure_streak == 0
+      assert passed.state == :review
+
+      [pass_event] =
+        Repo.all(
+          from re in ReviewEvents, where: re.word_id == ^word.id and re.reviewed_at == ^passed_at
+        )
+
+      assert pass_event.interval_after > 0
+      assert passed.due_at == DateTime.add(passed_at, pass_event.interval_after * 86_400, :second)
+
+      failure_events =
+        Repo.all(
+          from re in ReviewEvents,
+            where: re.word_id == ^word.id and re.grade == 1,
+            order_by: re.reviewed_at
+        )
+
+      assert Enum.map(failure_events, & &1.interval_after) == [0, 0, 0, 0]
+    end
+
+    test "an unknown word or an out-of-range grade is an error, not a raise", %{word: word} do
+      assert {:error, %Ecto.Changeset{}} = Ledger.review(999_999, 3, ~U[2026-11-01 12:00:00Z])
+
+      assert {:error, %Ecto.Changeset{errors: errors}} =
+               Ledger.review(word.id, 5, ~U[2026-11-01 12:00:00Z])
+
+      assert errors[:grade]
+      # nothing was written
+      assert Repo.aggregate(ReviewEvents, :count) == 0
+      assert Repo.aggregate(WordStates, :count) == 0
     end
   end
 
@@ -144,7 +312,6 @@ defmodule Ashiato.LedgerTest do
          %{user: user, source: source, word: word} do
       pages = for _ <- 1..4, do: page_fixture(user_id: user.id, source_id: source.id)
 
-      # on two of the four pages
       pages |> Enum.take(2) |> Enum.each(&record(user, source, word, &1, true))
 
       assert Ledger.chrome_ratio(user.id, source.id) == %{word.id => 0.5}
@@ -549,10 +716,463 @@ defmodule Ashiato.LedgerTest do
     end
   end
 
-  defp record(user, source, word, page, confirmed) do
-    record_on(user, source, word, page, confirmed, ~D[2026-11-01])
+  # :utc_datetime and :utc_datetime_usec load back with different microsecond
+  # precisions ({0, 0} vs {0, 6}), so compare the instant, not the struct
+  defp same_instant?(a, b), do: DateTime.compare(a, b) == :eq
+
+  describe "introduce_words/3" do
+    setup do
+      user = user_fixture()
+      source = source_fixture(user_id: user.id)
+
+      {:ok, %{user: user, source: source}}
+    end
+
+    test "a word below the threshold is not introduced", %{user: user, source: source} do
+      %{lexeme: lexeme} = met_word(user, source, 1)
+
+      assert {:ok, []} = Ledger.introduce_words(user.id, [lexeme.id])
+      assert Repo.aggregate(WordStates, :count) == 0
+    end
+
+    test "a word at the threshold is introduced, due immediately and new",
+         %{user: user, source: source} do
+      %{lexeme: lexeme, word: word} = met_word(user, source)
+
+      assert {:ok, [introduced]} = Ledger.introduce_words(user.id, [lexeme.id])
+      assert introduced.id == word.id
+
+      assert [%WordStates{} = state] = Repo.all(WordStates)
+      assert state.word_id == word.id
+      assert state.state == :new
+      assert %DateTime{} = state.due_at
+    end
+
+    test "unconfirmed and discarded encounters do not count toward the threshold",
+         %{user: user, source: source} do
+      lexeme = lexeme_fixture()
+      word = word_fixture(user_id: user.id, lexeme_id: lexeme.id)
+
+      [met, unconfirmed, discarded] =
+        for _ <- 1..3, do: page_fixture(user_id: user.id, source_id: source.id)
+
+      record(user, source, word, met, true)
+      # unconfirmed and discarded: neither counts toward the threshold
+      record(user, source, word, unconfirmed, false)
+
+      record(user, source, word, discarded, true, %{
+        discarded_at: DateTime.utc_now() |> DateTime.truncate(:second)
+      })
+
+      assert {:ok, []} = Ledger.introduce_words(user.id, [lexeme.id])
+      assert Repo.aggregate(WordStates, :count) == 0
+    end
+
+    test "force: true bypasses the threshold", %{user: user, source: source} do
+      %{lexeme: lexeme} = met_word(user, source, 1)
+
+      assert {:ok, [_introduced]} = Ledger.introduce_words(user.id, [lexeme.id], force: true)
+      assert Repo.aggregate(WordStates, :count) == 1
+    end
+
+    test "force bypasses only the threshold, not the other filters",
+         %{user: user, source: source} do
+      known = met_word(user, source, 1)
+      Repo.update!(change(known.word, known: true))
+
+      chrome = met_word(user, source, 1)
+      Repo.update!(change(chrome.word, chrome_like: true))
+
+      suspended = met_word(user, source, 1)
+      assert {:ok, _} = Ledger.mark_suspended(user.id, suspended.lexeme.id, :manual)
+
+      lexeme_ids = [known.lexeme.id, chrome.lexeme.id, suspended.lexeme.id]
+
+      assert {:ok, []} = Ledger.introduce_words(user.id, lexeme_ids, force: true)
+      assert Repo.aggregate(WordStates, :count) == 0
+    end
+
+    test "the threshold is overridable per call", %{user: user, source: source} do
+      %{lexeme: lexeme} = met_word(user, source, 3)
+
+      assert {:ok, []} = Ledger.introduce_words(user.id, [lexeme.id], min_encounters: 4)
+      assert {:ok, [_]} = Ledger.introduce_words(user.id, [lexeme.id], min_encounters: 3)
+    end
+
+    test "a word already introduced is not duplicated", %{user: user, source: source} do
+      %{lexeme: lexeme} = met_word(user, source)
+
+      assert {:ok, [_first]} = Ledger.introduce_words(user.id, [lexeme.id])
+
+      # a repeat call and a duplicated id both see the existing word_states row
+      assert {:ok, []} = Ledger.introduce_words(user.id, [lexeme.id])
+      assert {:ok, []} = Ledger.introduce_words(user.id, [lexeme.id, lexeme.id])
+
+      assert Repo.aggregate(WordStates, :count) == 1
+    end
+
+    test "a lexeme with no words row is skipped unless forced", %{user: user} do
+      lexeme = lexeme_fixture()
+
+      assert {:ok, []} = Ledger.introduce_words(user.id, [lexeme.id])
+
+      assert {:ok, [minted]} = Ledger.introduce_words(user.id, [lexeme.id], force: true)
+      assert minted.lexeme_id == lexeme.id
+      assert Repo.aggregate(WordStates, :count) == 1
+    end
+
+    test "returns only the introduced words, in the order given",
+         %{user: user, source: source} do
+      below = met_word(user, source, 1)
+      first = met_word(user, source)
+      second = met_word(user, source)
+
+      ids = [below.lexeme.id, second.lexeme.id, first.lexeme.id]
+      assert {:ok, [w1, w2]} = Ledger.introduce_words(user.id, ids)
+
+      assert w1.id == second.word.id
+      assert w2.id == first.word.id
+    end
   end
 
+  describe "mark_known/2" do
+    test "marks the user's copy of the lexeme known" do
+      user = user_fixture()
+      word = word_fixture(user_id: user.id)
+
+      assert {:ok, known} = Ledger.mark_known(user.id, word.lexeme_id)
+      assert known.known
+      assert Repo.reload!(word).known
+    end
+
+    test "a lexeme the user has no words row for is an error" do
+      user = user_fixture()
+      lexeme = lexeme_fixture()
+
+      assert {:error, :not_found} = Ledger.mark_known(user.id, lexeme.id)
+    end
+  end
+
+  describe "mark_suspended/3" do
+    setup do
+      user = user_fixture()
+      word = word_fixture(user_id: user.id)
+
+      {:ok, %{user: user, word: word}}
+    end
+
+    test "suspends with the given reason", %{user: user, word: word} do
+      assert {:ok, suspended} = Ledger.mark_suspended(user.id, word.lexeme_id, :manual)
+      assert suspended.suspended
+      assert suspended.suspended_reason == :manual
+    end
+
+    test "mastering also stamps mastered_at", %{user: user, word: word} do
+      assert {:ok, mastered} = Ledger.mark_suspended(user.id, word.lexeme_id, :mastered)
+      assert %DateTime{} = mastered.mastered_at
+    end
+
+    test "the reason must come from the Ecto.Enum", %{user: user, word: word} do
+      assert {:error, changeset} = Ledger.mark_suspended(user.id, word.lexeme_id, :bogus)
+      assert %{suspended_reason: ["is invalid"]} = errors_on(changeset)
+
+      refute Repo.reload!(word).suspended
+    end
+
+    test "suspending again never clobbers an existing reason", %{user: user, word: word} do
+      assert {:ok, first} = Ledger.mark_suspended(user.id, word.lexeme_id, :manual)
+      assert {:ok, second} = Ledger.mark_suspended(user.id, word.lexeme_id, :chrome)
+
+      # the manual reason survives, so clearing the chrome flag cannot wipe it
+      assert first.suspended_reason == :manual
+      assert second.suspended_reason == :manual
+    end
+
+    test "a lexeme the user has no words row for is an error" do
+      user = user_fixture()
+      lexeme = lexeme_fixture()
+
+      assert {:error, :not_found} = Ledger.mark_suspended(user.id, lexeme.id, :manual)
+    end
+  end
+
+  describe "update_chrome_like/1" do
+    setup do
+      {:ok, %{user: user_fixture()}}
+    end
+
+    test "flags a word chrome-like in every source it appears in", %{user: user} do
+      %{word: word} = chrome_word(user)
+
+      assert {:ok, [flagged]} = Ledger.update_chrome_like(user.id)
+      assert flagged.id == word.id
+      assert Repo.reload!(word).chrome_like
+    end
+
+    test "a word chrome in one game but rare in a manga stays unflagged", %{user: user} do
+      game = source_fixture(user_id: user.id)
+      game_pages = for _ <- 1..2, do: page_fixture(user_id: user.id, source_id: game.id)
+
+      # both words are on every game page; only one of them is also met in a manga
+      hud = word_fixture(user_id: user.id)
+      real = word_fixture(user_id: user.id)
+      Enum.each(game_pages, &record(user, game, hud, &1, true))
+      Enum.each(game_pages, &record(user, game, real, &1, true))
+
+      manga = source_fixture(user_id: user.id, kind: :manga)
+      manga_pages = for _ <- 1..3, do: page_fixture(user_id: user.id, source_id: manga.id)
+      Enum.each(Enum.take(manga_pages, 1), &record(user, manga, real, &1, true))
+
+      # HUD word: chrome in its only source. Real word: not chrome in every source.
+      assert {:ok, [flagged]} = Ledger.update_chrome_like(user.id)
+      assert flagged.id == hud.id
+      refute Repo.reload!(real).chrome_like
+    end
+
+    test "when the flag lands, an existing card is suspended with reason chrome",
+         %{user: user} do
+      %{lexeme: lexeme, word: word} = chrome_word(user)
+
+      assert {:ok, [_]} = Ledger.introduce_words(user.id, [lexeme.id])
+      assert {:ok, [_]} = Ledger.update_chrome_like(user.id)
+
+      reloaded = Repo.reload!(word)
+      assert reloaded.chrome_like
+      assert reloaded.suspended and reloaded.suspended_reason == :chrome
+
+      # suspended, never deleted: the card and its history survive
+      assert Repo.get!(WordStates, word.id)
+    end
+
+    test "when the flag lands on a suspended word, its reason is not clobbered", %{user: user} do
+      %{lexeme: lexeme, word: word} = chrome_word(user)
+
+      assert {:ok, _} = Ledger.mark_suspended(user.id, lexeme.id, :manual)
+      assert {:ok, [_flagged]} = Ledger.update_chrome_like(user.id)
+
+      reloaded = Repo.reload!(word)
+      assert reloaded.chrome_like
+      assert reloaded.suspended and reloaded.suspended_reason == :manual
+    end
+
+    test "clearing the flag un-suspends a chrome suspension", %{user: user} do
+      %{word: word} = chrome_word(user)
+
+      assert {:ok, [_]} = Ledger.update_chrome_like(user.id)
+      assert Repo.reload!(word).suspended
+
+      # no longer chrome-like everywhere: met on one of two manga pages
+      meet_rarely_elsewhere(user, word)
+      assert {:ok, []} = Ledger.update_chrome_like(user.id)
+
+      reloaded = Repo.reload!(word)
+      refute reloaded.chrome_like
+      refute reloaded.suspended
+      assert reloaded.suspended_reason == nil
+    end
+
+    for reason <- [:manual, :mastered, :leech] do
+      test "clearing the flag leaves a #{reason} suspension intact", %{user: user} do
+        reason = unquote(reason)
+        %{lexeme: lexeme, word: word} = chrome_word(user)
+
+        # the flag lands on an already-suspended word without touching it…
+        assert {:ok, _} = Ledger.mark_suspended(user.id, lexeme.id, reason)
+        assert {:ok, [_]} = Ledger.update_chrome_like(user.id)
+
+        reloaded = Repo.reload!(word)
+        assert reloaded.chrome_like
+        assert reloaded.suspended and reloaded.suspended_reason == reason
+
+        # …and clearing the flag leaves the suspension alone too
+        meet_rarely_elsewhere(user, word)
+        assert {:ok, []} = Ledger.update_chrome_like(user.id)
+
+        reloaded = Repo.reload!(word)
+        refute reloaded.chrome_like
+        assert reloaded.suspended and reloaded.suspended_reason == reason
+      end
+    end
+  end
+
+  # A word met on `n` distinct confirmed pages of one source.
+  defp met_word(user, source, n \\ 2) do
+    lexeme = lexeme_fixture()
+    word = word_fixture(user_id: user.id, lexeme_id: lexeme.id)
+
+    for _ <- 1..n do
+      page = page_fixture(user_id: user.id, source_id: source.id)
+      record(user, source, word, page, true)
+    end
+
+    %{lexeme: lexeme, word: word}
+  end
+
+  # A word on every page of a fresh source: chrome-like in its only source.
+  defp chrome_word(user) do
+    source = source_fixture(user_id: user.id)
+    lexeme = lexeme_fixture()
+    word = word_fixture(user_id: user.id, lexeme_id: lexeme.id)
+    pages = for _ <- 1..2, do: page_fixture(user_id: user.id, source_id: source.id)
+    Enum.each(pages, &record(user, source, word, &1, true))
+
+    %{lexeme: lexeme, word: word, source: source}
+  end
+
+  # Meets `word` on one of two manga pages: exactly half does not clear the
+  # threshold, so the word stops being chrome-like in every source.
+  defp meet_rarely_elsewhere(user, word) do
+    manga = source_fixture(user_id: user.id, kind: :manga)
+    [met, _unmet] = for _ <- 1..2, do: page_fixture(user_id: user.id, source_id: manga.id)
+    record(user, manga, word, met, true)
+
+    manga
+  end
+
+  defp record(user, source, word, page, confirmed, opts \\ %{}) do
+    attrs =
+      Map.merge(
+        %{
+          user_id: user.id,
+          word_id: word.id,
+          page_id: page.id,
+          source_id: source.id,
+          text_hash: page.text_hash,
+          crop_key: "crops/#{page.id}.jpg",
+          seen_on: ~D[2026-11-01],
+          confirmed: confirmed
+        },
+        opts
+      )
+
+    Ledger.record_encounter(attrs)
+  end
+
+  # The interesting behaviour is concurrency: a stale fenced write is discarded
+  # rather than raising, and pages only move forward.
+  describe "page lifecycle and revision fencing" do
+    setup do
+      user = user_fixture()
+      source = source_fixture(user_id: user.id)
+
+      {:ok, %{user: user, source: source}}
+    end
+
+    test "create_page/1 builds an uploaded page and sets user_id without casting",
+         %{user: user, source: source} do
+      n = System.unique_integer([:positive])
+
+      assert {:ok, page} =
+               Ledger.create_page(%{
+                 user_id: user.id,
+                 source_id: source.id,
+                 image_key: "pages/#{n}.jpg",
+                 text_hash: "hash-#{n}"
+               })
+
+      assert page.status == :uploaded
+      assert page.revision == 1
+      assert page.user_id == user.id
+    end
+
+    test "create_page/1 rejects a duplicate (user_id, text_hash) as an error, not a raise",
+         %{user: user, source: source} do
+      n = System.unique_integer([:positive])
+
+      attrs = %{
+        user_id: user.id,
+        source_id: source.id,
+        image_key: "pages/#{n}.jpg",
+        text_hash: "hash-#{n}"
+      }
+
+      assert {:ok, _} = Ledger.create_page(attrs)
+      assert {:error, changeset} = Ledger.create_page(attrs)
+      assert "has already been taken" in errors_on(changeset).user_id
+    end
+
+    test "accept_text/2 sets accepted_text and bumps revision in one write",
+         %{user: user, source: source} do
+      page = make_page(user, source)
+      assert {:ok, page} = Ledger.accept_text(page, "冷たいな！？")
+
+      assert page.accepted_text == "冷たいな！？"
+      assert page.revision == 2
+    end
+
+    test "a correction with a stale revision is rejected as :superseded",
+         %{user: user, source: source} do
+      page = make_page(user, source)
+      stale = page
+
+      assert {:ok, _} = Ledger.accept_text(page, "正しく読めた")
+      assert {:error, :superseded} = Ledger.accept_text(stale, "別の修正")
+      assert %{accepted_text: "正しく読めた", revision: 2} = Repo.get!(Pages, page.id)
+    end
+
+    test "a matching revision write succeeds and does not bump revision",
+         %{user: user, source: source} do
+      page = make_page(user, source)
+      assert {:ok, page} = Ledger.finish_page(page, :detecting)
+
+      assert page.status == :detecting
+      assert page.revision == 1
+    end
+
+    test "a stale revision write is discarded as :superseded", %{user: user, source: source} do
+      page = make_page(user, source)
+
+      # a correction landed while the job was working: revision bumped
+      assert {:ok, _} = Ledger.accept_text(page, "正しく読めた")
+
+      # the job still carries the page it read at the start (revision 1)
+      assert {:error, :superseded} = Ledger.finish_page(page, :detecting)
+    end
+
+    test "backward transitions are rejected", %{user: user, source: source} do
+      page = make_page(user, source)
+      assert {:ok, page} = Ledger.transition(page, :detecting)
+      assert {:ok, page} = Ledger.transition(page, :text_ready)
+
+      assert {:error, :invalid_transition} = Ledger.transition(page, :uploaded)
+      assert {:error, :invalid_transition} = Ledger.transition(page, :detecting)
+
+      assert {:ok, page} = Ledger.transition(page, :translating)
+      assert {:error, :invalid_transition} = Ledger.transition(page, :text_ready)
+
+      assert {:ok, page} = Ledger.transition(page, :ready)
+      assert {:error, :invalid_transition} = Ledger.transition(page, :failed)
+    end
+
+    test ":failed is reachable from every non-terminal state", %{user: user, source: source} do
+      for status <- [:uploaded, :detecting, :text_ready, :translating] do
+        page = make_page(user, source, status: status)
+        assert {:ok, page} = Ledger.transition(page, :failed)
+        assert page.status == :failed
+      end
+    end
+  end
+
+  defp make_page(user, source, attrs \\ %{}) do
+    n = System.unique_integer([:positive])
+    attrs = Map.new(attrs)
+
+    {:ok, page} =
+      Ledger.create_page(
+        Map.merge(
+          %{
+            user_id: user.id,
+            source_id: source.id,
+            image_key: "pages/#{n}.jpg",
+            text_hash: "hash-#{n}",
+            status: :uploaded
+          },
+          attrs
+        )
+      )
+
+    page
+  end
   defp record_on(user, source, word, page, confirmed, seen_on) do
     Ledger.record_encounter(%{
       user_id: user.id,
@@ -582,7 +1202,7 @@ defmodule Ashiato.LedgerTest do
 
     Repo.insert!(%WordStates{
       word_id: word.id,
-      state: 2,
+      state: :review,
       stability: stability,
       due_at: reviewed_at,
       last_reviewed_at: reviewed_at

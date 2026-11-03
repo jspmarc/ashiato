@@ -1,6 +1,7 @@
 defmodule Ashiato.Utils do
   @moduledoc """
-  Pure string/collection helpers shared across contexts.
+  Small shared helpers: pure string/collection helpers, plus timestamps that
+  match the `:utc_datetime` columns.
   """
 
   @doc """
@@ -29,4 +30,11 @@ defmodule Ashiato.Utils do
       _ -> false
     end
   end
+
+  @doc """
+  The current time truncated to whole seconds, matching the `:utc_datetime`
+  columns.
+  """
+  @spec utc_now() :: DateTime.t()
+  def utc_now, do: DateTime.utc_now() |> DateTime.truncate(:second)
 end

@@ -93,6 +93,24 @@ defmodule Ashiato.SettingsTest do
       assert log =~ "failed authentication"
       refute log =~ "sk-tamper-me"
     end
+
+    test "a row whose value column is NULL returns the default instead of raising", %{user: user} do
+      # the column is nullable: a hand-written or half-migrated row can hold NULL
+      Repo.insert!(%Setting{user_id: user.id, key: "new_cards_per_day", value: nil})
+
+      log =
+        capture_log(fn ->
+          assert Settings.get(user.id, "new_cards_per_day") == 10
+          assert Settings.get(user.id, "other_key", :fallback) == :fallback
+        end)
+
+      assert log =~ "has no value"
+    end
+
+    test "a value that cannot be JSON is an error tuple, not a raise", %{user: user} do
+      assert Settings.put(user.id, "weird", {:a, :tuple}) == {:error, :not_encodable}
+      assert Settings.get(user.id, "weird", :fallback) == :fallback
+    end
   end
 
   describe "capability gates through the fake" do

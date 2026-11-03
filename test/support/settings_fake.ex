@@ -2,8 +2,9 @@ defmodule Ashiato.Settings.Fake do
   @moduledoc """
   In-memory implementation of the `Ashiato.Settings` behaviour: values are stored
   decoded under `{user_id, key}`, so capability gates and callers are drivable without the
-  database. It ignores the `:secret` opt — encryption is a property of the repo-backed
-  store, not of the data a caller reads.
+  database. It keeps the `:secret` flag but stores the value in the clear — encryption is a
+  property of the repo-backed store; what callers observe here is that `all/1` redacts a
+  secret and `get/3` returns it.
 
   It lives in `test/support` rather than inside a test file so that any test — including a
   single-file run of some later card's test — can start it.
@@ -26,7 +27,7 @@ defmodule Ashiato.Settings.Fake do
   def get(user_id, key, default) do
     Agent.get(__MODULE__, fn store ->
       case Map.fetch(store, {user_id, key}) do
-        {:ok, value} -> value
+        {:ok, {value, _secret?}} -> value
         :error -> default
       end
     end)
@@ -38,10 +39,11 @@ defmodule Ashiato.Settings.Fake do
   store's reply, so a caller asserting on the returned row sees the value it wrote.
   """
   @spec put(integer(), String.t(), term(), keyword()) :: {:ok, Setting.t()}
-  def put(user_id, key, value, _opts) do
-    Agent.update(__MODULE__, &Map.put(&1, {user_id, key}, value))
+  def put(user_id, key, value, opts) do
+    secret? = Keyword.get(opts, :secret, false)
+    Agent.update(__MODULE__, &Map.put(&1, {user_id, key}, {value, secret?}))
 
-    {:ok, %Setting{user_id: user_id, key: key, value: Jason.encode!(value), secret: false}}
+    {:ok, %Setting{user_id: user_id, key: key, value: Jason.encode!(value), secret: secret?}}
   end
 
   @impl true
@@ -49,7 +51,10 @@ defmodule Ashiato.Settings.Fake do
   @spec all(integer()) :: %{optional(String.t()) => term()}
   def all(user_id) do
     Agent.get(__MODULE__, fn store ->
-      for {{uid, key}, value} <- store, uid == user_id, into: %{}, do: {key, value}
+      for {{uid, key}, {value, secret?}} <- store, uid == user_id, into: %{} do
+        # same rule as the real store: a bulk read never spreads a secret
+        if secret?, do: {key, :redacted}, else: {key, value}
+      end
     end)
   end
 end

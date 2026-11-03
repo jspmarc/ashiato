@@ -32,3 +32,8 @@ ashiato-*.tar
 *.env*
 !.env.example
 !.envrc
+
+# Git worktrees for parallel agent/card work: one checkout per card. Ignored so
+# a repo-wide grep or file listing never sees a second copy of lib/ or test/.
+/.worktrees/
+

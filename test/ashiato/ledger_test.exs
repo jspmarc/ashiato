@@ -253,9 +253,11 @@ defmodule Ashiato.LedgerTest do
       assert {:ok, page} = Ledger.transition(page, :text_ready)
 
       assert {:error, :invalid_transition} = Ledger.transition(page, :uploaded)
-      assert {:error, :invalid_transition} = Ledger.transition(page, :ready)
+      assert {:error, :invalid_transition} = Ledger.transition(page, :detecting)
 
       assert {:ok, page} = Ledger.transition(page, :translating)
+      assert {:error, :invalid_transition} = Ledger.transition(page, :text_ready)
+
       assert {:ok, page} = Ledger.transition(page, :ready)
       assert {:error, :invalid_transition} = Ledger.transition(page, :failed)
     end

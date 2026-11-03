@@ -562,6 +562,12 @@ string and nothing else. That check is admin-configurable: on/off, and its inter
 
 ## 7. Integrations
 
+**Implementation status.** Every service in this section is specified, not built. `jp-dict-api` and
+`ashiato-ocr` do not exist yet. The Elixir side reaches them only through behaviours — `Ashiato.Tokenizer`,
+`Ashiato.Dictionary`, `Ashiato.Ocr`, `Ashiato.Translator`, `Ashiato.Storage` — each with a fake, so no
+test calls a real service. The rest of this section is the contract those behaviours must satisfy, not a
+description of running code. See `docs/plan/wave-2.md`.
+
 ### 7.1 Dictionary — external HTTP service
 
 The dictionary is **`jp-dict-api`, run as a separate service** (`JP_DICT_API_URL`).
@@ -886,7 +892,7 @@ switch means no translate affordance anywhere in the UI — hidden, not failing.
 | `OPENAI_API_KEY` | unset | Credentials only. No default; empty means AI features are unavailable |
 | `JP_DICT_API_URL` | — | Dictionary service |
 | `tokenizer_provider` | `http` | `http` or `sudachi_nif` |
-| `ocr_provider` | `paddleocr_vl` | OCR recognition backend |
+| `ocr_provider` | `paddleocr` | OCR recognition backend: classic PP-OCRv6 by default; `paddleocr_vl` is the optional second opinion (R1.10) |
 | Min encounters — words | 2 | Queue-entry threshold (R3.4) |
 | Min encounters — kanji | 2 | Discrimination-drill threshold (R3.7) |
 | Remedial / ghost steps | 4h / 12h / 24h | First failure 4h, second consecutive 12h, third+ 24h repeating until a pass (R3.13) |

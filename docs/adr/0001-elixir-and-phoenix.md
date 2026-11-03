@@ -119,8 +119,9 @@ if OCR ever moved in-process (on-device inference, requirement §12).
 **Smaller talent pool and fewer niche libraries.** For a single-user personal project, the cost of
 this is near zero. It would matter for a team.
 
-**One more dependency to add.** Background jobs need Oban (not yet in `mix.exs`) or a hand-rolled
-queue on `Task.Supervisor`. That is a real piece of work, not a freebie.
+**One more dependency to add.** Background jobs use Oban, which is now in `mix.exs` and configured in
+`config/config.exs` with the `Lite` engine (one configuration for SQLite in development and Postgres in
+production). That is a real piece of work, not a freebie.
 
 ---
 

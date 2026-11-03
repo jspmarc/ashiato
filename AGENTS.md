@@ -5,6 +5,23 @@ This is a web application written using the Phoenix web framework.
 - Use `mix precommit` alias when you are done with all changes and fix any pending issues
 - Use the already included and available `:req` (`Req`) library for HTTP requests, **avoid** `:httpoison`, `:tesla`, and `:httpc`. Req is included by default and is the preferred HTTP client for Phoenix apps
 
+### Code layout
+
+```
+lib/ashiato/
+  ledger.ex  srs.ex  settings.ex    contexts: the only modules that run queries
+  schemas/                          Ashiato.Schemas.*, one Ecto schema per table
+  services/                         external clients: behaviour + impl + fake, one dir each
+  repo.ex  application.ex  mailer.ex  utils.ex
+```
+
+- Schema modules are `Ashiato.Schemas.<Singular>` (`Ashiato.Schemas.Page`, not `Ashiato.Pages`) and live
+  in `lib/ashiato/schemas/`. Do not add schemas to `lib/ashiato/` root, and never under `repo/` —
+  `Ashiato.Repo` is the connection module.
+- Every external dependency (dictionary, tokenizer, OCR, translator, storage) is behind a behaviour in
+  `lib/ashiato/services/`, with a fake. Tests never call a real service.
+- `Ashiato.Settings` is the only module allowed to treat settings as key-value rows.
+
 ### Phoenix v1.8 guidelines
 
 - **Always** begin your LiveView templates with `<Layouts.app flash={@flash} ...>` which wraps all inner content

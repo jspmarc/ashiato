@@ -95,9 +95,9 @@ defmodule Ashiato.SrsTest do
       assert next.state == 1
       assert next.reps == 1
       assert next.lapses == 1
-      # S0(1) = w0; D0(1) = w4 + 2 * w5
-      assert_in_delta next.stability, 0.4872, 1.0e-12
-      assert_in_delta next.difficulty, 5.1618 + 2 * 1.2298, 1.0e-12
+      # S0(1) = w0; D0(1) = w4 - e^(w5 * 0) + 1 = w4
+      assert_in_delta next.stability, 0.212, 1.0e-12
+      assert_in_delta next.difficulty, 6.4133, 1.0e-12
       assert next.due_at == @now
       assert next.last_reviewed_at == @now
     end
@@ -109,28 +109,28 @@ defmodule Ashiato.SrsTest do
       assert next.state == 2
       assert next.reps == 1
       assert next.lapses == 0
-      # S0(2) = w1; D0(2) = w4 + w5
-      assert_in_delta next.stability, 1.4003, 1.0e-12
-      assert_in_delta next.difficulty, 5.1618 + 1.2298, 1.0e-12
-      # I(0.9, S) is S: max(1, round(1.4003)) = 1 day
+      # S0(2) = w1; D0(2) = w4 - e^w5 + 1
+      assert_in_delta next.stability, 1.2931, 1.0e-12
+      assert_in_delta next.difficulty, 5.112170705601055, 1.0e-12
+      # I(0.9, S) is S: max(1, round(1.2931)) = 1 day
       assert interval == 1
       assert next.due_at == DateTime.add(@now, 1, :day)
       assert next.last_reviewed_at == @now
     end
 
-    test "grade 3 seeds the word as review, due in four days" do
+    test "grade 3 seeds the word as review, due in two days" do
       %{state: next, interval_days: interval} =
         Srs.grade(%WordStates{word_id: 7, state: 0, due_at: @now}, 3, @now)
 
       assert next.state == 2
       assert next.reps == 1
       assert next.lapses == 0
-      # S0(3) = w2; D0(3) = w4
-      assert_in_delta next.stability, 3.7145, 1.0e-12
-      assert_in_delta next.difficulty, 5.1618, 1.0e-12
-      # I(0.9, S) is S: round(3.7145) = 4 days
-      assert interval == 4
-      assert next.due_at == DateTime.add(@now, 4, :day)
+      # S0(3) = w2; D0(3) = w4 - e^(2 * w5) + 1
+      assert_in_delta next.stability, 2.3065, 1.0e-12
+      assert_in_delta next.difficulty, 2.118103970459015, 1.0e-12
+      # I(0.9, S) is S: round(2.3065) = 2 days
+      assert interval == 2
+      assert next.due_at == DateTime.add(@now, 2, :day)
       assert next.last_reviewed_at == @now
     end
 
@@ -141,18 +141,19 @@ defmodule Ashiato.SrsTest do
       assert next.state == 2
       assert next.reps == 1
       assert next.lapses == 0
-      # S0(4) = w3; D0(4) = w4 - w5
-      assert_in_delta next.stability, 13.8206, 1.0e-12
-      assert_in_delta next.difficulty, 5.1618 - 1.2298, 1.0e-12
-      # I(0.9, S) is S: round(13.8206) = 14 days
-      assert interval == 14
-      assert next.due_at == DateTime.add(@now, 14, :day)
+      # S0(4) = w3; D0(4) = w4 - e^(3 * w5) + 1, clamped to Dmin
+      assert_in_delta next.stability, 8.2956, 1.0e-12
+      assert_in_delta next.difficulty, 1.0, 1.0e-12
+      # I(0.9, S) is S: round(8.2956) = 8 days
+      assert interval == 8
+      assert next.due_at == DateTime.add(@now, 8, :day)
       assert next.last_reviewed_at == @now
     end
 
     test "grades 2 and 3 seed review with their own S0/D0" do
-      # S0(G) = w[G-1]; D0(G) = w4 - (G - 3) * w5
-      for {grade, s0, d0} <- [{2, 1.4003, 5.1618 + 1.2298}, {3, 3.7145, 5.1618}] do
+      # S0(G) = w[G-1]; D0(G) = w4 - e^(w5 * (G - 1)) + 1
+      for {grade, s0, d0} <-
+            [{2, 1.2931, 5.112170705601055}, {3, 2.3065, 2.118103970459015}] do
         %{state: next, interval_days: interval} =
           Srs.grade(%WordStates{word_id: 7, state: 0, due_at: @now}, grade, @now)
 
@@ -193,12 +194,12 @@ defmodule Ashiato.SrsTest do
       assert next.last_reviewed_at == @now
     end
 
-    test "failing a learning word resets it to the seed values and stays in learning" do
+    test "failing a learning word applies post-lapse stability and stays in learning" do
       state = %WordStates{
         word_id: 1,
         state: 1,
-        stability: 0.4872,
-        difficulty: 7.6214,
+        stability: 0.212,
+        difficulty: 6.4133,
         reps: 1,
         lapses: 1,
         last_reviewed_at: DateTime.add(@now, -1, :day)
@@ -211,8 +212,9 @@ defmodule Ashiato.SrsTest do
       assert next.due_at == @now
       assert next.reps == 2
       assert next.lapses == 2
-      assert_in_delta next.stability, 0.4872, 1.0e-12
-      assert_in_delta next.difficulty, 7.6214, 1.0e-12
+      # FSRS-6 post-lapse stability is capped at S / e^(w17 * w18)
+      assert_in_delta next.stability, 0.10088578982099844, 1.0e-12
+      assert_in_delta next.difficulty, 8.806304468856837, 1.0e-12
     end
 
     test "failing a relearning word keeps it there with the interval reset" do
@@ -254,10 +256,28 @@ defmodule Ashiato.SrsTest do
       assert next.state == 2
       assert next.reps == 2
       assert next.lapses == 1
-      # same-moment review: R = 1, the growth term is empty and S stays
+      # same-day hard: the short-term increment is floored at 1, so S stays
       assert_in_delta next.stability, 0.4872, 1.0e-9
       assert interval == 1
       assert next.due_at == DateTime.add(@now, 1, :day)
+    end
+
+    test "a same-day good review grows stability by the short-term formula" do
+      state = %WordStates{
+        word_id: 1,
+        state: 1,
+        stability: 0.212,
+        difficulty: 6.4133,
+        reps: 1,
+        lapses: 1,
+        last_reviewed_at: @now
+      }
+
+      %{state: next, interval_days: interval} = Srs.grade(state, 3, @now)
+
+      assert next.state == 2
+      assert_in_delta next.stability, 0.24668918777567272, 1.0e-12
+      assert interval == 1
     end
 
     test "passing a relearning word returns it to review" do

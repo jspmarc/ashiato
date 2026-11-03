@@ -122,12 +122,13 @@ defmodule Ashiato.LedgerTest do
       assert state1.state == 2
       assert state1.reps == 1
       assert state1.lapses == 0
-      # S0(3) = w2, D0(3) = w4; the interval is round(3.7145) = 4 days,
-      # uncapped because the word has no confirmed encounters yet
-      assert state1.stability == 3.7145
-      assert state1.difficulty == 5.1618
+      # S0(3) = w2; D0(3) = w4 - e^(2 * w5) + 1; the interval is
+      # round(2.3065) = 2 days, uncapped because the word has no confirmed
+      # encounters yet
+      assert state1.stability == 2.3065
+      assert state1.difficulty == 2.118103970459015
       assert state1.last_reviewed_at == day1
-      assert state1.due_at == DateTime.add(day1, 4 * 86_400, :second)
+      assert state1.due_at == DateTime.add(day1, 2 * 86_400, :second)
 
       day2 = ~U[2026-11-02 12:00:00Z]
       assert {:ok, state2} = Ledger.review(word.id, 4, day2)
@@ -182,82 +183,43 @@ defmodule Ashiato.LedgerTest do
     test "the occurrence band caps the interval, never the stability", %{user: user} do
       source = source_fixture(user_id: user.id)
       day0 = ~U[2026-06-01 12:00:00Z]
-      day1 = DateTime.add(day0, 30 * 86_400, :second)
-      day2 = DateTime.add(day0, 60 * 86_400, :second)
+      day1 = DateTime.add(day0, 86_400, :second)
 
       # -- 3 confirmed encounters: the 240-day band ---------------------------
       word = word_fixture(user_id: user.id)
+      add_encounters(user, source, word, 3)
+      state = seed_word_state(word.id, day0)
 
-      for _ <- 1..3 do
-        page = page_fixture(user_id: user.id, source_id: source.id)
-        assert {:ok, _} = record(user, source, word, page, true)
-      end
+      assert {:ok, next} = Ledger.review(word.id, 4, day1)
+      %{state: expected, interval_days: uncapped} = Srs.grade(state, 4, day1)
 
-      assert {:ok, state1} = Ledger.review(word.id, 4, day0)
-
-      # S0(4) = 13.8206 days -> round(13.8206) = 14, far below the 240-day cap
-      [event1] = Repo.all(from re in ReviewEvents, where: re.word_id == ^word.id)
-      assert event1.interval_after == 14
-      assert state1.due_at == DateTime.add(day0, 14 * 86_400, :second)
-
-      # stability grows unbounded (clamped at 36500 days), so with 3
-      # encounters the 240-day band need not bind: the uncapped interval
-      # must pass through
-      assert {:ok, _state2} = Ledger.review(word.id, 4, day1)
-      %{interval_days: uncapped} = Srs.grade(state1, 4, day1)
-
-      [event2] =
-        Repo.all(
-          from re in ReviewEvents, where: re.word_id == ^word.id and re.reviewed_at == ^day1
-        )
-
-      assert event2.interval_after == uncapped
+      assert uncapped > 240
+      assert next.stability == expected.stability
+      assert next.due_at == DateTime.add(day1, 240 * 86_400, :second)
+      assert reviewed_interval(word.id, day1) == 240
 
       # -- 20 confirmed encounters: the 60-day band bites ----------------------
       heavy = word_fixture(user_id: user.id)
+      add_encounters(user, source, heavy, 20)
+      state = seed_word_state(heavy.id, day0)
 
-      for _ <- 1..20 do
-        page = page_fixture(user_id: user.id, source_id: source.id)
-        assert {:ok, _} = record(user, source, heavy, page, true)
-      end
+      assert {:ok, next} = Ledger.review(heavy.id, 4, day1)
+      %{interval_days: uncapped} = Srs.grade(state, 4, day1)
 
-      assert {:ok, _heavy1} = Ledger.review(heavy.id, 4, day0)
-      assert {:ok, _heavy2} = Ledger.review(heavy.id, 4, day1)
-      assert {:ok, heavy3} = Ledger.review(heavy.id, 4, day2)
-
-      # stability is never clamped by the cap: grows past the 60-day band,
-      # which must bite on the interval alone
-      assert_in_delta heavy3.stability, 435.7889, 0.001
-      assert heavy3.due_at == DateTime.add(day2, 60 * 86_400, :second)
-
-      [heavy_event3] =
-        Repo.all(
-          from re in ReviewEvents, where: re.word_id == ^heavy.id and re.reviewed_at == ^day2
-        )
-
-      assert heavy_event3.interval_after == 60
+      assert uncapped > 60
+      assert next.due_at == DateTime.add(day1, 60 * 86_400, :second)
+      assert reviewed_interval(heavy.id, day1) == 60
 
       # -- 1 confirmed encounter: uncapped, the FSRS interval passes through --
       single = word_fixture(user_id: user.id)
+      add_encounters(user, source, single, 1)
+      state = seed_word_state(single.id, day0)
 
-      page = page_fixture(user_id: user.id, source_id: source.id)
-      assert {:ok, _} = record(user, source, single, page, true)
+      assert {:ok, next} = Ledger.review(single.id, 4, day1)
+      %{interval_days: uncapped} = Srs.grade(state, 4, day1)
 
-      assert {:ok, _} = Ledger.review(single.id, 4, day0)
-      assert {:ok, _} = Ledger.review(single.id, 4, day1)
-      assert {:ok, single3} = Ledger.review(single.id, 4, day2)
-
-      # same review schedule as the heavy word, but no cap applies: the full
-      # FSRS interval passes through
-      assert_in_delta single3.stability, 435.7889, 0.001
-      assert single3.due_at == DateTime.add(day2, 436 * 86_400, :second)
-
-      [single_event3] =
-        Repo.all(
-          from re in ReviewEvents, where: re.word_id == ^single.id and re.reviewed_at == ^day2
-        )
-
-      assert single_event3.interval_after == 436
+      assert next.due_at == DateTime.add(day1, uncapped * 86_400, :second)
+      assert reviewed_interval(single.id, day1) == uncapped
     end
   end
 
@@ -347,6 +309,36 @@ defmodule Ashiato.LedgerTest do
 
       assert Ledger.chrome_ratio(user.id, source.id) == %{word.id => 1.0}
     end
+  end
+
+  defp add_encounters(user, source, word, count) do
+    for _ <- 1..count do
+      page = page_fixture(user_id: user.id, source_id: source.id)
+      assert {:ok, _} = record(user, source, word, page, true)
+    end
+  end
+
+  defp seed_word_state(word_id, last_reviewed_at) do
+    %WordStates{word_id: word_id}
+    |> WordStates.changeset(%{
+      state: 2,
+      stability: 1000.0,
+      difficulty: 5.0,
+      reps: 10,
+      lapses: 0,
+      due_at: last_reviewed_at,
+      last_reviewed_at: last_reviewed_at
+    })
+    |> Repo.insert!()
+  end
+
+  defp reviewed_interval(word_id, reviewed_at) do
+    [event] =
+      Repo.all(
+        from re in ReviewEvents, where: re.word_id == ^word_id and re.reviewed_at == ^reviewed_at
+      )
+
+    event.interval_after
   end
 
   # :utc_datetime and :utc_datetime_usec load back with different microsecond

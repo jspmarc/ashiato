@@ -89,7 +89,11 @@ defmodule Ashiato.StorageTest do
       :ok = Local.put("pages/1.jpg", "first")
       :ok = Local.put("pages/1.jpg", "second")
       assert {:ok, "second"} = Local.get("pages/1.jpg")
-      assert [_only] = Path.wildcard(Path.join(Path.dirname(path_for("pages/1.jpg")), "*"))
+
+      # match_dot: the atomic-write temp file is named ".ashiato-tmp-<n>", so a default
+      # wildcard would skip exactly the leftover this assertion exists to catch.
+      dir = Path.dirname(path_for("pages/1.jpg"))
+      assert [_only] = Path.wildcard(Path.join(dir, "*"), match_dot: true)
     end
 
     @tag :tmp_dir
@@ -123,5 +127,18 @@ defmodule Ashiato.StorageTest do
     end
 
     defp path_for(key), do: Path.join(Local.root(), key)
+  end
+
+  describe "Ashiato.Storage.impl/0" do
+    test "defaults to the local store" do
+      assert Storage.impl() == Storage.Local
+    end
+
+    test "follows application config, so a later S3 card swaps it by configuration" do
+      Application.put_env(:ashiato, Storage, impl: Storage.Fake)
+      on_exit(fn -> Application.delete_env(:ashiato, Storage) end)
+
+      assert Storage.impl() == Storage.Fake
+    end
   end
 end

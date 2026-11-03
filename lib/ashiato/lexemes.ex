@@ -4,8 +4,9 @@ defmodule Ashiato.Lexemes do
 
   `lemma + reading` is the word: same spelling with a different reading is a
   different word (生物 せいぶつ vs なまもの). `reading` is non-null with a `\"\"`
-  database default so the `lexemes_identity` unique index actually bites —
-  multiple NULLs would pass a unique index on both SQLite and Postgres.
+  database default so the `lexemes_lemma_reading_part_of_speech_index` unique
+  index actually bites — multiple NULLs would pass a unique index on both SQLite
+  and Postgres.
   Uniqueness is `(lemma, reading, part_of_speech)` and lives here, on the shared
   table, not per user; identity is global while everything downstream is
   per user.
@@ -13,8 +14,7 @@ defmodule Ashiato.Lexemes do
 
   use Ecto.Schema
 
-  import Ecto.Changeset,
-    only: [cast: 3, validate_required: 2, unique_constraint: 2, unique_constraint: 3]
+  import Ecto.Changeset, only: [cast: 3, validate_required: 2, unique_constraint: 2]
 
   schema "lexemes" do
     field :lemma, :string
@@ -27,7 +27,7 @@ defmodule Ashiato.Lexemes do
   @doc """
   Changeset used by `Ashiato.Ledger.find_or_create_lexeme/3`.
 
-  The `unique_constraint` declaration for `lexemes_identity` is what turns a
+  The `unique_constraint` declaration is what turns a
   lost insert race into `{:error, changeset}` instead of a raised
   `Ecto.ConstraintError`, so the ledger can fall back to fetching the row the
   concurrent caller just won.
@@ -41,8 +41,8 @@ defmodule Ashiato.Lexemes do
     # in a unique index and nil would mint a new row on every call. Callers set it
     # on the struct instead, the same way user_id is set rather than cast.
     |> validate_required([:lemma])
-    # Same dual declaration as Encounters: Postgres names the index, SQLite does not.
-    |> unique_constraint([:lemma, :reading, :part_of_speech], name: :lexemes_identity)
+    # the index keeps Ecto's default name, so this one declaration matches the
+    # name Postgres reports and the columns SQLite reports
     |> unique_constraint([:lemma, :reading, :part_of_speech])
   end
 end

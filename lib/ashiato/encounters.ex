@@ -3,8 +3,8 @@ defmodule Ashiato.Encounters do
   One sighting of a word on one page.
 
   Encounter identity is `(user_id, word_id, text_hash)` unique —
-  `one_encounter_per_word_per_page` (§6.1). A single page yields many word
-  encounters, so the page hash alone would collapse them into one. Identity
+  `encounters_user_id_word_id_text_hash_index` (§6.1). A single page yields
+  many word encounters, so the page hash alone would collapse them into one. Identity
   ignores `page_id` on purpose: two pages with identical text are one and the
   same page row, so `(user_id, word_id, text_hash)` is the same test.
 
@@ -43,9 +43,9 @@ defmodule Ashiato.Encounters do
 
   `user_id` is NOT here: fields set programmatically are never cast (AGENTS
   Ecto house rule) — the ledger assigns it on the struct. The
-  `one_encounter_per_word_per_page` unique constraint is declared so a duplicate
-  arrives as `{:error, changeset}` rather than a raise, letting the ledger
-  return the existing row.
+  `encounters_user_id_word_id_text_hash_index` unique constraint is declared so
+  a duplicate arrives as `{:error, changeset}` rather than a raise, letting the
+  ledger return the existing row.
 
   `confirmed` and `crop_store` are optional: when absent they are omitted from
   the insert, so the database defaults (`false` / `"local"`) apply.
@@ -64,12 +64,8 @@ defmodule Ashiato.Encounters do
       :discarded_at
     ])
     |> validate_required([:word_id, :page_id, :source_id, :text_hash, :crop_key, :seen_on])
-    # Two declarations, one constraint. Postgres reports the index by its custom
-    # name; ecto_sqlite3 derives a name from the columns and ignores `name:`. Without
-    # both, a duplicate raises Ecto.ConstraintError on one backend and returns
-    # {:error, changeset} on the other -- and the ledger's whole idempotency contract
-    # depends on the second behaviour.
-    |> unique_constraint([:user_id, :word_id, :text_hash], name: :one_encounter_per_word_per_page)
+    # the index keeps Ecto's default name, so this one declaration matches the
+    # name Postgres reports and the columns SQLite reports
     |> unique_constraint([:user_id, :word_id, :text_hash])
   end
 end

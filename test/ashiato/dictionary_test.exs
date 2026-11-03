@@ -52,6 +52,17 @@ defmodule Ashiato.DictionaryTest do
     assert Dictionary.Fake.version_calls() == 1
   end
 
+  test "a miss and a cache hit return the same shape" do
+    # The service may hand back atom keys; a row round-tripped through the JSON column
+    # always comes back string-keyed. Wave 3 must not have to care which call it made.
+    start_supervised!({Dictionary.Fake, version: "2026-1", entries: %{"食べる" => %{gloss: "eat"}}})
+
+    assert {:ok, first} = Dictionary.lookup("食べる")
+    assert {:ok, second} = Dictionary.lookup("食べる")
+    assert first == second
+    assert Map.has_key?(first, "gloss")
+  end
+
   test "a term that is not valid UTF-8 is refused before any request" do
     start_supervised!({Dictionary.Fake, version: "2026-1", entries: %{}})
 

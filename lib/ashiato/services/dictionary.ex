@@ -46,7 +46,6 @@ defmodule Ashiato.Dictionary do
   # enough that a page's worth of lookups asks once, short enough that a JMdict release is
   # picked up without a restart.
   @version_ttl_ms 300_000
-  @version_key {__MODULE__, :dict_version}
 
   @callback lookup(term :: String.t()) :: {:ok, entry()} | {:error, term()}
   @callback lookup_many(terms :: [String.t()]) ::
@@ -85,7 +84,11 @@ defmodule Ashiato.Dictionary do
         nil ->
           case impl.lookup(term) do
             {:ok, entry} ->
-              with {:ok, _row} <- cache_entry(kind, term, dict_version, entry), do: {:ok, entry}
+              entry = normalise(entry)
+              # A cache write failure must not fail a lookup the service just answered: the
+              # next call simply misses again.
+              _ = cache_entry(kind, term, dict_version, entry)
+              {:ok, entry}
 
             {:error, reason} ->
               {:error, reason}
@@ -114,14 +117,15 @@ defmodule Ashiato.Dictionary do
 
       case fetched do
         {:ok, entries} ->
-          entries
-          |> Enum.reduce_while({:ok, %{}}, fn {term, entry}, {:ok, acc} ->
-            case cache_entry(kind_for(term), term, dict_version, entry) do
-              {:ok, _row} -> {:cont, {:ok, Map.put(acc, term, entry)}}
-              {:error, changeset} -> {:halt, {:error, changeset}}
-            end
-          end)
-          |> merge_with(cached)
+          fresh =
+            Map.new(entries, fn {term, entry} ->
+              entry = normalise(entry)
+              # Same rule as lookup/1: a failed cache write must not fail the batch.
+              _ = cache_entry(kind_for(term), term, dict_version, entry)
+              {term, entry}
+            end)
+
+          {:ok, Map.merge(cached, fresh)}
 
         {:error, reason} ->
           {:error, reason}
@@ -145,21 +149,28 @@ defmodule Ashiato.Dictionary do
   def current_version(impl) do
     now = System.monotonic_time(:millisecond)
 
-    case :persistent_term.get(@version_key, nil) do
+    key = version_key(impl)
+
+    case :persistent_term.get(key, nil) do
       {version, fetched_at} when now - fetched_at < @version_ttl_ms ->
         {:ok, version}
 
       memo ->
         case impl.dict_version() do
           {:ok, version} ->
-            :persistent_term.put(@version_key, {version, now})
+            :persistent_term.put(key, {version, now})
             {:ok, version}
 
           error ->
-            # stale-but-usable beats unavailable: the cache still serves what it has
+            # Stale-but-usable beats unavailable, and the memo's timestamp is refreshed so
+            # an outage costs one failed version call per TTL, not one per lookup.
             case memo do
-              {version, _fetched_at} -> {:ok, version}
-              nil -> error
+              {version, _fetched_at} ->
+                :persistent_term.put(key, {version, now})
+                {:ok, version}
+
+              nil ->
+                error
             end
         end
     end
@@ -172,9 +183,13 @@ defmodule Ashiato.Dictionary do
   """
   @spec forget_version() :: :ok
   def forget_version do
-    :persistent_term.erase(@version_key)
+    :persistent_term.erase(version_key(service()))
     :ok
   end
+
+  # Keyed by implementation: a fake version set by one test must not leak into the next
+  # through the VM-wide persistent_term store.
+  defp version_key(impl), do: {__MODULE__, impl, :dict_version}
 
   # A term reaches this module from OCR and tokenizer output, so it can carry bytes that are
   # not valid UTF-8. Jason would raise while encoding the request body, breaking the
@@ -195,6 +210,14 @@ defmodule Ashiato.Dictionary do
 
   # kind is half of the cache identity, so deriving it from the term (one
   # codepoint → KANJIDIC2 shape, otherwise JMdict) keeps the key deterministic.
+  # A fresh entry comes back with atom or string keys depending on the service; a cached
+  # one always comes back from the JSON column string-keyed. Wave 3 must see one shape, so
+  # the service's entry is normalised before it is both cached and returned.
+  @spec normalise(entry()) :: entry()
+  defp normalise(entry) when is_map(entry) do
+    entry |> Jason.encode!() |> Jason.decode!()
+  end
+
   @spec kind_for(String.t()) :: :word | :kanji
   defp kind_for(term) do
     if Utils.cjk_codepoint?(term), do: :kanji, else: :word
@@ -243,9 +266,4 @@ defmodule Ashiato.Dictionary do
         end
     end
   end
-
-  @spec merge_with({:ok, %{String.t() => entry()}} | {:error, term()}, %{String.t() => entry()}) ::
-          {:ok, %{String.t() => entry()}} | {:error, term()}
-  defp merge_with({:ok, fresh}, cached), do: {:ok, Map.merge(cached, fresh)}
-  defp merge_with({:error, reason}, _cached), do: {:error, reason}
 end

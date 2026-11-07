@@ -13,6 +13,9 @@ defmodule Ashiato.Storage.Local do
   `tmp/`:
 
       config :ashiato, Ashiato.Storage, root: "/path/to/volume/images"
+
+  A symlink created between validation and the filesystem operation is not
+  detected: a residual TOCTOU race remains.
   """
 
   @behaviour Ashiato.Storage
@@ -37,7 +40,8 @@ defmodule Ashiato.Storage.Local do
   @spec put(String.t(), binary()) :: :ok | {:error, term()}
   def put(key, binary) do
     with {:ok, path} <- resolve(key),
-         :ok <- File.mkdir_p(Path.dirname(path)) do
+         :ok <- File.mkdir_p(Path.dirname(path)),
+         {:ok, path} <- resolve(key) do
       write_atomically(path, binary)
     end
   end
@@ -115,16 +119,47 @@ defmodule Ashiato.Storage.Local do
     |> Kernel.==(:symlink)
   end
 
-  defp write_atomically(path, binary) do
-    # same directory as the target so the rename never crosses a filesystem
-    tmp = Path.join(Path.dirname(path), ".ashiato-tmp-#{:erlang.unique_integer([:positive])}")
+  defp write_atomically(path, binary), do: write_temp(path, binary, 10)
 
-    with :ok <- File.write(tmp, binary),
-         :ok <- File.rename(tmp, path) do
-      :ok
-    else
+  defp write_temp(_path, _binary, 0), do: {:error, :eexist}
+
+  defp write_temp(path, binary, retries) do
+    suffix = :crypto.strong_rand_bytes(8) |> Base.url_encode64(padding: false)
+    tmp = Path.join(Path.dirname(path), ".ashiato-tmp-" <> suffix)
+
+    case :file.open(tmp, [:write, :exclusive, :binary, :raw]) do
+      {:ok, fd} ->
+        case write_and_close(fd, binary) do
+          :ok ->
+            case File.rename(tmp, path) do
+              :ok ->
+                :ok
+
+              {:error, reason} ->
+                File.rm(tmp)
+                {:error, reason}
+            end
+
+          {:error, reason} ->
+            File.rm(tmp)
+            {:error, reason}
+        end
+
+      {:error, :eexist} ->
+        write_temp(path, binary, retries - 1)
+
       {:error, reason} ->
-        File.rm(tmp)
+        {:error, reason}
+    end
+  end
+
+  defp write_and_close(fd, binary) do
+    case :file.write(fd, binary) do
+      :ok ->
+        :file.close(fd)
+
+      {:error, reason} ->
+        :file.close(fd)
         {:error, reason}
     end
   end

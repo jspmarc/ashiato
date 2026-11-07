@@ -16,7 +16,7 @@ defmodule Ashiato.Tokenizer do
   * `:lemma` — dictionary form, orthography preserved; kanji are derived from it, so a normalised
     kana lemma would credit characters the reader never saw (§6.1)
   * `:reading` — pronunciation, normalised to hiragana by the client
-    (`Ashiato.Tokenizer.Http.to_hiragana/1`); it is half the lexeme identity
+    (`Ashiato.Utils.to_hiragana/1`); it is half the lexeme identity
   * `:part_of_speech` — POS as reported by the tokenizer
   """
   @type token :: %{
@@ -27,7 +27,7 @@ defmodule Ashiato.Tokenizer do
         }
 
   @doc """
-  Tokenizes `text` into `t:token/1` maps.
+  Tokenizes `text` into `t:token/0` maps.
 
   The service emits katakana readings; the client normalises them to hiragana, because an
   unconverted reading would mint a second lexeme for a word the ledger already knows.

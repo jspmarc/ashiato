@@ -15,7 +15,7 @@ defmodule Ashiato.Tokenizer.Fake do
 
   ## Options
 
-    * `:tokens` — canned `t:Ashiato.Tokenizer.token/1` maps returned verbatim by `tokenize/1`
+    * `:tokens` — canned `t:Ashiato.Tokenizer.token/0` maps returned verbatim by `tokenize/1`
       (default `[]`)
     * `:error` — when set, `tokenize/1` returns `{:error, reason}` with it instead of the canned
       tokens

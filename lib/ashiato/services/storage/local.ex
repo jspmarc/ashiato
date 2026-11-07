@@ -17,9 +17,8 @@ defmodule Ashiato.Storage.Local do
 
   @doc """
   The configured root directory, read lazily so tests can point it at a
-  per-test directory. No config file sets it yet: until a deploy sets
-  `:ashiato, Ashiato.Storage, root: ...`, the default is `tmp/storage` under
-  the current working directory.
+  per-test directory. Production sets it from `STORAGE_ROOT`; without config
+  it defaults to `tmp/storage` under the current working directory.
   """
   @spec root() :: String.t()
   def root do

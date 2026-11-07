@@ -3,10 +3,10 @@ defmodule Ashiato.SettingsTest do
   The settings boundary: typed JSON values in and out, secrets encrypted at
   rest and never logged, `(user_id, key)` upserts that never raise, and the
   capability gates that hide AI/translation affordances until both the switch
-  and the credentials hold (D43, §7.5).
+  and the credentials hold.
 
   The gate tests drive the behaviour through the fake; the storage tests pin
-  the repo-backed semantics the contract names.
+  the repo-backed semantics.
   """
 
   use Ashiato.DataCase, async: false
@@ -54,7 +54,7 @@ defmodule Ashiato.SettingsTest do
       assert Repo.get_by!(Setting, user_id: user.id, key: "OPENAI_API_KEY").secret
     end
 
-    test "missing rows fall back to the requirement defaults", %{user: user} do
+    test "missing rows fall back to the built-in defaults", %{user: user} do
       assert Settings.get(user.id, "ai_features_enabled") == false
       assert Settings.get(user.id, "translation_enabled") == false
       assert Settings.get(user.id, "translation_provider") == "google_free"

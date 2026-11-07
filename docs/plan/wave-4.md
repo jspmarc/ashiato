@@ -71,7 +71,7 @@ reasoning (the review session does).
 
 - Choose the translation provider from all of them, toggle translation, toggle AI features, and enter
   each provider's credentials (R7.4).
-- Each provider displays its readiness: *ready*, *needs an API key*, *needs a URL*. A misconfiguration
+- Each provider displays its readiness: *ready* or *needs an API key*. A misconfiguration
   should be visible here rather than as a failed page twenty minutes later.
 - No provider is privileged; `google_free` is only the initial value.
 - Writes go through `Ashiato.Settings` (W2-6) — never to the table directly, so secrets stay encrypted.

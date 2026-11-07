@@ -14,14 +14,13 @@ defmodule Ashiato.Translator do
       `"auto"`, which every provider either supports natively or omits.
     * `:target_lang` — ISO code of the target language, e.g. `"en"`. Required;
       without it providers return `{:error, :missing_target_lang}`.
-    * `:api_key` — credential for `deepl` and `google_cloud`, optional for
-      `libretranslate`. Passed in by the settings context; never logged.
-    * `:base_url` — self-hosted instance root for `libretranslate`.
+    * `:api_key` — credential for `deepl` and `google_cloud`. Passed in by the
+      settings context; never logged.
     * `:model` — model name for `llm`; see `Ashiato.Translator.Llm`.
 
   Known providers, selectable as `config :ashiato, Ashiato.Translator, provider: ...`
-  by atom: `:google_free` (default), `:llm`, `:deepl`, `:google_cloud`,
-  `:libretranslate`, `:off` — or directly as a module.
+  by atom: `:google_free` (default), `:llm`, `:deepl`, `:google_cloud`, `:off` — or
+  directly as a module.
 
   **No caching in this module.** Nothing here logs the text being translated or any
   credential, and an unconfigured provider returns `{:error, :not_configured}`
@@ -40,7 +39,6 @@ defmodule Ashiato.Translator do
     "llm" => Ashiato.Translator.Llm,
     "deepl" => Ashiato.Translator.Deepl,
     "google_cloud" => Ashiato.Translator.GoogleCloud,
-    "libretranslate" => Ashiato.Translator.LibreTranslate,
     "off" => Ashiato.Translator.Off
   }
 

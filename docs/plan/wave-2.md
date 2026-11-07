@@ -120,7 +120,7 @@ application config so later waves depend on the behaviour and never on a concret
 ```
 
 - One request per page, so cross-line context survives. Providers: `google_free` (default), `llm`,
-  `deepl`, `google_cloud`, `libretranslate`, `off`.
+  `deepl`, `google_cloud`, `off`.
 - The `llm` provider asks for a **JSON array** of strings and falls back to per-line when the array does
   not parse. NMT providers return line-aligned text directly. **If the returned line count differs from
   the input, fall back to per-line.**

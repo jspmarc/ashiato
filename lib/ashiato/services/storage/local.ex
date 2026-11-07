@@ -1,13 +1,11 @@
 defmodule Ashiato.Storage.Local do
   @moduledoc """
-  Filesystem-backed `Ashiato.Storage`: a shared-volume directory.
+  Filesystem-backed `Ashiato.Storage`.
 
-  The OCR client's `{:path, ...}` locator and the `{:url, ...}` locator both
-  work here because the pod's containers mount the same volume — see §7.3 of
-  `docs/requirements.md`.
-
-  Writes land via rename from a same-directory temporary file, so a reader can
-  never observe a half-written image (rename within a filesystem is atomic).
+  An object is a file under `root`; a key is validated and joined under it.
+  Writes land via rename from a same-directory temporary file, so a reader sees
+  either the previous object or the new one, never a partial file (rename within
+  a filesystem is atomic).
 
   The root is application config, defaulting inside the already-gitignored
   `tmp/`:
@@ -39,9 +37,11 @@ defmodule Ashiato.Storage.Local do
   """
   @spec put(String.t(), binary()) :: :ok | {:error, term()}
   def put(key, binary) do
-    with {:ok, path} <- resolve(key),
+    with {:ok, path} <- resolve_key(key),
          :ok <- File.mkdir_p(Path.dirname(path)),
-         {:ok, path} <- resolve(key) do
+         # re-check: mkdir_p may have created parents under a symlink that
+         # appeared since the first check
+         {:ok, path} <- resolve_key(key) do
       write_atomically(path, binary)
     end
   end
@@ -50,22 +50,21 @@ defmodule Ashiato.Storage.Local do
   @doc "Reads the object at `key`; a missing key is an error tuple, not a raise."
   @spec get(String.t()) :: {:ok, binary()} | {:error, term()}
   def get(key) do
-    with {:ok, path} <- resolve(key) do
+    with {:ok, path} <- resolve_key(key) do
       File.read(path)
     end
   end
 
   @doc """
-  Returns a `file://` URL the OCR locator can carry.
+  Returns a `file://` URL for `key`.
 
-  This is **not a real pre-signature** — a local file needs no authorisation —
-  but it keeps the `presigned_get` contract identical for the later S3 store.
+  This is **not a real pre-signature**: a local file needs no authorisation.
   `ttl_seconds` is part of the shared contract and is deliberately ignored.
   """
   @impl true
   @spec presigned_get(String.t(), pos_integer()) :: {:ok, String.t()} | {:error, term()}
   def presigned_get(key, _ttl_seconds) do
-    with {:ok, path} <- resolve(key) do
+    with {:ok, path} <- resolve_key(key) do
       {:ok, "file://" <> path}
     end
   end
@@ -74,7 +73,7 @@ defmodule Ashiato.Storage.Local do
   @doc "Deletes the object at `key`. Idempotent: an absent key is `:ok`."
   @spec delete(String.t()) :: :ok | {:error, term()}
   def delete(key) do
-    with {:ok, path} <- resolve(key) do
+    with {:ok, path} <- resolve_key(key) do
       case File.rm(path) do
         :ok -> :ok
         # absent keys are already deleted: delete stays idempotent
@@ -84,7 +83,7 @@ defmodule Ashiato.Storage.Local do
     end
   end
 
-  defp resolve(key) do
+  defp resolve_key(key) do
     if Ashiato.Storage.valid_key?(key) do
       root = Path.expand(root())
       path = Path.expand(Path.join(root, key))
@@ -119,11 +118,15 @@ defmodule Ashiato.Storage.Local do
     |> Kernel.==(:symlink)
   end
 
-  defp write_atomically(path, binary), do: write_temp(path, binary, 10)
+  # A reader must never see a partial object: write to an exclusive temp file in
+  # the target directory, then rename it over the key. The random name is opened
+  # exclusively so neither a stale temp file nor a real key with that name is
+  # truncated; a collision retries with a fresh name a bounded number of times.
+  defp write_atomically(path, binary, retries \\ 10)
 
-  defp write_temp(_path, _binary, 0), do: {:error, :eexist}
+  defp write_atomically(_path, _binary, 0), do: {:error, :eexist}
 
-  defp write_temp(path, binary, retries) do
+  defp write_atomically(path, binary, retries) do
     suffix = :crypto.strong_rand_bytes(8) |> Base.url_encode64(padding: false)
     tmp = Path.join(Path.dirname(path), ".ashiato-tmp-" <> suffix)
 
@@ -146,7 +149,7 @@ defmodule Ashiato.Storage.Local do
         end
 
       {:error, :eexist} ->
-        write_temp(path, binary, retries - 1)
+        write_atomically(path, binary, retries - 1)
 
       {:error, reason} ->
         {:error, reason}

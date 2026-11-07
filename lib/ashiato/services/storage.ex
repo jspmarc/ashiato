@@ -2,12 +2,10 @@ defmodule Ashiato.Storage do
   @moduledoc """
   Behaviour for binary object storage (page images, line crops).
 
-  D29: the app and the OCR service must not assume they share a filesystem, so
-  all access goes through this behaviour and is swappable by config. A key is
-  an **object key**, never a filesystem path — `Ashiato.Schemas.Page.image_key`
-  stores exactly such a key. The validation here is the only defence between
-  an OCR-supplied locator and the filesystem, so it rejects anything that could
-  resolve outside the store's root rather than sanitising it.
+  All access goes through the configured implementation. A key is an **object
+  key**, never a filesystem path: the local store joins it under its root.
+  `valid_key?/1` rejects keys that could resolve outside the root rather than
+  sanitising them.
   """
 
   @callback put(key :: String.t(), binary()) :: :ok | {:error, term()}
@@ -32,14 +30,16 @@ defmodule Ashiato.Storage do
   @doc """
   Whether `key` is an acceptable object key.
 
-  Rejects the empty key, anything containing `..`, a leading `/`, or a null
-  byte — the shapes a path-traversal attempt takes — and callers resolve the
-  remainder against the root so nothing can land outside it even if a check
-  here is ever loosened.
+  `Path` has no realpath or containment predicate, so this is a cheap lexical
+  prefilter: the key must be relative and carry no `..` segment and no null
+  byte. A store still resolves the key against its root and rejects anything
+  that escapes it.
   """
   @spec valid_key?(String.t()) :: boolean()
   def valid_key?(key) when is_binary(key) and byte_size(key) > 0 do
-    not String.contains?(key, ["..", "\0"]) and not String.starts_with?(key, "/")
+    Path.type(key) == :relative and
+      not Enum.member?(Path.split(key), "..") and
+      not String.contains?(key, "\0")
   end
 
   def valid_key?(_), do: false

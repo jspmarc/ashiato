@@ -1,16 +1,14 @@
 defmodule Ashiato.StorageTest do
   @moduledoc """
-  The storage behaviour is swappable (D29) and its key validation is the only
-  defence between an OCR-supplied locator and the filesystem, so the tests pin:
+  Pins the storage behaviour through the fake, and `Ashiato.Storage.Local`
+  against a per-test directory:
 
-    * the fake as the behaviour in isolation — round trip, recorded calls,
-      idempotent delete — exactly the surface later waves will depend on
-    * `Ashiato.Storage.Local` against a per-test directory: the atomic
-      put/get/delete round trip, the `file://` pre-signature, and traversal
-      keys rejected with nothing written outside the root
+    * the fake in isolation — round trip, recorded calls, idempotent delete
+    * `Local` put/get/delete round trip, the `file://` URL, and traversal keys
+      rejected with nothing written outside the root
 
   Each test roots `Local` at its own `tmp_dir` through application env, so no
-  test ever touches the default `tmp/storage` or another test's files.
+  test touches the default `tmp/storage` or another test's files.
   """
 
   use ExUnit.Case, async: false
@@ -52,7 +50,7 @@ defmodule Ashiato.StorageTest do
              ] = Fake.calls()
     end
 
-    test "presigned_get hands back a locator the OCR fake can carry" do
+    test "presigned_get hands back a fake:// URL marker" do
       Fake.put("pages/1.jpg", <<1>>)
       assert {:ok, "fake://pages/1.jpg"} = Fake.presigned_get("pages/1.jpg", 300)
     end

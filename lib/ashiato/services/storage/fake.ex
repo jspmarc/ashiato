@@ -54,8 +54,7 @@ defmodule Ashiato.Storage.Fake do
   end
 
   @doc """
-  Same contract as the real store's pre-signature, but the URL is a marker the
-  OCR fake can consume; there is no filesystem to point at.
+  Returns a `fake://` marker URL; there is no filesystem to point at.
   """
   @impl true
   @spec presigned_get(String.t(), pos_integer()) :: {:ok, String.t()} | {:error, term()}
@@ -67,7 +66,7 @@ defmodule Ashiato.Storage.Fake do
   end
 
   @impl true
-  @doc "Deletes a key. Idempotent, so wave-3 tests can call it twice."
+  @doc "Deletes a key. Idempotent: deleting an absent key returns `:ok`."
   @spec delete(String.t()) :: :ok | {:error, term()}
   def delete(key) do
     with :ok <- check(key) do

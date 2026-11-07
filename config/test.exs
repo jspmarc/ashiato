@@ -23,6 +23,9 @@ config :ashiato, AshiatoWeb.Endpoint,
 # In test we don't send emails
 config :ashiato, Ashiato.Mailer, adapter: Swoosh.Adapters.Test
 
+# Never let a test reach the real tokenizer service
+config :ashiato, Ashiato.Tokenizer, impl: Ashiato.Tokenizer.Fake
+
 # Disable swoosh api client as it is only required for production adapters
 config :swoosh, :api_client, false
 

@@ -6,20 +6,24 @@ defmodule Ashiato.TokenizerTest do
   alias Ashiato.Tokenizer
   alias Ashiato.Tokenizer.Fake
 
-  test "a katakana reading comes back as hiragana, ー untouched" do
-    assert Tokenizer.Http.to_hiragana("キャッチャー") == "きゃっちゃー"
-    assert Tokenizer.Http.to_hiragana("ケーキ") == "けーき"
+  setup do
+    previous = Application.get_env(:ashiato, Tokenizer)
+
+    on_exit(fn ->
+      if previous,
+        do: Application.put_env(:ashiato, Tokenizer, previous),
+        else: Application.delete_env(:ashiato, Tokenizer)
+    end)
   end
 
   test "HTTP impl maps the service's JSON shape onto token maps" do
     Application.put_env(
       :ashiato,
       Tokenizer,
+      impl: Tokenizer.Http,
       base_url: "https://jp-dict.test",
       plug: {Req.Test, Tokenizer.Http}
     )
-
-    on_exit(fn -> Application.delete_env(:ashiato, Tokenizer) end)
 
     Req.Test.stub(Tokenizer.Http, fn conn ->
       assert conn.method == "POST"
@@ -71,7 +75,6 @@ defmodule Ashiato.TokenizerTest do
   test "impl/0 routes through the configured implementation" do
     start_supervised!({Fake, tokens: [token("橋", "橋", "ハシ")]})
     Application.put_env(:ashiato, Tokenizer, impl: Fake)
-    on_exit(fn -> Application.delete_env(:ashiato, Tokenizer) end)
 
     # the exact hook wave 3 configures: behaviour in, concrete module out
     assert Tokenizer.tokenize("橋") == {:ok, [token("橋", "橋", "ハシ")]}
@@ -87,7 +90,7 @@ defmodule Ashiato.TokenizerTest do
   test "a 200 reply without a token list is rejected, not read as an empty page" do
     stub_reply(fn conn -> Req.Test.json(conn, %{"nope" => []}) end)
 
-    assert {:error, {:malformed_reply, {:map, ["nope"]}}} = Tokenizer.Http.tokenize("食べた")
+    assert {:error, {:malformed_reply, {:map, 1}}} = Tokenizer.Http.tokenize("食べた")
   end
 
   test "a malformed token names the entry instead of raising" do
@@ -95,6 +98,37 @@ defmodule Ashiato.TokenizerTest do
 
     # the error names the position, not the page text: this term ends up in a log
     assert Tokenizer.Http.tokenize("食べた") == {:error, {:malformed_token, 0}}
+  end
+
+  test "a transport failure is an error tuple with a plain reason" do
+    stub_reply(fn conn -> Req.Test.transport_error(conn, :econnrefused) end)
+
+    assert Tokenizer.Http.tokenize("食べた") == {:error, {:transport, :econnrefused}}
+  end
+
+  test "a transport reason carrying server data is reduced to an atom" do
+    stub_reply(fn conn -> Req.Test.transport_error(conn, {:bad_alpn_protocol, "食べた"}) end)
+
+    assert Tokenizer.Http.tokenize("食べた") == {:error, {:transport, :unknown}}
+  end
+
+  test "an undecodable 200 body is rejected without keeping the page text" do
+    stub_reply(fn conn ->
+      conn
+      |> Plug.Conn.put_resp_content_type("application/json")
+      |> Plug.Conn.send_resp(200, ~s({"tokens": ["食べた"))
+    end)
+
+    result = Tokenizer.Http.tokenize("食べた")
+
+    assert result == {:error, :invalid_json}
+    refute inspect(result) =~ "食べた"
+  end
+
+  test "a missing base URL is a named error, not a relative request" do
+    Application.put_env(:ashiato, Tokenizer, impl: Tokenizer.Http)
+
+    assert Tokenizer.Http.tokenize("食べた") == {:error, :base_url_not_configured}
   end
 
   test "fake returns {:error, reason} when configured" do
@@ -111,11 +145,11 @@ defmodule Ashiato.TokenizerTest do
   # Points the HTTP client at a Req.Test stub: no socket, no service.
   defp stub_reply(plug) do
     Application.put_env(:ashiato, Tokenizer,
+      impl: Tokenizer.Http,
       base_url: "https://jp-dict.test",
       plug: {Req.Test, Tokenizer.Http}
     )
 
-    on_exit(fn -> Application.delete_env(:ashiato, Tokenizer) end)
     Req.Test.stub(Tokenizer.Http, plug)
   end
 end

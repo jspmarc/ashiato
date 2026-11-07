@@ -35,6 +35,8 @@ problem this app does not have.
 ## 2. Non-goals (v1)
 
 - Multi-user (not planned; schema prepared for it, see §1.1), accounts, sharing, social features
+- Per-user translation provider selection; the provider and its credentials are server-wide for now
+  (§7.5)
 - **Standard JLPT-level decks for introduction.** Planned, not in v1: introducing cards from a
   canned N5–N1 ordering instead of only from your own encounters. The ledger stays the default source
   of truth for what gets studied; a standard deck is an opt-in shortcut, not a replacement.
@@ -874,6 +876,10 @@ translate_capable = translation_enabled AND provider_configured(translation_prov
 
 Where `provider_configured` means the key that provider needs is present. No `translation_enabled`
 switch means no translate affordance anywhere in the UI — hidden, not failing.
+
+**Per-user provider selection is out of scope for now.** The provider and its credentials are
+server-wide. Settings rows are per-user (D47), so multi-user can add per-user selection later without
+a migration; until then every user on the same server shares the selected provider.
 
 ---
 

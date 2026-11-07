@@ -22,13 +22,13 @@ defmodule Ashiato.Settings.Fake do
   end
 
   @impl true
-  @doc "Reads a stored value, or `default` when the key was never written."
+  @doc "Reads a stored value, or falls back to requirement defaults then `default`."
   @spec get(integer(), String.t(), term()) :: term()
   def get(user_id, key, default) do
     Agent.get(__MODULE__, fn store ->
       case Map.fetch(store, {user_id, key}) do
         {:ok, {value, _secret?}} -> value
-        :error -> default
+        :error -> Map.get(Ashiato.Settings.defaults(), key, default)
       end
     end)
   end
@@ -38,12 +38,20 @@ defmodule Ashiato.Settings.Fake do
   Stores a decoded value and returns a `Ashiato.Schemas.Setting` shaped like the real
   store's reply, so a caller asserting on the returned row sees the value it wrote.
   """
-  @spec put(integer(), String.t(), term(), keyword()) :: {:ok, Setting.t()}
+  @spec put(integer(), String.t(), term(), keyword()) ::
+          {:ok, Setting.t()} | {:error, :not_encodable}
   def put(user_id, key, value, opts) do
     secret? = Keyword.get(opts, :secret, false)
-    Agent.update(__MODULE__, &Map.put(&1, {user_id, key}, {value, secret?}))
 
-    {:ok, %Setting{user_id: user_id, key: key, value: Jason.encode!(value), secret: secret?}}
+    case Jason.encode(value) do
+      {:ok, json} ->
+        decoded = Jason.decode!(json)
+        Agent.update(__MODULE__, &Map.put(&1, {user_id, key}, {decoded, secret?}))
+        {:ok, %Setting{user_id: user_id, key: key, value: json, secret: secret?}}
+
+      {:error, _reason} ->
+        {:error, :not_encodable}
+    end
   end
 
   @impl true

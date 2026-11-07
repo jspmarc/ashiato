@@ -35,6 +35,8 @@ problem this app does not have.
 ## 2. Non-goals (v1)
 
 - Multi-user (not planned; schema prepared for it, see §1.1), accounts, sharing, social features
+- Per-user translation provider selection; the provider and its credentials are server-wide for now
+  (§7.5)
 - **Standard JLPT-level decks for introduction.** Planned, not in v1: introducing cards from a
   canned N5–N1 ordering instead of only from your own encounters. The ledger stays the default source
   of truth for what gets studied; a standard deck is an opt-in shortcut, not a replacement.
@@ -832,7 +834,6 @@ for a personal toy; a poor foundation for something shipped.
 | `llm` | OpenAI-compatible key or a local server | Best with page context | The only provider that can use surrounding lines, speaker, and register |
 | `deepl` | DeepL API key (free tier exists) | Strongest on prose | Weakest on slang and casual game dialogue |
 | `google_cloud` | Cloud Translation key (paid) | Same engine, supported contract | The official API — use this if you need reliability you can depend on |
-| `libretranslate` | None; self-hosted URL | Weakest | Fully offline. Japanese is supported (ja↔en Argos models, ~112 MB) but it is a small NMT model |
 | `off` | — | — | Disables translation entirely |
 
 **Default provider is `google_free`**, because it is the only one that works on a fresh install with no
@@ -854,7 +855,7 @@ Three caveats that are not optional to state:
 **Every provider is equally available and the user picks.** `google_free` is only the *initial* value, so a
 fresh install has something working; it is not privileged. Selection, the enable switch, and each
 provider's credentials are all editable in the app's Settings screen, and each provider shows whether it
-is ready — "needs an API key", "needs a URL", "ready" — so a misconfiguration is visible before a page
+is ready — "needs an API key" or "ready" — so a misconfiguration is visible before a page
 fails.
 
 Credentials entered in the UI are stored in `settings` with `secret = true`, encrypted at rest using a key
@@ -873,8 +874,12 @@ Capability, computed at boot alongside the AI gate:
 translate_capable = translation_enabled AND provider_configured(translation_provider)
 ```
 
-Where `provider_configured` means the key or URL that provider needs is present. No `translation_enabled`
+Where `provider_configured` means the key that provider needs is present. No `translation_enabled`
 switch means no translate affordance anywhere in the UI — hidden, not failing.
+
+**Per-user provider selection is out of scope for now.** The provider and its credentials are
+server-wide. Settings rows are per-user (D47), so multi-user can add per-user selection later without
+a migration; until then every user on the same server shares the selected provider.
 
 ---
 
@@ -884,10 +889,9 @@ switch means no translate affordance anywhere in the UI — hidden, not failing.
 |---|---|---|
 | `ai_features_enabled` | `false` | The switch for mnemonics and example sentences. Does not imply credentials exist |
 | `translation_enabled` | `false` | UI-editable. Off by default so nothing is sent off-host until opted in |
-| `translation_provider` | `google_free` | UI-editable. `google_free`, `llm`, `deepl`, `google_cloud`, `libretranslate`, `off` |
+| `translation_provider` | `google_free` | UI-editable. `google_free`, `llm`, `deepl`, `google_cloud`, `off` |
 | `deepl_api_key` | unset | Only read for the `deepl` provider |
 | `google_cloud_api_key` | unset | Only read for the `google_cloud` provider |
-| `libretranslate_url` | unset | Only read for the `libretranslate` provider; the key is optional (self-hosted) |
 | `OPENAI_BASE_URL` | `https://api.openai.com/v1` | Any OpenAI-compatible endpoint: llama.cpp, vLLM, proxy |
 | `OPENAI_API_KEY` | unset | Credentials only. No default; empty means AI features are unavailable |
 | `JP_DICT_API_URL` | — | Dictionary service |

@@ -2,7 +2,7 @@
 
 Read `AGENTS.md` first; it wins over anything here.
 
-**Depends on:** all of `wave-2.md` (the six clients) and on Wave 1's ledger functions
+**Depends on:** all of `wave-2.md` (the six clients), `wave-2.5.md` (shared HTTP transport), and on Wave 1's ledger functions
 (`find_or_create_lexeme/3`, `record_encounter/1`, `chrome_ratio/2`). Do not start this card until both
 exist — the pipeline has nothing to call otherwise.
 

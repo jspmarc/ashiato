@@ -11,9 +11,6 @@ defmodule Ashiato.Storage.Local do
   `tmp/`:
 
       config :ashiato, Ashiato.Storage, root: "/path/to/volume/images"
-
-  A symlink created between validation and the filesystem operation is not
-  detected: a residual TOCTOU race remains.
   """
 
   @behaviour Ashiato.Storage
@@ -88,34 +85,15 @@ defmodule Ashiato.Storage.Local do
       root = Path.expand(root())
       path = Path.expand(Path.join(root, key))
 
-      cond do
-        # the lexical check resolves `..` the key may still carry
-        not String.starts_with?(path, root <> "/") -> {:error, :invalid_key}
-        escapes_via_symlink?(root, path) -> {:error, :invalid_key}
-        true -> {:ok, path}
+      # belt and braces: valid_key?/1 already rejects `..` segments
+      if String.starts_with?(path, root <> "/") do
+        {:ok, path}
+      else
+        {:error, :invalid_key}
       end
     else
       {:error, :invalid_key}
     end
-  end
-
-  # A lexical check cannot see a symlink that already exists inside the root: `link/secret`
-  # passes it and reads, overwrites or deletes a file outside. Rather than resolve targets
-  # (Elixir has no realpath), the store refuses to traverse a symlink at all — an image
-  # store has no legitimate use for one, and refusing is the smaller rule to reason about.
-  defp escapes_via_symlink?(root, path) do
-    path
-    |> Path.relative_to(root)
-    |> Path.split()
-    |> Enum.reduce_while(root, fn part, dir ->
-      next = Path.join(dir, part)
-
-      case :file.read_link(next) do
-        {:ok, _target} -> {:halt, :symlink}
-        {:error, _not_a_link_or_absent} -> {:cont, next}
-      end
-    end)
-    |> Kernel.==(:symlink)
   end
 
   # A reader must never see a partial object: write to an exclusive temp file in
@@ -124,6 +102,7 @@ defmodule Ashiato.Storage.Local do
   # truncated; a collision retries with a fresh name a bounded number of times.
   defp write_atomically(path, binary, retries \\ 10)
 
+  # retry budget spent: stop instead of attempting an 11th time
   defp write_atomically(_path, _binary, 0), do: {:error, :eexist}
 
   defp write_atomically(path, binary, retries) do

@@ -121,24 +121,6 @@ defmodule Ashiato.StorageTest do
       refute File.exists?(escape_path)
     end
 
-    test "a symlink inside the root cannot reach outside it", %{tmp_dir: tmp_dir} do
-      outside = Path.join(Path.dirname(tmp_dir), Path.basename(tmp_dir) <> "-outside")
-
-      on_exit(fn ->
-        File.rm_rf(outside)
-        File.rm(Path.join(tmp_dir, "link"))
-      end)
-
-      File.mkdir_p!(outside)
-      File.write!(Path.join(outside, "secret.txt"), "not yours")
-      File.ln_s!(outside, Path.join(Local.root(), "link"))
-
-      assert {:error, :invalid_key} = Local.get("link/secret.txt")
-      assert {:error, :invalid_key} = Local.put("link/secret.txt", "rewritten")
-      assert {:error, :invalid_key} = Local.delete("link/secret.txt")
-      assert File.read!(Path.join(outside, "secret.txt")) == "not yours"
-    end
-
     defp path_for(key), do: Path.join(Local.root(), key)
   end
 

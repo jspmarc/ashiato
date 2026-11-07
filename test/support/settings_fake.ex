@@ -7,7 +7,7 @@ defmodule Ashiato.Settings.Fake do
   secret and `get/3` returns it.
 
   It lives in `test/support` rather than inside a test file so that any test — including a
-  single-file run of some later card's test — can start it.
+  single-file run of another test — can start it.
   """
 
   use Agent
@@ -22,7 +22,7 @@ defmodule Ashiato.Settings.Fake do
   end
 
   @impl true
-  @doc "Reads a stored value, or falls back to requirement defaults then `default`."
+  @doc "Reads a stored value, or falls back to the built-in defaults then `default`."
   @spec get(integer(), String.t(), term()) :: term()
   def get(user_id, key, default) do
     Agent.get(__MODULE__, fn store ->

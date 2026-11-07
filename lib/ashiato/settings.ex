@@ -1,8 +1,8 @@
 defmodule Ashiato.Settings do
   @moduledoc """
-  The typed accessor over the per-user `settings` key-value table (D47), and
-  the only module that knows settings are key-value — everything else calls
-  this context and works with typed values.
+  The typed accessor over the per-user `settings` key-value table, and the only
+  module that knows settings are key-value — everything else calls this context
+  and works with typed values.
 
   Values are JSON-encoded in the `value` column, so a boolean reads back as a
   boolean and a list as a list. Rows marked `secret: true` are encrypted at
@@ -10,7 +10,7 @@ defmodule Ashiato.Settings do
   plaintext of a secret never reaches a log or an error report.
 
   The module is also the behaviour of the settings boundary: `impl/0` returns
-  the configured implementation (defaulting to this one), so later waves call
+  the configured implementation (defaulting to this one), so callers use
   `impl().get/3` and swap in a fake in tests without naming a concrete module.
   The capability helpers read their inputs through `impl/0` for the same
   reason, which is what lets the gates be driven against the fake.
@@ -31,8 +31,7 @@ defmodule Ashiato.Settings do
 
   @secret_salt "ashiato settings"
 
-  # §8 defaults: a missing row must never force a caller to special-case nil
-  # for the settings the requirements name.
+  # Built-in defaults: a missing row must never force a caller to special-case nil.
   @defaults %{
     "ai_features_enabled" => false,
     "translation_enabled" => false,
@@ -42,23 +41,22 @@ defmodule Ashiato.Settings do
     "maturity_threshold_days" => 21
   }
 
-  @doc "Requirement defaults for keys without a stored row."
+  @doc "Built-in defaults for keys without a stored row."
   @spec defaults() :: %{String.t() => term()}
   def defaults(), do: @defaults
 
   @doc """
   Returns the configured implementation of the `get/3`, `put/4` and `all/1`
   callbacks from application config (`config :ashiato, :settings, MyImpl`),
-  defaulting to this module — the repo-backed accessor. Later waves call
+  defaulting to this module — the repo-backed accessor. Callers use
   `impl().get/3` and never name a concrete module.
   """
   @spec impl() :: module()
   def impl, do: Application.get_env(:ashiato, :settings, __MODULE__)
 
   @doc """
-  Reads one setting as a decoded value. A missing row falls back to the §8
-  requirement defaults for the settings named there, and to `default` for any
-  other key.
+  Reads one setting as a decoded value. A missing row falls back to the
+  built-in default for known keys, and to `default` for any other key.
 
   A secret row is decrypted first; if authentication fails the default is
   returned and the failure is logged without the value.
@@ -159,7 +157,7 @@ defmodule Ashiato.Settings do
   end
 
   @doc """
-  The AI gate (D43): `ai_features_enabled` is on AND a non-empty
+  The AI gate: `ai_features_enabled` is on AND a non-empty
   `OPENAI_API_KEY` exists — settings row first, then `System.get_env/1`. An
   empty key disables the feature even with the switch on, so affordances hide
   instead of failing at call time.
@@ -171,7 +169,7 @@ defmodule Ashiato.Settings do
   end
 
   @doc """
-  The translation gate (§7.5): `translation_enabled` is on AND the selected
+  The translation gate: `translation_enabled` is on AND the selected
   `translation_provider` is configured. `google_free` needs nothing, `off` is
   never capable, and the other providers each need their key or URL.
   """
@@ -201,11 +199,10 @@ defmodule Ashiato.Settings do
   # through to the environment and re-enable a capability the user just switched off.
   @missing :__missing_setting__
 
-  # The settings row wins and environment variables are the fallback for the same
-  # values (§7.5). Environment names are the uppercase form of the setting key
-  # (`OPENAI_API_KEY`, `DEEPL_API_KEY`, `LIBRETRANSLATE_URL`), which is how §7-§8
-  # name them. An explicitly empty stored key stays empty rather than falling through,
-  # so it still disables (D43).
+  # The settings row wins and environment variables are the fallback. Environment
+  # names are the uppercase form of the setting key (`OPENAI_API_KEY`,
+  # `DEEPL_API_KEY`, `LIBRETRANSLATE_URL`). An explicitly empty stored key stays
+  # empty rather than falling through, so it still disables the capability.
   defp credential?(user_id, key) do
     case impl().get(user_id, key, @missing) do
       @missing -> present?(System.get_env(String.upcase(key)))
@@ -274,7 +271,7 @@ defmodule Ashiato.Settings do
     end
   end
 
-  # Deterministic derivation (D47): the same SECRET_KEY_BASE yields the same
+  # Deterministic derivation: the same SECRET_KEY_BASE yields the same
   # 32-byte key on every boot, so no key column is needed. A missing
   # SECRET_KEY_BASE raises here rather than storing plaintext.
   defp derived_key do

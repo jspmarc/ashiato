@@ -30,6 +30,11 @@ defmodule Ashiato.Translator do
   @callback translate_page(lines :: [String.t()], opts :: keyword()) ::
               {:ok, [String.t()]} | {:error, term()}
 
+  @callback page_request(lines :: [String.t()], opts :: keyword()) ::
+              {:ok, [String.t()]} | {:error, term()}
+
+  @optional_callbacks page_request: 2
+
   require Logger
 
   # Keyed by the string the settings table stores (`translation_provider` is JSON, so it
@@ -62,7 +67,7 @@ defmodule Ashiato.Translator do
       @impl Ashiato.Translator
       @spec translate_page([String.t()], keyword()) :: {:ok, [String.t()]} | {:error, term()}
       def translate_page(lines, opts) do
-        Ashiato.Translator.page_with_fallback(lines, opts, &page_request/2)
+        Ashiato.Translator.run_provider(__MODULE__, lines, opts, &page_request/2)
       end
     end
   end
@@ -113,15 +118,22 @@ defmodule Ashiato.Translator do
   Refused providers enter a 300 s cool-down keyed by provider module.
   """
   @spec translate_page([String.t()], keyword()) :: {:ok, [String.t()]} | {:error, term()}
-  def translate_page(lines, opts) do
-    provider = impl()
+  def translate_page(lines, opts), do: impl().translate_page(lines, opts)
 
+  @doc false
+  @spec run_provider(
+          module(),
+          [String.t()],
+          keyword(),
+          ([String.t()], keyword() -> {:ok, [String.t()]} | {:error, term()})
+        ) :: {:ok, [String.t()]} | {:error, term()}
+  def run_provider(provider, lines, opts, page_request) do
     case check_cooldown(provider) do
       nil ->
-        case provider.translate_page(lines, opts) do
-          {:error, {:http, status}} when status in [403, 429] or status >= 500 ->
+        case page_with_fallback(lines, opts, page_request) do
+          {:error, {:http, status}} = error when status in [403, 429] or status >= 500 ->
             record_cooldown(provider)
-            {:error, {:http, status}}
+            error
 
           other ->
             other
@@ -221,6 +233,8 @@ defmodule Ashiato.Translator do
   """
   @spec http_post(String.t(), keyword()) :: {:ok, [String.t()]} | {:error, term()}
   def http_post(url, req_opts) do
+    req_opts = put_test_plug(req_opts)
+
     case Keyword.pop(req_opts, :decode) do
       {nil, _opts} ->
         {:error, :no_decoder}
@@ -237,6 +251,13 @@ defmodule Ashiato.Translator do
     end
   end
 
+  defp put_test_plug(req_opts) do
+    case Application.get_env(:ashiato, __MODULE__, [])[:plug] do
+      nil -> req_opts
+      plug -> Keyword.put_new(req_opts, :plug, plug)
+    end
+  end
+
   defp do_post(url, decode, req_opts) do
     try do
       case Req.post(url, [retry: false] ++ req_opts) do
@@ -245,12 +266,15 @@ defmodule Ashiato.Translator do
         # Req's JSON step turns a malformed body into an exception whose `data` is
         # the response text; returning it would leak translated lines to the caller.
         {:error, %Jason.DecodeError{}} -> {:error, :unparsable}
-        {:error, exception} -> {:error, exception}
+        {:error, exception} -> {:error, {:transport, safe_reason(exception)}}
       end
     rescue
       _ -> {:error, :request_failed}
     end
   end
+
+  defp safe_reason(%{reason: reason}) when is_atom(reason), do: reason
+  defp safe_reason(_exception), do: :unknown
 
   @doc false
   @spec langs(keyword()) :: {:ok, {String.t(), String.t()}} | {:error, :missing_target_lang}
@@ -270,10 +294,6 @@ defmodule Ashiato.Translator do
         {:error, :missing_target_lang}
     end
   end
-
-  @doc false
-  @spec split_trim(String.t()) :: [String.t()]
-  def split_trim(text), do: text |> String.split("\n") |> Enum.map(&String.trim/1)
 
   @doc false
   @spec configured?(term()) :: boolean()

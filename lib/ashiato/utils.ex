@@ -52,6 +52,12 @@ defmodule Ashiato.Utils do
   defp to_hiragana_codepoint(codepoint), do: codepoint
 
   @doc """
+  Splits text on newlines and trims each line.
+  """
+  @spec split_trim(String.t()) :: [String.t()]
+  def split_trim(text), do: text |> String.split("\n") |> Enum.map(&String.trim/1)
+
+  @doc """
   The current time truncated to whole seconds, matching the `:utc_datetime`
   columns.
   """

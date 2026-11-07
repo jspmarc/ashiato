@@ -7,6 +7,8 @@ defmodule Ashiato.Translator.GoogleFree do
   """
   use Ashiato.Translator
 
+  alias Ashiato.Utils
+
   @url "https://translate.googleapis.com/translate_a/single"
 
   @doc """
@@ -28,7 +30,7 @@ defmodule Ashiato.Translator.GoogleFree do
 
   defp decode([segments | _]) when is_list(segments) do
     if Enum.all?(segments, &match?([text | _] when is_binary(text), &1)) do
-      {:ok, segments |> Enum.map(&hd/1) |> Enum.join("") |> Translator.split_trim()}
+      {:ok, segments |> Enum.map(&hd/1) |> Enum.join("") |> Utils.split_trim()}
     else
       {:error, :unparsable}
     end

@@ -121,9 +121,10 @@ application config so later waves depend on the behaviour and never on a concret
 
 - One request per page, so cross-line context survives. Providers: `google_free` (default), `llm`,
   `deepl`, `google_cloud`, `off`.
-- The `llm` provider asks for a **JSON array** of strings and falls back to per-line when the array does
-  not parse. NMT providers return line-aligned text directly. **If the returned line count differs from
-  the input, fall back to per-line.**
+- The `llm` provider asks for a **JSON object with a `translations` array of strings**, enforced by a
+  strict schema, and falls back to per-line when the reply does not match. It uses the Responses API and
+  falls back to chat completions when that endpoint is unavailable. NMT providers return line-aligned
+  text directly. **If the returned line count differs from the input, fall back to per-line.**
 - **No caching in this card.** That would need `dict_cache_entries.kind = 'translation'`, which the CHECK
   constraint forbids, so caching waits for a migration that adds the value. Do not widen the constraint
   here, and do not repurpose an existing `kind`.

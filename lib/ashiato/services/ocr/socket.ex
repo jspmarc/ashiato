@@ -2,10 +2,12 @@ defmodule Ashiato.Ocr.Socket do
   @moduledoc """
   Unix-socket client for the resident `ashiato-ocr` service.
 
-  `packet: 4` is the whole framing protocol: the 4-byte big-endian length
-  prefix is handled by the socket, so nothing here frames by hand or reads a
-  stream. Every failure — absent socket, closed connection, corrupt reply —
-  comes back as an `{:error, term}` tuple instead of a raise.
+  Despite the `:gen_tcp` name, `{:local, path}` opens an `AF_UNIX` socket: no IP
+  address or port is involved. `packet: 4` is the whole framing protocol: the
+  4-byte big-endian length prefix is handled by the socket, so nothing here
+  frames by hand or reads a stream. Every failure — absent socket, closed
+  connection, corrupt reply — comes back as an `{:error, term}` tuple instead
+  of a raise.
   """
 
   @behaviour Ashiato.Ocr

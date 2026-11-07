@@ -1,7 +1,7 @@
 defmodule Ashiato.OcrTest do
   @moduledoc """
-  OCR client contract: socket round trip, clean errors, malformed-block
-  rejection, and the fake's canned/recorded behaviour.
+  Covers the socket round trip, clean errors, malformed-block rejection, and
+  the fake's canned and recorded behaviour.
   """
 
   # These tests write application env for `:ashiato, Ashiato.Ocr` and start a fake under a

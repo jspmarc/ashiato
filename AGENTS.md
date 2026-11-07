@@ -95,6 +95,7 @@ custom classes must fully style the input
    - Instead of sleeping to synchronize before the next call, **always** use `_ = :sys.get_state/1` to ensure the process has handled prior messages
 - Only add unit tests for public functions and methods, unless instructed otherwise.
 <!-- phoenix:elixir-end -->
+- For tests, avoid testing private functions unless absolutely necessary (ask the user's permission to test private or protected functions).
 
 <!-- phoenix:phoenix-start -->
 ## Phoenix guidelines

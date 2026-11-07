@@ -17,6 +17,7 @@ defmodule Ashiato.Application do
       {Phoenix.PubSub, name: Ashiato.PubSub},
       # Start a worker by calling: Ashiato.Worker.start_link(arg)
       # {Ashiato.Worker, arg},
+      {Task.Supervisor, name: Ashiato.Dictionary.TaskSupervisor},
       # Start to serve requests, typically the last entry
       AshiatoWeb.Endpoint
     ]

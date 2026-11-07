@@ -1,0 +1,334 @@
+defmodule Ashiato.Dictionary do
+  @moduledoc """
+  Dictionary lookups behind a behaviour, plus a version-keyed cache façade.
+
+  `lookup/1` and `lookup_many/1` are the public façade: they consult
+  `Ashiato.Schemas.DictCacheEntry` first and only fall through to the service
+  on a miss, so a cache hit never touches the network.
+
+  The configured service is returned by `impl/0`, from
+  `Application.get_env(:ashiato, Ashiato.Dictionary, [])[:impl]`, default
+  `Ashiato.Dictionary.Http`. Callers depend on the behaviour, not a concrete
+  module.
+
+  ## Cache shape
+
+  Rows are keyed `(kind, cache_key, dict_version)`. `cache_key` is the term;
+  `dict_version` is what the service reports; `kind` derives from the term: a
+  single CJK codepoint (U+4E00..U+9FFF) is a `"kanji"` entry, anything else a
+  `"word"`. `payload` is the entry map, stored as-is.
+
+  A row is either current or superseded wholesale, so there is no TTL. A version
+  bump mutates nothing: old rows stop matching and a fresh row is inserted with
+  the new version. `prune/0` deletes superseded rows once the new release is in
+  use.
+
+  The `dict_version/0` needed to build the key is memoised via a private path
+  that checks `:persistent_term` then the cache's newest row. A cache hit uses
+  that version without a network call; a miss re-reads the version from the
+  service before caching, so a new release is picked up lazily.
+
+  Callbacks are the raw service calls; `Http` and `Fake` implement them.
+  """
+
+  import Ecto.Query
+
+  alias Ashiato.Repo
+  alias Ashiato.Schemas.DictCacheEntry
+  alias Ashiato.Utils
+
+  @type entry :: map()
+
+  @callback lookup(term :: String.t()) :: {:ok, entry()} | {:error, term()}
+  @callback lookup_many(terms :: [String.t()]) ::
+              {:ok, %{String.t() => entry()}} | {:error, term()}
+  @callback dict_version() :: {:ok, String.t()} | {:error, term()}
+
+  @doc """
+  The configured service module. Callers depend on this indirection rather than
+  on a concrete module.
+  """
+  @spec impl() :: module()
+  def impl do
+    Application.get_env(:ashiato, __MODULE__, [])[:impl] || Ashiato.Dictionary.Http
+  end
+
+  @doc """
+  Looks up one term: cache first, service on a miss. On a miss the entry is
+  cached under the service's current `dict_version`; a lost insert race
+  re-fetches the row the winning caller just wrote, so the entry is returned
+  either way. A service error propagates without caching anything.
+  """
+  @spec lookup(String.t()) :: {:ok, entry()} | {:error, term()}
+  def lookup(term) do
+    with :ok <- validate_term(term) do
+      fetch_one(term, kind_for(term), impl())
+    end
+  end
+
+  @doc """
+  Looks up many terms in one call: every term is checked against the cache, and
+  only the misses go to the service (a fully cached batch makes no lookup
+  calls). Returns `{:ok, map}` keyed by term. A service error for the missing
+  terms propagates; cached entries alone are not returned in that case.
+  """
+  @spec lookup_many([String.t()]) :: {:ok, %{String.t() => entry()}} | {:error, term()}
+  def lookup_many(terms) do
+    with :ok <- validate_terms(terms) do
+      uniq = Enum.uniq(terms)
+
+      case known_version() do
+        {:ok, dict_version} ->
+          cached = cached_payloads(uniq, dict_version)
+          missing = Enum.reject(uniq, &Map.has_key?(cached, &1))
+          if missing == [], do: {:ok, cached}, else: fetch_many(uniq, impl())
+
+        :error ->
+          fetch_many(uniq, impl())
+      end
+    end
+  end
+
+  @doc """
+  The `dict_version/0` the cache is keyed by, re-read from the service on a miss
+  so the cache never goes stale on version changes.
+
+  `prune/0` and the scheduled release check call this to flip the version outside a
+  request; the next lookup then misses and refetches under the new version.
+
+  A failed refresh propagates: caching a fresh response under a guessed version
+  would silently mix releases until the next successful refresh.
+  """
+  @spec refresh_version() :: {:ok, String.t()} | {:error, term()}
+  def refresh_version do
+    impl = impl()
+
+    case impl.dict_version() do
+      {:ok, version} ->
+        :persistent_term.put(version_key(impl), {:ok, version})
+        {:ok, version}
+
+      error ->
+        error
+    end
+  end
+
+  @doc """
+  Deletes cached entries for every `dict_version` except the one the service currently
+  reports, and returns the number of rows removed.
+
+  A release bump keeps the old rows so they can still be served; call this once the new
+  release is in use to reclaim the space. The version comes from `refresh_version/0`, not
+  from the cache, so a stale memo can never delete a newer release's rows.
+  """
+  @spec prune() :: {:ok, non_neg_integer()} | {:error, term()}
+  def prune do
+    with {:ok, version} <- refresh_version() do
+      {count, _} =
+        Repo.delete_all(from(e in DictCacheEntry, where: e.dict_version != ^version),
+          log: false
+        )
+
+      {:ok, count}
+    end
+  end
+
+  # ── private ──────────────────────────────────────────────────────────
+
+  defp known_version do
+    key = version_key(impl())
+
+    case :persistent_term.get(key, :cold) do
+      {:ok, version} ->
+        {:ok, version}
+
+      :cold ->
+        case newest_cached_version() do
+          {:ok, version} ->
+            :persistent_term.put(key, {:ok, version})
+            {:ok, version}
+
+          :error ->
+            :error
+        end
+    end
+  end
+
+  defp fetch_one(term, kind, impl) do
+    case known_version() do
+      {:ok, dict_version} ->
+        case Repo.get_by(
+               DictCacheEntry,
+               [kind: kind, cache_key: term, dict_version: dict_version],
+               log: false
+             ) do
+          %DictCacheEntry{payload: payload} ->
+            {:ok, payload}
+
+          nil ->
+            do_fetch_one(term, kind, impl)
+        end
+
+      :error ->
+        do_fetch_one(term, kind, impl)
+    end
+  end
+
+  defp do_fetch_one(term, kind, impl) do
+    case refresh_version() do
+      {:ok, dict_version} ->
+        case Repo.get_by(
+               DictCacheEntry,
+               [kind: kind, cache_key: term, dict_version: dict_version],
+               log: false
+             ) do
+          %DictCacheEntry{payload: payload} ->
+            {:ok, payload}
+
+          nil ->
+            case impl.lookup(term) do
+              {:ok, entry} ->
+                entry = normalise(entry)
+
+                case cache_entry(kind, term, dict_version, entry) do
+                  {:ok, row} -> {:ok, row.payload}
+                  {:error, _changeset} -> {:ok, entry}
+                end
+
+              {:error, reason} ->
+                {:error, reason}
+            end
+        end
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp fetch_many(terms, impl) do
+    case refresh_version() do
+      {:ok, dict_version} ->
+        cached = cached_payloads(terms, dict_version)
+        still_missing = Enum.reject(terms, &Map.has_key?(cached, &1))
+
+        if still_missing == [] do
+          {:ok, cached}
+        else
+          case impl.lookup_many(still_missing) do
+            {:ok, entries} ->
+              {:ok, Map.merge(cached, cache_missing(still_missing, entries, dict_version))}
+
+            {:error, reason} ->
+              {:error, reason}
+          end
+        end
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp newest_cached_version do
+    from(d in DictCacheEntry,
+      order_by: [desc: d.fetched_at, desc: d.id],
+      limit: 1,
+      select: d.dict_version
+    )
+    |> Repo.all(log: false)
+    |> case do
+      [version] -> {:ok, version}
+      [] -> :error
+    end
+  end
+
+  # The store is VM-wide and the key includes the implementation, so a fake version set by
+  # one test does not leak into the next and no per-user data ever lands here.
+  defp version_key(impl), do: {__MODULE__, :dict_version, impl}
+
+  # A term reaches this module from OCR and tokenizer output, so it can carry bytes that are
+  # not valid UTF-8. Jason would raise while encoding the request body, breaking the
+  # `{:error, term()}` contract on the ingest path.
+  defp validate_term(term) when is_binary(term) do
+    if String.valid?(term), do: :ok, else: {:error, :invalid_term}
+  end
+
+  defp validate_term(_term), do: {:error, :invalid_term}
+
+  defp validate_terms(terms) when is_list(terms) do
+    if Enum.all?(terms, &match?(:ok, validate_term(&1))), do: :ok, else: {:error, :invalid_term}
+  end
+
+  defp validate_terms(_terms), do: {:error, :invalid_term}
+
+  # A fresh entry comes back with atom or string keys depending on the service; a cached
+  # one always comes back from the JSON column string-keyed. Normalising before the entry
+  # is cached and returned keeps one shape for callers.
+  defp normalise(entry) when is_map(entry) do
+    entry |> Jason.encode!() |> Jason.decode!()
+  end
+
+  # kind is half of the cache identity; deriving it from the term keeps the key deterministic.
+  defp kind_for(term) do
+    if Utils.cjk_codepoint?(term), do: :kanji, else: :word
+  end
+
+  defp cached_payloads(terms, dict_version) do
+    from(e in DictCacheEntry,
+      where: e.dict_version == ^dict_version and e.cache_key in ^terms,
+      select: {e.kind, e.cache_key, e.payload}
+    )
+    |> Repo.all(log: false)
+    |> Enum.reduce(%{}, fn {kind, term, payload}, acc ->
+      if kind == kind_for(term), do: Map.put(acc, term, payload), else: acc
+    end)
+  end
+
+  defp cache_missing(missing, entries, dict_version) do
+    Enum.reduce(missing, %{}, fn term, acc ->
+      case Map.fetch(entries, term) do
+        {:ok, entry} ->
+          entry = normalise(entry)
+
+          case cache_entry(kind_for(term), term, dict_version, entry) do
+            {:ok, row} -> Map.put(acc, term, row.payload)
+            {:error, _changeset} -> Map.put(acc, term, entry)
+          end
+
+        :error ->
+          acc
+      end
+    end)
+  end
+
+  # House pattern (Ledger.find_or_create_lexeme/3): the unique_constraint
+  # declaration turns a lost insert race into {:error, changeset}, and the
+  # refetch finds the row the concurrent winner just wrote. Fields are set
+  # programmatically, never cast.
+  defp cache_entry(kind, cache_key, dict_version, payload) do
+    %DictCacheEntry{}
+    |> Ecto.Changeset.change(%{
+      kind: kind,
+      cache_key: cache_key,
+      dict_version: dict_version,
+      payload: payload,
+      fetched_at: Utils.utc_now()
+    })
+    # keeps Ecto's default index name, matching both adapters
+    |> Ecto.Changeset.unique_constraint([:kind, :cache_key, :dict_version])
+    |> Repo.insert(log: false)
+    |> case do
+      {:ok, row} ->
+        {:ok, row}
+
+      {:error, changeset} ->
+        case Repo.get_by(
+               DictCacheEntry,
+               [kind: kind, cache_key: cache_key, dict_version: dict_version],
+               log: false
+             ) do
+          %DictCacheEntry{} = winner -> {:ok, winner}
+          nil -> {:error, changeset}
+        end
+    end
+  end
+end

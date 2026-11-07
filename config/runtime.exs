@@ -24,6 +24,7 @@ config :ashiato, AshiatoWeb.Endpoint,
   http: [port: String.to_integer(System.get_env("PORT", "4000"))]
 
 config :ashiato, Ashiato.Tokenizer, base_url: System.get_env("JP_DICT_API_URL")
+config :ashiato, Ashiato.Dictionary, base_url: System.get_env("JP_DICT_API_URL")
 
 if config_env() == :prod do
   db_url =

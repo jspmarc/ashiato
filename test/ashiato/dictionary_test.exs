@@ -98,6 +98,24 @@ defmodule Ashiato.DictionaryTest do
     assert Repo.all(from e in DictCacheEntry, select: e.dict_version) == ["2026-2"]
   end
 
+  test "a batch refresh picks up a version bump before fetching" do
+    start_supervised!(
+      {Dictionary.Fake, version: "2026-1", entries: %{"食べる" => @entry_a, "橋" => @entry_b}}
+    )
+
+    assert {:ok, %{"食べる" => @entry_a}} = Dictionary.lookup_many(["食べる"])
+
+    Dictionary.Fake.set_version("2026-2")
+
+    assert {:ok, %{"食べる" => @entry_a, "橋" => @entry_b}} =
+             Dictionary.lookup_many(["食べる", "橋"])
+
+    assert Repo.aggregate(
+             from(e in DictCacheEntry, where: e.dict_version == "2026-2"),
+             :count
+           ) == 2
+  end
+
   test "lookup_many returns a map keyed by term and fetches only the misses" do
     start_supervised!(
       {Dictionary.Fake,
@@ -156,6 +174,49 @@ defmodule Ashiato.DictionaryTest do
       assert {:ok, %{"words" => [%{"word" => "食べる"}]}} = Dictionary.Http.lookup("食べる")
       assert Dictionary.Http.lookup("ない") == {:error, :not_found}
       assert {:ok, %{"食べる" => _, "橋" => _}} = Dictionary.Http.lookup_many(["食べる", "橋"])
+    end
+
+    test "maps malformed JSON to unexpected_response and transport errors" do
+      Req.Test.stub(__MODULE__, fn conn ->
+        case Enum.map(conn.path_info, &URI.decode/1) do
+          ["lookup", "壊"] ->
+            conn
+            |> Plug.Conn.put_resp_content_type("application/json")
+            |> Plug.Conn.send_resp(200, "{not json")
+
+          ["lookup", "落"] ->
+            Req.Test.transport_error(conn, :econnrefused)
+        end
+      end)
+
+      assert Dictionary.Http.lookup("壊") == {:error, :unexpected_response}
+      assert Dictionary.Http.lookup("落") == {:error, {:transport, :econnrefused}}
+    end
+
+    test "a crashing worker returns an error without killing the caller" do
+      Req.Test.stub(__MODULE__, fn conn ->
+        case Enum.map(conn.path_info, &URI.decode/1) do
+          ["lookup", "爆"] -> raise "boom"
+        end
+      end)
+
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          assert Dictionary.Http.lookup_many(["爆"]) == {:error, :lookup_failed}
+        end)
+
+      refute log =~ "爆"
+      assert Process.alive?(self())
+    end
+
+    test "encodes slash as one path segment" do
+      Req.Test.stub(__MODULE__, fn conn ->
+        assert conn.request_path == "/lookup/a%2Fb"
+
+        Req.Test.json(conn, %{"words" => nil, "kanji" => nil})
+      end)
+
+      assert Dictionary.Http.lookup("a/b") == {:error, :not_found}
     end
   end
 end

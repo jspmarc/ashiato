@@ -27,7 +27,7 @@ defmodule Ashiato.Dictionary.Http do
   """
   @spec lookup(String.t()) :: {:ok, map()} | {:error, term()}
   def lookup(term) do
-    case request("/lookup/" <> URI.encode(term)) do
+    case request("/lookup/" <> URI.encode(term, &URI.char_unreserved?/1)) do
       {:ok, %{"words" => words, "kanji" => kanji} = entry} ->
         cond do
           not valid_words?(words) -> {:error, :unexpected_response}
@@ -51,8 +51,8 @@ defmodule Ashiato.Dictionary.Http do
   """
   @spec lookup_many([String.t()]) :: {:ok, %{String.t() => map()}} | {:error, term()}
   def lookup_many(terms) do
-    terms
-    |> Task.async_stream(&fetch/1,
+    Ashiato.Dictionary.TaskSupervisor
+    |> Task.Supervisor.async_stream_nolink(terms, &fetch/1,
       max_concurrency: @max_concurrency,
       timeout: @timeout + 5_000,
       on_timeout: :kill_task
@@ -60,7 +60,7 @@ defmodule Ashiato.Dictionary.Http do
     |> Enum.reduce_while({:ok, %{}}, fn
       {:ok, {term, {:ok, entry}}}, {:ok, acc} -> {:cont, {:ok, Map.put(acc, term, entry)}}
       {:ok, {_term, {:error, reason}}}, _acc -> {:halt, {:error, reason}}
-      {:exit, reason}, _acc -> {:halt, {:error, {:lookup_many, reason}}}
+      {:exit, _reason}, _acc -> {:halt, {:error, :lookup_failed}}
     end)
   end
 
@@ -85,7 +85,15 @@ defmodule Ashiato.Dictionary.Http do
     end
   end
 
-  defp fetch(term), do: {term, lookup(term)}
+  # Catch inside the worker: an uncaught exception would put the term in an OTP crash
+  # report before async_stream_nolink can turn it into a return value.
+  defp fetch(term) do
+    {term, lookup(term)}
+  rescue
+    _exception -> {term, {:error, :lookup_failed}}
+  catch
+    _kind, _reason -> {term, {:error, :lookup_failed}}
+  end
 
   defp valid_words?(nil), do: true
   defp valid_words?(words) when is_list(words), do: Enum.all?(words, &is_map/1)
@@ -96,6 +104,10 @@ defmodule Ashiato.Dictionary.Http do
 
   defp empty_reply?(words, kanji), do: (is_nil(words) or words == []) and is_nil(kanji)
 
+  @spec safe_reason(term()) :: atom()
+  defp safe_reason(reason) when is_atom(reason), do: reason
+  defp safe_reason(_reason), do: :unknown
+
   @spec request(String.t()) :: {:ok, term()} | {:error, term()}
   defp request(path) do
     with {:ok, base} <- base_url() do
@@ -103,13 +115,25 @@ defmodule Ashiato.Dictionary.Http do
 
       case Req.request(req,
              url: base <> path,
+             redirect: false,
              retry: false,
              receive_timeout: @timeout,
              request_timeout: @timeout
            ) do
-        {:ok, %Req.Response{status: 200, body: body}} -> {:ok, body}
-        {:ok, %Req.Response{status: status}} -> {:error, {:unexpected_status, status}}
-        {:error, exception} -> {:error, exception}
+        {:ok, %Req.Response{status: 200, body: body}} ->
+          {:ok, body}
+
+        {:ok, %Req.Response{status: status}} ->
+          {:error, {:unexpected_status, status}}
+
+        {:error, %Req.TransportError{reason: reason}} ->
+          {:error, {:transport, safe_reason(reason)}}
+
+        {:error, %{__exception__: true}} ->
+          {:error, :unexpected_response}
+
+        {:error, _reason} ->
+          {:error, :transport_error}
       end
     end
   end
@@ -121,8 +145,8 @@ defmodule Ashiato.Dictionary.Http do
         {:error, :base_url_not_configured}
 
       url ->
-        case URI.parse(url) do
-          %URI{scheme: scheme, host: host}
+        case URI.new(url) do
+          {:ok, %URI{scheme: scheme, host: host, query: nil, fragment: nil}}
           when scheme in ["http", "https"] and host != nil and host != "" ->
             {:ok, String.trim_trailing(url, "/")}
 

@@ -23,11 +23,10 @@ defmodule Ashiato.Dictionary do
   the new version. `prune/0` deletes superseded rows once the new release is in
   use.
 
-  The `dict_version/0` needed to build the key is memoised (`current_version/1`) and falls
-  back to the newest `dict_version` already in the cache after a restart, so a cache hit
-  makes no network call and keeps working while the service is down. Only a miss talks to
-  the service. `refresh_version/0` re-reads the version from the service; the lookup path
-  never asks for it once one is known.
+  The `dict_version/0` needed to build the key is memoised via a private path
+  that checks `:persistent_term` then the cache's newest row. A cache hit uses
+  that version without a network call; a miss re-reads the version from the
+  service before caching, so a new release is picked up lazily.
 
   Callbacks are the raw service calls; `Http` and `Fake` implement them.
   """
@@ -62,33 +61,8 @@ defmodule Ashiato.Dictionary do
   """
   @spec lookup(String.t()) :: {:ok, entry()} | {:error, term()}
   def lookup(term) do
-    impl = impl()
-
-    with :ok <- validate_term(term),
-         {:ok, dict_version} <- current_version(impl) do
-      kind = kind_for(term)
-
-      case Repo.get_by(
-             DictCacheEntry,
-             [kind: kind, cache_key: term, dict_version: dict_version],
-             log: false
-           ) do
-        %DictCacheEntry{payload: payload} ->
-          {:ok, payload}
-
-        nil ->
-          case impl.lookup(term) do
-            {:ok, entry} ->
-              entry = normalise(entry)
-              # A cache write failure must not fail a lookup the service just answered: the
-              # next call simply misses again.
-              _ = cache_entry(kind, term, dict_version, entry)
-              {:ok, entry}
-
-            {:error, reason} ->
-              {:error, reason}
-          end
-      end
+    with :ok <- validate_term(term) do
+      fetch_one(term, kind_for(term), impl())
     end
   end
 
@@ -100,102 +74,39 @@ defmodule Ashiato.Dictionary do
   """
   @spec lookup_many([String.t()]) :: {:ok, %{String.t() => entry()}} | {:error, term()}
   def lookup_many(terms) do
-    impl = impl()
+    with :ok <- validate_terms(terms) do
+      uniq = Enum.uniq(terms)
 
-    with :ok <- validate_terms(terms),
-         {:ok, dict_version} <- current_version(impl) do
-      terms = Enum.uniq(terms)
-      cached = cached_payloads(terms, dict_version)
-      missing = Enum.reject(terms, &Map.has_key?(cached, &1))
+      case known_version() do
+        {:ok, dict_version} ->
+          cached = cached_payloads(uniq, dict_version)
+          missing = Enum.reject(uniq, &Map.has_key?(cached, &1))
+          if missing == [], do: {:ok, cached}, else: fetch_many(uniq, impl())
 
-      if missing == [] do
-        {:ok, cached}
-      else
-        case impl.lookup_many(missing) do
-          {:ok, entries} ->
-            {:ok, Map.merge(cached, cache_missing(missing, entries, dict_version))}
-
-          {:error, reason} ->
-            {:error, reason}
-        end
+        :error ->
+          fetch_many(uniq, impl())
       end
     end
   end
 
   @doc """
-  The `dict_version/0` the cache is keyed by, memoised so a cache hit makes no network call.
+  The `dict_version/0` the cache is keyed by, re-read from the service on a miss
+  so the cache never goes stale on version changes.
 
-  The version is part of the cache key, so it has to be known before a row can be matched.
-  Asking the service on every lookup would make a cache hit hit the network, and a cached
-  word would become unavailable the moment the service went down. A cold memo therefore
-  reads the newest `dict_version` already in the cache; only a database with no rows at all
-  asks the service, and that call can never replace a cache hit.
-
-  `refresh_version/0` changes the version; nothing on the lookup path does.
-  """
-  @spec current_version(module()) :: {:ok, String.t()} | {:error, term()}
-  def current_version(impl) do
-    key = version_key(impl)
-
-    case :persistent_term.get(key, :cold) do
-      {:ok, version} ->
-        {:ok, version}
-
-      :cold ->
-        case newest_cached_version() do
-          {:ok, version} ->
-            :persistent_term.put(key, {:ok, version})
-            {:ok, version}
-
-          :error ->
-            case impl.dict_version() do
-              {:ok, version} ->
-                :persistent_term.put(key, {:ok, version})
-                {:ok, version}
-
-              error ->
-                error
-            end
-        end
-    end
-  end
-
-  @doc """
-  Asks the service for its current `dict_version/0` and memoises it.
-
-  This is the only place the version is refreshed, so a new release never turns a cache hit
-  into a network call. When the service is unreachable the last known version is kept and
-  returned.
-
-  The refreshed value lives in VM memory until the first row for the new version is written.
-  A restart inside that window re-derives the previous version from the cache. A durable
-  version store would remove that window.
+  A failed refresh propagates: caching a fresh response under a guessed version
+  would silently mix releases until the next successful refresh.
   """
   @spec refresh_version() :: {:ok, String.t()} | {:error, term()}
   def refresh_version do
     impl = impl()
-    key = version_key(impl)
 
     case impl.dict_version() do
       {:ok, version} ->
-        :persistent_term.put(key, {:ok, version})
+        :persistent_term.put(version_key(impl), {:ok, version})
         {:ok, version}
 
       error ->
-        case :persistent_term.get(key, :cold) do
-          {:ok, version} ->
-            {:ok, version}
-
-          :cold ->
-            case newest_cached_version() do
-              {:ok, version} ->
-                :persistent_term.put(key, {:ok, version})
-                {:ok, version}
-
-              :error ->
-                error
-            end
-        end
+        error
     end
   end
 
@@ -210,19 +121,117 @@ defmodule Ashiato.Dictionary do
   end
 
   @doc """
-  Deletes cached entries for every `dict_version` except the current one and returns the
-  number of rows removed.
+  Deletes cached entries for every `dict_version` except the one the service currently
+  reports, and returns the number of rows removed.
 
   A release bump keeps the old rows so they can still be served; call this once the new
-  release is in use to reclaim the space.
+  release is in use to reclaim the space. The version comes from `refresh_version/0`, not
+  from the cache, so a stale memo can never delete a newer release's rows.
   """
   @spec prune() :: {:ok, non_neg_integer()} | {:error, term()}
   def prune do
-    with {:ok, version} <- current_version(impl()) do
+    with {:ok, version} <- refresh_version() do
       {count, _} =
-        Repo.delete_all(from(e in DictCacheEntry, where: e.dict_version != ^version), log: false)
+        Repo.delete_all(from(e in DictCacheEntry, where: e.dict_version != ^version),
+          log: false
+        )
 
       {:ok, count}
+    end
+  end
+
+  # ── private ──────────────────────────────────────────────────────────
+
+  defp known_version do
+    key = version_key(impl())
+
+    case :persistent_term.get(key, :cold) do
+      {:ok, version} ->
+        {:ok, version}
+
+      :cold ->
+        case newest_cached_version() do
+          {:ok, version} ->
+            :persistent_term.put(key, {:ok, version})
+            {:ok, version}
+
+          :error ->
+            :error
+        end
+    end
+  end
+
+  defp fetch_one(term, kind, impl) do
+    case known_version() do
+      {:ok, dict_version} ->
+        case Repo.get_by(
+               DictCacheEntry,
+               [kind: kind, cache_key: term, dict_version: dict_version],
+               log: false
+             ) do
+          %DictCacheEntry{payload: payload} ->
+            {:ok, payload}
+
+          nil ->
+            do_fetch_one(term, kind, impl)
+        end
+
+      :error ->
+        do_fetch_one(term, kind, impl)
+    end
+  end
+
+  defp do_fetch_one(term, kind, impl) do
+    case refresh_version() do
+      {:ok, dict_version} ->
+        case Repo.get_by(
+               DictCacheEntry,
+               [kind: kind, cache_key: term, dict_version: dict_version],
+               log: false
+             ) do
+          %DictCacheEntry{payload: payload} ->
+            {:ok, payload}
+
+          nil ->
+            case impl.lookup(term) do
+              {:ok, entry} ->
+                entry = normalise(entry)
+
+                case cache_entry(kind, term, dict_version, entry) do
+                  {:ok, row} -> {:ok, row.payload}
+                  {:error, _changeset} -> {:ok, entry}
+                end
+
+              {:error, reason} ->
+                {:error, reason}
+            end
+        end
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp fetch_many(terms, impl) do
+    case refresh_version() do
+      {:ok, dict_version} ->
+        cached = cached_payloads(terms, dict_version)
+        still_missing = Enum.reject(terms, &Map.has_key?(cached, &1))
+
+        if still_missing == [] do
+          {:ok, cached}
+        else
+          case impl.lookup_many(still_missing) do
+            {:ok, entries} ->
+              {:ok, Map.merge(cached, cache_missing(still_missing, entries, dict_version))}
+
+            {:error, reason} ->
+              {:error, reason}
+          end
+        end
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 
@@ -286,9 +295,11 @@ defmodule Ashiato.Dictionary do
       case Map.fetch(entries, term) do
         {:ok, entry} ->
           entry = normalise(entry)
-          # A failed cache write must not fail a batch the service just answered.
-          _ = cache_entry(kind_for(term), term, dict_version, entry)
-          Map.put(acc, term, entry)
+
+          case cache_entry(kind_for(term), term, dict_version, entry) do
+            {:ok, row} -> Map.put(acc, term, row.payload)
+            {:error, _changeset} -> Map.put(acc, term, entry)
+          end
 
         :error ->
           acc

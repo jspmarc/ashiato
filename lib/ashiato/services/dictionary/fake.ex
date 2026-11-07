@@ -36,8 +36,7 @@ defmodule Ashiato.Dictionary.Fake do
 
   @impl true
   @doc "Canned batch lookup; counts one call. Unknown terms come back as an error."
-  @spec lookup_many([String.t()]) ::
-          {:ok, %{String.t() => map()}} | {:error, {:not_found, [String.t()]}}
+  @spec lookup_many([String.t()]) :: {:ok, %{String.t() => map()}} | {:error, :not_found}
   def lookup_many(terms) do
     Agent.get_and_update(__MODULE__, fn state ->
       state = count_call(state)
@@ -48,7 +47,7 @@ defmodule Ashiato.Dictionary.Fake do
       if missing == [] do
         {{:ok, entries}, state}
       else
-        {{:error, {:not_found, missing}}, state}
+        {{:error, :not_found}, state}
       end
     end)
   end

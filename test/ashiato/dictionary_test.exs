@@ -16,16 +16,10 @@ defmodule Ashiato.DictionaryTest do
   @entry_c %{"gloss" => "chopsticks", "reading" => "はし"}
 
   # The fake is selected through the same application config production uses, and the
-  # memoised dict_version is process-global, so each test starts from a cold memo.
+  # memoised dict_version is VM-wide, so each test starts from a cold memo.
   setup do
-    Application.put_env(:ashiato, Dictionary, service: Dictionary.Fake)
     Dictionary.forget_version()
-
-    on_exit(fn ->
-      Application.delete_env(:ashiato, Dictionary)
-      Dictionary.forget_version()
-    end)
-
+    on_exit(&Dictionary.forget_version/0)
     :ok
   end
 
@@ -92,6 +86,18 @@ defmodule Ashiato.DictionaryTest do
     assert Repo.get_by!(DictCacheEntry, dict_version: "2026-2").payload == @entry_a
   end
 
+  test "prune deletes superseded versions and keeps the current one" do
+    start_supervised!({Dictionary.Fake, version: "2026-1", entries: %{"食べる" => @entry_a}})
+
+    assert {:ok, @entry_a} = Dictionary.lookup("食べる")
+    Dictionary.Fake.set_version("2026-2")
+    assert {:ok, "2026-2"} = Dictionary.refresh_version()
+    assert {:ok, @entry_a} = Dictionary.lookup("食べる")
+
+    assert Dictionary.prune() == {:ok, 1}
+    assert Repo.all(from e in DictCacheEntry, select: e.dict_version) == ["2026-2"]
+  end
+
   test "lookup_many returns a map keyed by term and fetches only the misses" do
     start_supervised!(
       {Dictionary.Fake,
@@ -109,5 +115,47 @@ defmodule Ashiato.DictionaryTest do
 
     assert Dictionary.Fake.calls() == 2
     assert List.last(Dictionary.Fake.requests()) == {:lookup_many, ["箸"]}
+  end
+
+  describe "Http" do
+    setup do
+      Application.put_env(:ashiato, Dictionary,
+        impl: Dictionary.Http,
+        base_url: "http://dict.test",
+        plug: {Req.Test, __MODULE__}
+      )
+
+      on_exit(fn -> Application.put_env(:ashiato, Dictionary, impl: Dictionary.Fake) end)
+      :ok
+    end
+
+    test "maps lookup replies, fans out batches, and reads a plain-text version" do
+      Req.Test.stub(__MODULE__, fn conn ->
+        case Enum.map(conn.path_info, &URI.decode/1) do
+          ["version"] ->
+            Plug.Conn.send_resp(conn, 200, "2026-08-03\n")
+
+          ["lookup", "食べる"] ->
+            Req.Test.json(conn, %{
+              "words" => [%{"word" => "食べる", "meanings" => ["eat"]}],
+              "kanji" => nil
+            })
+
+          ["lookup", "橋"] ->
+            Req.Test.json(conn, %{
+              "words" => [%{"word" => "橋", "meanings" => ["bridge"]}],
+              "kanji" => nil
+            })
+
+          ["lookup", "ない"] ->
+            Req.Test.json(conn, %{"words" => nil, "kanji" => nil})
+        end
+      end)
+
+      assert Dictionary.Http.dict_version() == {:ok, "2026-08-03"}
+      assert {:ok, %{"words" => [%{"word" => "食べる"}]}} = Dictionary.Http.lookup("食べる")
+      assert Dictionary.Http.lookup("ない") == {:error, :not_found}
+      assert {:ok, %{"食べる" => _, "橋" => _}} = Dictionary.Http.lookup_many(["食べる", "橋"])
+    end
   end
 end

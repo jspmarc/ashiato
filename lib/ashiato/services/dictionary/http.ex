@@ -1,17 +1,19 @@
 defmodule Ashiato.Dictionary.Http do
   @timeout 10_000
+  @max_concurrency 8
 
   @moduledoc """
-  HTTP client for the dictionary service. `JP_DICT_API_URL` must be set; there
-  is no default.
+  HTTP client for `jp-dict-api`. `JP_DICT_API_URL` must be set; there is no default.
 
   Endpoints:
 
-    * `GET  /version`     → `{"version": "..."}`
-    * `POST /lookup`      `{"term": ...}` → `{"entry": {...}}`
-    * `POST /lookup_many` `{"terms": [...]}` → `{"entries": {term => entry}}`
+    * `GET /lookup/{term}` → `{"words": [...] | null, "kanji": {...} | null}`
+    * `GET /version` → plain-text release identifier
 
-  Retries are off: one attempt per call. Each request has a total deadline of
+  The API has no batch lookup, so `lookup_many/1` sends one request per term. An
+  entry is the whole lookup reply, cached as the payload.
+
+  Retries are off: one attempt per request. Each request has a total deadline of
   #{@timeout} ms, so a trickling reply cannot keep the call open indefinitely.
   """
 
@@ -19,35 +21,19 @@ defmodule Ashiato.Dictionary.Http do
 
   @impl true
   @doc """
-  Looks up one term. A reply whose `entry` is not an object is a broken reply, not a
-  `nil` result: caching `nil` would push a crash to the first map access, far from here.
+  Looks up one term. A reply with neither words nor kanji is `{:error, :not_found}`.
+  A reply that is not the documented object is a broken reply, not a `nil` result:
+  caching `nil` would push a crash to the first map access, far from here.
   """
   @spec lookup(String.t()) :: {:ok, map()} | {:error, term()}
   def lookup(term) do
-    case request(:post, "/lookup", %{term: term}) do
-      {:ok, %{"entry" => entry}} when is_map(entry) -> {:ok, entry}
-      {:ok, _body} -> {:error, :unexpected_response}
-      {:error, reason} -> {:error, reason}
-    end
-  end
-
-  @impl true
-  @doc """
-  Looks up many terms in one request. The reply must name exactly the requested
-  terms, and every value must be an object.
-  """
-  @spec lookup_many([String.t()]) :: {:ok, %{String.t() => map()}} | {:error, term()}
-  def lookup_many(terms) do
-    case request(:post, "/lookup_many", %{terms: terms}) do
-      {:ok, %{"entries" => entries}} when is_map(entries) ->
-        missing = terms -- Map.keys(entries)
-        extra = Map.keys(entries) -- terms
-
+    case request("/lookup/" <> URI.encode(term)) do
+      {:ok, %{"words" => words, "kanji" => kanji} = entry} ->
         cond do
-          missing != [] -> {:error, {:not_found, missing}}
-          extra != [] -> {:error, :unexpected_response}
-          Enum.all?(Map.values(entries), &is_map/1) -> {:ok, entries}
-          true -> {:error, :unexpected_response}
+          not valid_words?(words) -> {:error, :unexpected_response}
+          not valid_kanji?(kanji) -> {:error, :unexpected_response}
+          empty_reply?(words, kanji) -> {:error, :not_found}
+          true -> {:ok, entry}
         end
 
       {:ok, _body} ->
@@ -60,58 +46,89 @@ defmodule Ashiato.Dictionary.Http do
 
   @impl true
   @doc """
-  The dictionary release identifier the cache is keyed by.
+  Looks up many terms, one request per term, at most #{@max_concurrency} at a time.
+  Returns `{:ok, map}` keyed by term, or the first error.
+  """
+  @spec lookup_many([String.t()]) :: {:ok, %{String.t() => map()}} | {:error, term()}
+  def lookup_many(terms) do
+    terms
+    |> Task.async_stream(&fetch/1,
+      max_concurrency: @max_concurrency,
+      timeout: @timeout + 5_000,
+      on_timeout: :kill_task
+    )
+    |> Enum.reduce_while({:ok, %{}}, fn
+      {:ok, {term, {:ok, entry}}}, {:ok, acc} -> {:cont, {:ok, Map.put(acc, term, entry)}}
+      {:ok, {_term, {:error, reason}}}, _acc -> {:halt, {:error, reason}}
+      {:exit, reason}, _acc -> {:halt, {:error, {:lookup_many, reason}}}
+    end)
+  end
+
+  @impl true
+  @doc """
+  The dictionary release identifier, read as plain text from `GET /version`.
   """
   @spec dict_version() :: {:ok, String.t()} | {:error, term()}
   def dict_version do
-    case request(:get, "/version", nil) do
-      {:ok, %{"version" => version}} when is_binary(version) -> {:ok, version}
-      {:ok, _body} -> {:error, :unexpected_response}
-      {:error, reason} -> {:error, reason}
+    case request("/version") do
+      {:ok, body} when is_binary(body) ->
+        case String.trim(body) do
+          "" -> {:error, :unexpected_response}
+          version -> {:ok, version}
+        end
+
+      {:ok, _body} ->
+        {:error, :unexpected_response}
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 
-  @spec request(:get | :post, String.t(), map() | nil) :: {:ok, term()} | {:error, term()}
-  defp request(method, path, body) do
+  defp fetch(term), do: {term, lookup(term)}
+
+  defp valid_words?(nil), do: true
+  defp valid_words?(words) when is_list(words), do: Enum.all?(words, &is_map/1)
+  defp valid_words?(_words), do: false
+
+  defp valid_kanji?(nil), do: true
+  defp valid_kanji?(kanji), do: is_map(kanji)
+
+  defp empty_reply?(words, kanji), do: (is_nil(words) or words == []) and is_nil(kanji)
+
+  @spec request(String.t()) :: {:ok, term()} | {:error, term()}
+  defp request(path) do
     with {:ok, base} <- base_url() do
-      case call(method, base <> path, body) do
-        {:ok, %Req.Response{status: 200, body: decoded}} -> {:ok, decoded}
+      req = Req.new(Keyword.take(Application.get_env(:ashiato, Ashiato.Dictionary, []), [:plug]))
+
+      case Req.request(req,
+             url: base <> path,
+             retry: false,
+             receive_timeout: @timeout,
+             request_timeout: @timeout
+           ) do
+        {:ok, %Req.Response{status: 200, body: body}} -> {:ok, body}
         {:ok, %Req.Response{status: status}} -> {:error, {:unexpected_status, status}}
         {:error, exception} -> {:error, exception}
       end
     end
   end
 
-  @spec call(:get | :post, String.t(), map() | nil) ::
-          {:ok, Req.Response.t()} | {:error, term()}
-  defp call(:get, url, nil),
-    do: Req.get(url, retry: false, receive_timeout: @timeout, request_timeout: @timeout)
-
-  defp call(:post, url, body),
-    do:
-      Req.post(url,
-        json: body,
-        retry: false,
-        receive_timeout: @timeout,
-        request_timeout: @timeout
-      )
-
-  @spec base_url() ::
-          {:ok, String.t()} | {:error, :jp_dict_api_url_unset | :invalid_jp_dict_api_url}
+  @spec base_url() :: {:ok, String.t()} | {:error, :base_url_not_configured | :invalid_base_url}
   defp base_url do
-    case System.fetch_env("JP_DICT_API_URL") do
-      {:ok, url} ->
+    case Application.get_env(:ashiato, Ashiato.Dictionary, [])[:base_url] do
+      nil ->
+        {:error, :base_url_not_configured}
+
+      url ->
         case URI.parse(url) do
           %URI{scheme: scheme, host: host}
           when scheme in ["http", "https"] and host != nil and host != "" ->
             {:ok, String.trim_trailing(url, "/")}
 
           _ ->
-            {:error, :invalid_jp_dict_api_url}
+            {:error, :invalid_base_url}
         end
-
-      :error ->
-        {:error, :jp_dict_api_url_unset}
     end
   end
 end

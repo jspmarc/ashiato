@@ -27,9 +27,11 @@ defmodule Ashiato.Dictionary do
   old rows simply stop matching and a fresh row is inserted, because the ledger
   must not silently rewrite what it claims you studied (P9).
 
-  The `dict_version/0` needed to build the key is memoised (`current_version/1`), so a
-  cache hit makes no network call and keeps working while the service is down. Only a
-  miss talks to the service.
+  The `dict_version/0` needed to build the key is memoised (`current_version/1`) and falls
+  back to the newest `dict_version` already in the cache after a restart, so a cache hit
+  makes no network call and keeps working while the service is down. Only a miss talks to
+  the service. `refresh_version/0` is what the scheduled release check (§6.9) calls to pick
+  up a new release; the lookup path never asks for the version once one is known.
 
   Callbacks are the raw service calls; `Http` and `Fake` implement them.
   """
@@ -41,11 +43,6 @@ defmodule Ashiato.Dictionary do
   alias Ashiato.Utils
 
   @type entry :: map()
-
-  # How long a fetched `dict_version` is trusted before the service is asked again. Long
-  # enough that a page's worth of lookups asks once, short enough that a JMdict release is
-  # picked up without a restart.
-  @version_ttl_ms 300_000
 
   @callback lookup(term :: String.t()) :: {:ok, entry()} | {:error, term()}
   @callback lookup_many(terms :: [String.t()]) ::
@@ -77,7 +74,11 @@ defmodule Ashiato.Dictionary do
          {:ok, dict_version} <- current_version(impl) do
       kind = kind_for(term)
 
-      case Repo.get_by(DictCacheEntry, kind: kind, cache_key: term, dict_version: dict_version) do
+      case Repo.get_by(
+             DictCacheEntry,
+             [kind: kind, cache_key: term, dict_version: dict_version],
+             log: false
+           ) do
         %DictCacheEntry{payload: payload} ->
           {:ok, payload}
 
@@ -134,42 +135,38 @@ defmodule Ashiato.Dictionary do
   end
 
   @doc """
-  The service's `dict_version/0`, memoised so a cache hit makes no network call.
+  The `dict_version/0` the cache is keyed by, memoised so a cache hit makes no network call.
 
   The version is part of the cache key, so it has to be known before a row can be matched.
   Asking the service on every lookup would mean a cache hit still hit the network — and a
   cached word would become unavailable the moment the service went down, which is the
-  opposite of the degradation §7.1 asks for. The memo expires after #{@version_ttl_ms} ms;
-  when the service is unreachable the last known version is reused for as long as it takes.
+  opposite of the degradation §7.1 asks for. A cold memo therefore reads the newest
+  `dict_version` already in the cache; only a database with no rows at all asks the service,
+  and that call can never replace a cache hit.
 
-  The scheduled JMdict release check (§6.9) and tests call `forget_version/0` to pick up a
-  new release immediately instead of waiting for the expiry.
+  `refresh_version/0` changes the version; nothing on the lookup path does.
   """
   @spec current_version(module()) :: {:ok, String.t()} | {:error, term()}
   def current_version(impl) do
-    now = System.monotonic_time(:millisecond)
-
     key = version_key(impl)
 
-    case :persistent_term.get(key, nil) do
-      {version, fetched_at} when now - fetched_at < @version_ttl_ms ->
+    case :persistent_term.get(key, :cold) do
+      {:ok, version} ->
         {:ok, version}
 
-      memo ->
-        case impl.dict_version() do
+      :cold ->
+        case newest_cached_version() do
           {:ok, version} ->
-            :persistent_term.put(key, {version, now})
+            :persistent_term.put(key, {:ok, version})
             {:ok, version}
 
-          error ->
-            # Stale-but-usable beats unavailable, and the memo's timestamp is refreshed so
-            # an outage costs one failed version call per TTL, not one per lookup.
-            case memo do
-              {version, _fetched_at} ->
-                :persistent_term.put(key, {version, now})
+          :error ->
+            case impl.dict_version() do
+              {:ok, version} ->
+                :persistent_term.put(key, {:ok, version})
                 {:ok, version}
 
-              nil ->
+              error ->
                 error
             end
         end
@@ -177,14 +174,66 @@ defmodule Ashiato.Dictionary do
   end
 
   @doc """
-  Drops the memoised `dict_version/0`, so the next lookup asks the service again.
+  Asks the service for its current `dict_version/0` and memoises it.
 
-  Called by the scheduled release check and by tests; nothing on the request path needs it.
+  This is the only place the release is refreshed, and §6.9's scheduled check calls it, so a
+  new JMdict release never turns a cache hit into a network call. When the service is
+  unreachable the last known version is kept and returned, so a failed check changes nothing.
+
+  The refreshed value lives in VM memory until the first row for the new version is written.
+  A restart inside that window re-derives the previous version from the cache. Durable
+  tracking needs a settings or migration card; no such store exists in this card's scope.
+  """
+  @spec refresh_version() :: {:ok, String.t()} | {:error, term()}
+  def refresh_version do
+    impl = service()
+    key = version_key(impl)
+
+    case impl.dict_version() do
+      {:ok, version} ->
+        :persistent_term.put(key, {:ok, version})
+        {:ok, version}
+
+      error ->
+        case :persistent_term.get(key, :cold) do
+          {:ok, version} ->
+            {:ok, version}
+
+          :cold ->
+            case newest_cached_version() do
+              {:ok, version} ->
+                :persistent_term.put(key, {:ok, version})
+                {:ok, version}
+
+              :error ->
+                error
+            end
+        end
+    end
+  end
+
+  @doc """
+  Drops the memoised `dict_version/0` so the next lookup re-derives it. Tests use this for
+  isolation; the release check uses `refresh_version/0`.
   """
   @spec forget_version() :: :ok
   def forget_version do
     :persistent_term.erase(version_key(service()))
     :ok
+  end
+
+  @spec newest_cached_version() :: {:ok, String.t()} | :error
+  defp newest_cached_version do
+    from(d in DictCacheEntry,
+      order_by: [desc: d.fetched_at, desc: d.id],
+      limit: 1,
+      select: d.dict_version
+    )
+    |> Repo.all(log: false)
+    |> case do
+      [version] -> {:ok, version}
+      [] -> :error
+    end
   end
 
   # Keyed by implementation: a fake version set by one test must not leak into the next
@@ -225,11 +274,13 @@ defmodule Ashiato.Dictionary do
 
   @spec cached_payloads([String.t()], String.t()) :: %{String.t() => entry()}
   defp cached_payloads(terms, dict_version) do
+    # cache_key determines `kind` via kind_for/1, so term+version already identifies the
+    # composite key — no `kind` filter needed.
     from(e in DictCacheEntry,
       where: e.dict_version == ^dict_version and e.cache_key in ^terms,
       select: {e.cache_key, e.payload}
     )
-    |> Repo.all()
+    |> Repo.all(log: false)
     |> Map.new()
   end
 
@@ -250,16 +301,16 @@ defmodule Ashiato.Dictionary do
     })
     # keeps Ecto's default index name, matching both adapters
     |> Ecto.Changeset.unique_constraint([:kind, :cache_key, :dict_version])
-    |> Repo.insert()
+    |> Repo.insert(log: false)
     |> case do
       {:ok, row} ->
         {:ok, row}
 
       {:error, changeset} ->
-        case Repo.get_by(DictCacheEntry,
-               kind: kind,
-               cache_key: cache_key,
-               dict_version: dict_version
+        case Repo.get_by(
+               DictCacheEntry,
+               [kind: kind, cache_key: cache_key, dict_version: dict_version],
+               log: false
              ) do
           %DictCacheEntry{} = winner -> {:ok, winner}
           nil -> {:error, changeset}

@@ -79,9 +79,8 @@ defmodule Ashiato.DictionaryTest do
     snapshot = Map.take(old, [:id, :kind, :cache_key, :dict_version, :payload, :fetched_at])
 
     Dictionary.Fake.set_version("2026-2")
-    # a new release is picked up by the scheduled check (§6.9) flipping the memo, not by
-    # each lookup asking the service
-    Dictionary.forget_version()
+    # a new release is picked up by the scheduled check (§6.9), not by each lookup asking
+    assert Dictionary.refresh_version() == {:ok, "2026-2"}
 
     assert {:ok, @entry_a} = Dictionary.lookup("食べる")
     assert Dictionary.Fake.calls() == 2

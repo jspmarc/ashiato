@@ -117,14 +117,20 @@ defmodule Ashiato.StorageTest do
       assert {:error, :invalid_key} = Local.put("/etc/passwd", "nope")
       assert {:error, :invalid_key} = Local.put("nested/../escape", "nope")
       assert {:error, :invalid_key} = Local.put("", "nope")
+      assert {:error, :invalid_key} = Local.put("pages/1\0.jpg", "nope")
       assert {:error, :invalid_key} = Local.presigned_get("../escape", 300)
 
       refute File.exists?(escape_path)
     end
 
-    @tag :tmp_dir
     test "a symlink inside the root cannot reach outside it", %{tmp_dir: tmp_dir} do
-      outside = Path.join(tmp_dir, "outside")
+      outside = Path.join(Path.dirname(tmp_dir), Path.basename(tmp_dir) <> "-outside")
+
+      on_exit(fn ->
+        File.rm_rf(outside)
+        File.rm(Path.join(tmp_dir, "link"))
+      end)
+
       File.mkdir_p!(outside)
       File.write!(Path.join(outside, "secret.txt"), "not yours")
       File.ln_s!(outside, Path.join(Local.root(), "link"))

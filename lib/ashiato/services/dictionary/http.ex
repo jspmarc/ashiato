@@ -1,4 +1,6 @@
 defmodule Ashiato.Dictionary.Http do
+  @timeout 10_000
+
   @moduledoc """
   The real `jp-dict-api` client (§7.1). `JP_DICT_API_URL` must be set; there is
   no sensible default because the service does not exist yet.
@@ -11,7 +13,8 @@ defmodule Ashiato.Dictionary.Http do
 
   Retries are off on purpose: the app degrades to recording encounters without
   enrichments when the service is down (§7.1), so a retry would just stretch the
-  degradation window without changing the outcome. Tests never call this module.
+  degradation window without changing the outcome. Each request has a total deadline of
+  #{@timeout} ms, so a trickling reply cannot hold the ingest pipeline. Tests never call this module.
   """
 
   @behaviour Ashiato.Dictionary
@@ -39,9 +42,15 @@ defmodule Ashiato.Dictionary.Http do
   def lookup_many(terms) do
     case request(:post, "/lookup_many", %{terms: terms}) do
       {:ok, %{"entries" => entries}} when is_map(entries) ->
-        if Enum.all?(Map.values(entries), &is_map/1),
-          do: {:ok, entries},
-          else: {:error, :unexpected_response}
+        missing = terms -- Map.keys(entries)
+        extra = Map.keys(entries) -- terms
+
+        cond do
+          missing != [] -> {:error, {:not_found, missing}}
+          extra != [] -> {:error, :unexpected_response}
+          Enum.all?(Map.values(entries), &is_map/1) -> {:ok, entries}
+          true -> {:error, :unexpected_response}
+        end
 
       {:ok, _body} ->
         {:error, :unexpected_response}
@@ -77,14 +86,34 @@ defmodule Ashiato.Dictionary.Http do
 
   @spec call(:get | :post, String.t(), map() | nil) ::
           {:ok, Req.Response.t()} | {:error, term()}
-  defp call(:get, url, nil), do: Req.get(url, retry: false)
-  defp call(:post, url, body), do: Req.post(url, json: body, retry: false)
+  defp call(:get, url, nil),
+    do: Req.get(url, retry: false, receive_timeout: @timeout, request_timeout: @timeout)
 
-  @spec base_url() :: {:ok, String.t()} | {:error, :jp_dict_api_url_unset}
+  defp call(:post, url, body),
+    do:
+      Req.post(url,
+        json: body,
+        retry: false,
+        receive_timeout: @timeout,
+        request_timeout: @timeout
+      )
+
+  @spec base_url() ::
+          {:ok, String.t()} | {:error, :jp_dict_api_url_unset | :invalid_jp_dict_api_url}
   defp base_url do
     case System.fetch_env("JP_DICT_API_URL") do
-      {:ok, url} -> {:ok, String.trim_trailing(url, "/")}
-      :error -> {:error, :jp_dict_api_url_unset}
+      {:ok, url} ->
+        case URI.parse(url) do
+          %URI{scheme: scheme, host: host}
+          when scheme in ["http", "https"] and host != nil and host != "" ->
+            {:ok, String.trim_trailing(url, "/")}
+
+          _ ->
+            {:error, :invalid_jp_dict_api_url}
+        end
+
+      :error ->
+        {:error, :jp_dict_api_url_unset}
     end
   end
 end

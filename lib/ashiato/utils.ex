@@ -32,6 +32,26 @@ defmodule Ashiato.Utils do
   end
 
   @doc """
+  Converts katakana to hiragana, leaving every other character untouched.
+
+  Katakana U+30A1..U+30F6 map to hiragana by subtracting 0x60. `ー` (U+30FC) is outside that range
+  and passes through, so the prolonged sound mark survives in either script.
+  """
+  @spec to_hiragana(String.t()) :: String.t()
+  def to_hiragana(text) do
+    text
+    |> String.codepoints()
+    |> Enum.map(&to_hiragana_codepoint/1)
+    |> IO.iodata_to_binary()
+  end
+
+  defp to_hiragana_codepoint(<<codepoint::utf8>>) when codepoint in 0x30A1..0x30F6 do
+    <<codepoint - 0x60::utf8>>
+  end
+
+  defp to_hiragana_codepoint(codepoint), do: codepoint
+
+  @doc """
   The current time truncated to whole seconds, matching the `:utc_datetime`
   columns.
   """

@@ -7,7 +7,8 @@ defmodule Ashiato.Dictionary.Fake do
   where `opts` accepts `:entries` (`%{term => entry}`) and `:version`
   (defaults `"test-dict-1"`).
 
-  `calls/0` counts `lookup/1` and `lookup_many/1` invocations only —
+  `calls/0` counts lookups. `requests/0` records the exact arguments sent
+  to `lookup/1` and `lookup_many/1`.
   `dict_version/0` is cheap metadata used to build the cache key, so it is not
   counted. That is the counter the façade's "a cache hit makes zero lookup
   calls" guarantee is measured against. `set_version/1` simulates a JMdict
@@ -24,6 +25,7 @@ defmodule Ashiato.Dictionary.Fake do
   def lookup(term) do
     Agent.get_and_update(__MODULE__, fn state ->
       state = count_call(state)
+      state = put_in(state.requests, [{:lookup, term} | state.requests])
 
       case Map.fetch(state.entries, term) do
         {:ok, entry} -> {{:ok, entry}, state}
@@ -39,6 +41,7 @@ defmodule Ashiato.Dictionary.Fake do
   def lookup_many(terms) do
     Agent.get_and_update(__MODULE__, fn state ->
       state = count_call(state)
+      state = put_in(state.requests, [{:lookup_many, terms} | state.requests])
       entries = Map.take(state.entries, terms)
       missing = terms -- Map.keys(entries)
 
@@ -74,17 +77,27 @@ defmodule Ashiato.Dictionary.Fake do
   @spec set_version(String.t()) :: :ok
   def set_version(version), do: Agent.update(__MODULE__, &%{&1 | version: version})
 
+  @doc """
+  Starts the Agent for per-test use.
+
+  Accepts `:entries` (`%{term => entry}`) and `:version` (defaults `"test-dict-1"`).
+  """
   @spec start_link(keyword()) :: {:ok, pid()} | {:error, term()}
   def start_link(opts) do
     state = %{
       version: Keyword.get(opts, :version, "test-dict-1"),
       entries: Keyword.get(opts, :entries, %{}),
       calls: 0,
-      version_calls: 0
+      version_calls: 0,
+      requests: []
     }
 
     Agent.start_link(fn -> state end, name: __MODULE__)
   end
+
+  @doc "Records every `lookup/1` and `lookup_many/1` call as `{:lookup, term}` or `{:lookup_many, terms}`."
+  @spec requests() :: [{:lookup, String.t()} | {:lookup_many, [String.t()]}]
+  def requests, do: Agent.get(__MODULE__, &Enum.reverse(&1.requests))
 
   @spec count_call(%{calls: non_neg_integer()}) :: %{calls: non_neg_integer()}
   defp count_call(state), do: %{state | calls: state.calls + 1}

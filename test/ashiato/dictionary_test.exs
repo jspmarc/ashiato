@@ -108,5 +108,6 @@ defmodule Ashiato.DictionaryTest do
              Dictionary.lookup_many(["食べる", "橋", "箸"])
 
     assert Dictionary.Fake.calls() == 2
+    assert List.last(Dictionary.Fake.requests()) == {:lookup_many, ["箸"]}
   end
 end

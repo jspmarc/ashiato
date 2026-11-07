@@ -76,6 +76,30 @@ defmodule Ashiato.SettingsTest do
              }
     end
 
+    test "a put for a missing user is an error tuple, not a constraint raise" do
+      assert {:error, changeset} = Settings.put(-1, "new_cards_per_day", 1)
+      assert {msg, _opts} = changeset.errors[:user_id]
+      refute msg == ""
+    end
+
+    test "storing a secret with no SECRET_KEY_BASE is an error tuple", %{
+      user: user
+    } do
+      endpoint_config = Application.get_env(:ashiato, AshiatoWeb.Endpoint)
+
+      on_exit(fn ->
+        case endpoint_config do
+          nil -> Application.delete_env(:ashiato, AshiatoWeb.Endpoint)
+          cfg -> Application.put_env(:ashiato, AshiatoWeb.Endpoint, cfg)
+        end
+      end)
+
+      Application.delete_env(:ashiato, AshiatoWeb.Endpoint)
+
+      assert Settings.put(user.id, "OPENAI_API_KEY", "sk-1", secret: true) ==
+               {:error, :secret_key_base_missing}
+    end
+
     test "a secret that fails authentication returns the default, logged without the value", %{
       user: user
     } do
@@ -118,7 +142,25 @@ defmodule Ashiato.SettingsTest do
       Application.put_env(:ashiato, :settings, Ashiato.Settings.Fake)
       start_supervised!(Ashiato.Settings.Fake)
 
-      on_exit(fn -> Application.delete_env(:ashiato, :settings) end)
+      orig = %{
+        "OPENAI_API_KEY" => System.get_env("OPENAI_API_KEY"),
+        "DEEPL_API_KEY" => System.get_env("DEEPL_API_KEY"),
+        "GOOGLE_CLOUD_API_KEY" => System.get_env("GOOGLE_CLOUD_API_KEY"),
+        "LIBRETRANSLATE_URL" => System.get_env("LIBRETRANSLATE_URL")
+      }
+
+      for {key, _} <- orig, do: System.delete_env(key)
+
+      on_exit(fn ->
+        for {key, val} <- orig do
+          case val do
+            nil -> System.delete_env(key)
+            v -> System.put_env(key, v)
+          end
+        end
+
+        Application.delete_env(:ashiato, :settings)
+      end)
 
       {:ok, user: user_fixture()}
     end
@@ -147,7 +189,6 @@ defmodule Ashiato.SettingsTest do
 
     test "ai_capable? falls back to the environment for the key", %{user: user} do
       System.put_env("OPENAI_API_KEY", "sk-from-env")
-      on_exit(fn -> System.delete_env("OPENAI_API_KEY") end)
 
       Settings.impl().put(user.id, "ai_features_enabled", true, [])
 
@@ -182,7 +223,6 @@ defmodule Ashiato.SettingsTest do
 
     test "a stored null key does not fall through to the environment", %{user: user} do
       System.put_env("DEEPL_API_KEY", "dl-from-env")
-      on_exit(fn -> System.delete_env("DEEPL_API_KEY") end)
 
       impl = Settings.impl()
       impl.put(user.id, "translation_enabled", true, [])

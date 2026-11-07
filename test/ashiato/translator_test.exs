@@ -11,6 +11,7 @@ defmodule Ashiato.TranslatorTest do
 
   alias Ashiato.Translator
   alias Ashiato.Translator.Fake
+  alias Ashiato.Translator.Llm
 
   setup do
     Application.put_env(:ashiato, Translator, provider: Fake)
@@ -134,12 +135,159 @@ defmodule Ashiato.TranslatorTest do
            ) == {:error, :unparsable}
   end
 
+  test "llm uses the Responses API with a JSON schema" do
+    configure_llm()
+    parent = self()
+
+    Req.Test.stub(__MODULE__, fn conn ->
+      {:ok, raw, conn} = Plug.Conn.read_body(conn)
+      auth = Plug.Conn.get_req_header(conn, "authorization")
+      send(parent, {:llm_request, conn.method, conn.request_path, auth, Jason.decode!(raw)})
+
+      Req.Test.json(conn, %{
+        "status" => "completed",
+        "output" => [
+          %{
+            "type" => "message",
+            "content" => [
+              %{"type" => "output_text", "text" => ~s({"translations":["one","two"]})}
+            ]
+          }
+        ]
+      })
+    end)
+
+    assert Llm.page_request(["一"], target_lang: "en") == {:ok, ["one", "two"]}
+
+    assert_received {:llm_request, "POST", "/v1/responses", ["Bearer test-key"], body}
+    assert body["text"]["format"]["type"] == "json_schema"
+    assert body["text"]["format"]["schema"]["required"] == ["translations"]
+    assert body["input"] |> Enum.at(1) |> Map.fetch!("content") =~ "一"
+  end
+
+  test "llm rejects incomplete and refused responses" do
+    configure_llm()
+
+    Req.Test.stub(__MODULE__, fn conn ->
+      Req.Test.json(conn, %{
+        "status" => "incomplete",
+        "output" => [
+          %{
+            "type" => "message",
+            "content" => [%{"type" => "output_text", "text" => ~s({"translations":[]})}]
+          }
+        ]
+      })
+    end)
+
+    assert Llm.page_request(["一"], target_lang: "en") == {:error, :unparsable}
+
+    Req.Test.stub(__MODULE__, fn conn ->
+      Req.Test.json(conn, %{
+        "status" => "completed",
+        "output" => [
+          %{"type" => "message", "content" => [%{"type" => "refusal", "refusal" => "no"}]}
+        ]
+      })
+    end)
+
+    assert Llm.page_request(["一"], target_lang: "en") == {:error, :unparsable}
+
+    Req.Test.stub(__MODULE__, fn conn ->
+      Req.Test.json(conn, %{
+        "status" => "completed",
+        "output" => [
+          %{
+            "type" => "message",
+            "content" => [
+              %{"type" => "output_text", "text" => ~s({"translations":"not a list"})}
+            ]
+          }
+        ]
+      })
+    end)
+
+    assert Llm.page_request(["一"], target_lang: "en") == {:error, :unparsable}
+  end
+
+  test "llm falls back to chat completions when responses is missing" do
+    configure_llm()
+
+    Req.Test.stub(__MODULE__, fn conn ->
+      if conn.request_path == "/v1/responses" do
+        Plug.Conn.send_resp(conn, 404, "")
+      else
+        {:ok, raw, conn} = Plug.Conn.read_body(conn)
+        send(self(), {:chat_body, Jason.decode!(raw)})
+
+        Req.Test.json(conn, %{
+          "choices" => [
+            %{
+              "finish_reason" => "stop",
+              "message" => %{"content" => ~s({"translations":["one"]})}
+            }
+          ]
+        })
+      end
+    end)
+
+    assert Llm.page_request(["一"], target_lang: "en") == {:ok, ["one"]}
+
+    assert_received {:chat_body, body}
+    assert body["response_format"]["type"] == "json_schema"
+    assert body["response_format"]["json_schema"]["strict"] == true
+  end
+
+  test "llm rejects chat replies that did not finish" do
+    configure_llm()
+
+    Req.Test.stub(__MODULE__, fn conn ->
+      if conn.request_path == "/v1/responses" do
+        Plug.Conn.send_resp(conn, 404, "")
+      else
+        Req.Test.json(conn, %{
+          "choices" => [
+            %{
+              "finish_reason" => "length",
+              "message" => %{"content" => ~s({"translations":["one"]})}
+            }
+          ]
+        })
+      end
+    end)
+
+    assert Llm.page_request(["一"], target_lang: "en") == {:error, :unparsable}
+  end
+
+  defp configure_llm do
+    key = System.get_env("OPENAI_API_KEY")
+    base = System.get_env("OPENAI_BASE_URL")
+
+    System.put_env("OPENAI_API_KEY", "test-key")
+    System.put_env("OPENAI_BASE_URL", "https://api.openai.com/v1")
+
+    on_exit(fn ->
+      restore_env("OPENAI_API_KEY", key)
+      restore_env("OPENAI_BASE_URL", base)
+    end)
+
+    Application.put_env(:ashiato, Translator,
+      provider: Llm,
+      plug: {Req.Test, __MODULE__}
+    )
+  end
+
+  defp restore_env(name, nil), do: System.delete_env(name)
+  defp restore_env(name, value), do: System.put_env(name, value)
+
   test "refused provider enters cooldown" do
     on_exit(fn -> Translator.clear_cooldowns() end)
     Translator.clear_cooldowns()
     start_supervised!({Fake, error: {:http, 429}})
 
     assert Translator.translate_page(["一"], target_lang: "en") == {:error, {:http, 429}}
+
+    assert {:error, {:cooldown, _seconds}} = Fake.translate_page(["一"], target_lang: "en")
 
     assert {:error, {:cooldown, seconds}} =
              Translator.translate_page(["一"], target_lang: "en")

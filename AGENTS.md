@@ -4,6 +4,22 @@ This is a web application written using the Phoenix web framework.
 
 - Use `mix precommit` alias when you are done with all changes and fix any pending issues
 - Use the already included and available `:req` (`Req`) library for HTTP requests, **avoid** `:httpoison`, `:tesla`, and `:httpc`. Req is included by default and is the preferred HTTP client for Phoenix apps
+- For unit tests, avoid testing private functions unless absolutely necessary (ask the user's permission to test private or protected functions).
+
+### Elixir style
+
+- Capture syntax is fine for one short expression. **Never** nest captures; use `fn` for anything past that:
+
+      # FINE
+      Enum.map(xs, &(&1 * 2))
+      Enum.map(xs, &String.trim/1)
+      Task.async(&page_request/2)
+
+      # BANNED
+      Enum.map(xs, &Enum.map(&1, &String.trim/1))
+
+      # REQUIRED INSTEAD
+      Enum.map(xs, fn x -> Enum.map(x, &String.trim/1) end)
 
 ### Code layout
 
@@ -95,7 +111,6 @@ custom classes must fully style the input
    - Instead of sleeping to synchronize before the next call, **always** use `_ = :sys.get_state/1` to ensure the process has handled prior messages
 - Only add unit tests for public functions and methods, unless instructed otherwise.
 <!-- phoenix:elixir-end -->
-- For tests, avoid testing private functions unless absolutely necessary (ask the user's permission to test private or protected functions).
 
 <!-- phoenix:phoenix-start -->
 ## Phoenix guidelines

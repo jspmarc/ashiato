@@ -35,6 +35,8 @@ problem this app does not have.
 ## 2. Non-goals (v1)
 
 - Multi-user (not planned; schema prepared for it, see §1.1), accounts, sharing, social features
+- Per-user translation provider selection; the provider and its credentials are server-wide for now
+  (§7.5)
 - **Standard JLPT-level decks for introduction.** Planned, not in v1: introducing cards from a
   canned N5–N1 ordering instead of only from your own encounters. The ledger stays the default source
   of truth for what gets studied; a standard deck is an opt-in shortcut, not a replacement.
@@ -279,7 +281,7 @@ its own provider set, its own switch, and its own credentials.
 |---|---|---|
 | R7.1 | S | Mnemonic generation for a word or kanji. Stored, cached, user-editable. Regenerating over an edit requires confirmation and keeps the previous version. Records which model and prompt version produced each. |
 | R7.2 | S | Generate 1–3 example sentences per word. The prompt includes the user's own recorded meaning and the source sentence, so generated sentences match the sense actually learned. Validate the target word appears with the expected reading before displaying. |
-| R7.3 | S | Passage translation in one request per page, so cross-line context survives. The `llm` provider is asked for a **JSON array** of strings and falls back to per-line if it does not parse; NMT providers return line-aligned text directly. Results cached per line by `(lang, line)`. Provider and gate: §7.5. |
+| R7.3 | S | Passage translation in one request per page, so cross-line context survives. The `llm` provider is asked for a **JSON object with a `translations` array of strings** and falls back to per-line if it does not parse; NMT providers return line-aligned text directly. Results cached per line by `(lang, line)`. Provider and gate: §7.5. |
 | R7.4 | M | Settings screen: choose the translation provider from all of them, toggle translation, and enter each provider's credentials. Each provider displays its readiness. No provider is privileged. |
 
 **Note:** the user's own encounters are the primary source of example sentences. Generated ones are
@@ -832,7 +834,6 @@ for a personal toy; a poor foundation for something shipped.
 | `llm` | OpenAI-compatible key or a local server | Best with page context | The only provider that can use surrounding lines, speaker, and register |
 | `deepl` | DeepL API key (free tier exists) | Strongest on prose | Weakest on slang and casual game dialogue |
 | `google_cloud` | Cloud Translation key (paid) | Same engine, supported contract | The official API — use this if you need reliability you can depend on |
-| `libretranslate` | None; self-hosted URL | Weakest | Fully offline. Japanese is supported (ja↔en Argos models, ~112 MB) but it is a small NMT model |
 | `off` | — | — | Disables translation entirely |
 
 **Default provider is `google_free`**, because it is the only one that works on a fresh install with no
@@ -854,7 +855,7 @@ Three caveats that are not optional to state:
 **Every provider is equally available and the user picks.** `google_free` is only the *initial* value, so a
 fresh install has something working; it is not privileged. Selection, the enable switch, and each
 provider's credentials are all editable in the app's Settings screen, and each provider shows whether it
-is ready — "needs an API key", "needs a URL", "ready" — so a misconfiguration is visible before a page
+is ready — "needs an API key" or "ready" — so a misconfiguration is visible before a page
 fails.
 
 Credentials entered in the UI are stored in `settings` with `secret = true`, encrypted at rest using a key
@@ -873,8 +874,12 @@ Capability, computed at boot alongside the AI gate:
 translate_capable = translation_enabled AND provider_configured(translation_provider)
 ```
 
-Where `provider_configured` means the key or URL that provider needs is present. No `translation_enabled`
+Where `provider_configured` means the key that provider needs is present. No `translation_enabled`
 switch means no translate affordance anywhere in the UI — hidden, not failing.
+
+**Per-user provider selection is out of scope for now.** The provider and its credentials are
+server-wide. Settings rows are per-user (D47), so multi-user can add per-user selection later without
+a migration; until then every user on the same server shares the selected provider.
 
 ---
 
@@ -884,10 +889,9 @@ switch means no translate affordance anywhere in the UI — hidden, not failing.
 |---|---|---|
 | `ai_features_enabled` | `false` | The switch for mnemonics and example sentences. Does not imply credentials exist |
 | `translation_enabled` | `false` | UI-editable. Off by default so nothing is sent off-host until opted in |
-| `translation_provider` | `google_free` | UI-editable. `google_free`, `llm`, `deepl`, `google_cloud`, `libretranslate`, `off` |
+| `translation_provider` | `google_free` | UI-editable. `google_free`, `llm`, `deepl`, `google_cloud`, `off` |
 | `deepl_api_key` | unset | Only read for the `deepl` provider |
 | `google_cloud_api_key` | unset | Only read for the `google_cloud` provider |
-| `libretranslate_url` | unset | Only read for the `libretranslate` provider; the key is optional (self-hosted) |
 | `OPENAI_BASE_URL` | `https://api.openai.com/v1` | Any OpenAI-compatible endpoint: llama.cpp, vLLM, proxy |
 | `OPENAI_API_KEY` | unset | Credentials only. No default; empty means AI features are unavailable |
 | `JP_DICT_API_URL` | — | Dictionary service |
@@ -944,7 +948,7 @@ switch means no translate affordance anywhere in the UI — hidden, not failing.
 | D10 | Import as known baseline | Import SRS intervals | Foreign intervals and local FSRS parameters do not merge |
 | D11 | `OPENAI_BASE_URL` | `OPENAI_API_BASE_URL` | Conventional name; SDKs and proxies expect it |
 | D43 | AI capability = switch **and** non-empty key; base URL defaults to OpenAI | Treat the env vars as the switch | OCR no longer needs those credentials, so they are genuinely optional; an empty key must disable the feature rather than fail at call time |
-| D44 | Translate the page in one request, asking for a JSON array; fall back to per-line | Per-line only, or jp-reader's numbered-prose batching | A sentence split across two OCR lines only translates correctly when the model sees the page; JSON survives round-trip far better than "1. 2. 3." prose |
+| D44 | Translate the page in one request, asking for structured JSON; fall back to per-line | Per-line only, or jp-reader's numbered-prose batching | A sentence split across two OCR lines only translates correctly when the model sees the page; JSON survives round-trip far better than "1. 2. 3." prose |
 | D45 | Translation is a provider behaviour, defaulting to `google_free` | Ship `off`, or default to a paid engine | It is the only provider that works on a fresh install with no key and no server; at single-user volume the rate limits are irrelevant. `translation_enabled` stays off so nothing leaves the host until asked |
 | D46 | Translation lives in the Elixir app, not a Python service | Add it to the NLP service | It is one HTTP call with no local model, and the cache belongs in the ledger's database |
 | D47 | Settings are a per-user key-value table; secrets encrypted with a key from `SECRET_KEY_BASE` | A column per setting, or credentials in env only | The schema is still moving and a settings UI would otherwise cost a migration per toggle; typed access stops the looseness at one boundary |

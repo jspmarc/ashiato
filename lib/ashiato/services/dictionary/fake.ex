@@ -11,7 +11,7 @@ defmodule Ashiato.Dictionary.Fake do
   to `lookup/1` and `lookup_many/1`.
   `dict_version/0` is cheap metadata used to build the cache key, so it is not
   counted. That is the counter the façade's "a cache hit makes zero lookup
-  calls" guarantee is measured against. `set_version/1` simulates a JMdict
+  calls" guarantee is measured against. `set_version/1` simulates a new dictionary
   release bump: the façade must then ignore the old rows, not rewrite them.
   """
 
@@ -73,7 +73,7 @@ defmodule Ashiato.Dictionary.Fake do
   @spec calls() :: non_neg_integer()
   def calls, do: Agent.get(__MODULE__, & &1.calls)
 
-  @doc "Replaces the canned `dict_version`, simulating a new JMdict release."
+  @doc "Replaces the canned `dict_version`, simulating a new dictionary release."
   @spec set_version(String.t()) :: :ok
   def set_version(version), do: Agent.update(__MODULE__, &%{&1 | version: version})
 

@@ -1,7 +1,7 @@
 defmodule Ashiato.DictionaryTest do
   @moduledoc """
   Drives the cache façade through the Fake: a cache hit makes zero service
-  lookups, a version bump ignores old rows instead of mutating them (P9), and
+  lookups, a version bump ignores old rows instead of mutating them, and
   `lookup_many/1` returns a map keyed by term while fetching only the misses.
   """
 
@@ -54,7 +54,7 @@ defmodule Ashiato.DictionaryTest do
 
   test "a miss and a cache hit return the same shape" do
     # The service may hand back atom keys; a row round-tripped through the JSON column
-    # always comes back string-keyed. Wave 3 must not have to care which call it made.
+    # always comes back string-keyed. Both calls must return the same shape.
     start_supervised!({Dictionary.Fake, version: "2026-1", entries: %{"食べる" => %{gloss: "eat"}}})
 
     assert {:ok, first} = Dictionary.lookup("食べる")
@@ -79,7 +79,7 @@ defmodule Ashiato.DictionaryTest do
     snapshot = Map.take(old, [:id, :kind, :cache_key, :dict_version, :payload, :fetched_at])
 
     Dictionary.Fake.set_version("2026-2")
-    # a new release is picked up by the scheduled check (§6.9), not by each lookup asking
+    # a new release is picked up by an explicit refresh, not by each lookup asking
     assert Dictionary.refresh_version() == {:ok, "2026-2"}
 
     assert {:ok, @entry_a} = Dictionary.lookup("食べる")

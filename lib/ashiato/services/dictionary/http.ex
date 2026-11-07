@@ -2,8 +2,8 @@ defmodule Ashiato.Dictionary.Http do
   @timeout 10_000
 
   @moduledoc """
-  The real `jp-dict-api` client (§7.1). `JP_DICT_API_URL` must be set; there is
-  no sensible default because the service does not exist yet.
+  HTTP client for the dictionary service. `JP_DICT_API_URL` must be set; there
+  is no default.
 
   Endpoints:
 
@@ -11,10 +11,8 @@ defmodule Ashiato.Dictionary.Http do
     * `POST /lookup`      `{"term": ...}` → `{"entry": {...}}`
     * `POST /lookup_many` `{"terms": [...]}` → `{"entries": {term => entry}}`
 
-  Retries are off on purpose: the app degrades to recording encounters without
-  enrichments when the service is down (§7.1), so a retry would just stretch the
-  degradation window without changing the outcome. Each request has a total deadline of
-  #{@timeout} ms, so a trickling reply cannot hold the ingest pipeline. Tests never call this module.
+  Retries are off: one attempt per call. Each request has a total deadline of
+  #{@timeout} ms, so a trickling reply cannot keep the call open indefinitely.
   """
 
   @behaviour Ashiato.Dictionary
@@ -22,8 +20,7 @@ defmodule Ashiato.Dictionary.Http do
   @impl true
   @doc """
   Looks up one term. A reply whose `entry` is not an object is a broken reply, not a
-  `nil` result: caching `nil` would hand wave 3 something that crashes on the first map
-  access, far from here.
+  `nil` result: caching `nil` would push a crash to the first map access, far from here.
   """
   @spec lookup(String.t()) :: {:ok, map()} | {:error, term()}
   def lookup(term) do
@@ -36,7 +33,8 @@ defmodule Ashiato.Dictionary.Http do
 
   @impl true
   @doc """
-  Looks up many terms in one request; every value in the reply must be an object.
+  Looks up many terms in one request. The reply must name exactly the requested
+  terms, and every value must be an object.
   """
   @spec lookup_many([String.t()]) :: {:ok, %{String.t() => map()}} | {:error, term()}
   def lookup_many(terms) do

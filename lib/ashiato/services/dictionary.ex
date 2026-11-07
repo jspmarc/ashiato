@@ -1,37 +1,32 @@
 defmodule Ashiato.Dictionary do
   @moduledoc """
-  Dictionary lookups (§7.1, `jp-dict-api`) behind a behaviour, plus the
-  version-keyed cache façade (P9, §6.9) in front of it.
+  Dictionary lookups behind a behaviour, plus a version-keyed cache façade.
 
-  **Wave 3 and later: call `Ashiato.Dictionary.lookup/1` / `lookup_many/1`.
-  Never call a concrete service module.** Those two functions are the public
-  façade: they consult `Ashiato.Schemas.DictCacheEntry` first and only fall
-  through to the service on a miss, so a cache hit never touches the network.
+  `lookup/1` and `lookup_many/1` are the public façade: they consult
+  `Ashiato.Schemas.DictCacheEntry` first and only fall through to the service
+  on a miss, so a cache hit never touches the network.
 
-  This card deviates from the shared `impl/0` convention of
-  `docs/plan/wave-2.md`: the configured service is returned by `service/0`
-  (from `Application.get_env(:ashiato, Ashiato.Dictionary, [])[:service]`,
-  default `Ashiato.Dictionary.Http`). The difference is in name only; callers
-  still depend on the behaviour, not a concrete module.
+  The configured service is returned by `service/0`, from
+  `Application.get_env(:ashiato, Ashiato.Dictionary, [])[:service]`, default
+  `Ashiato.Dictionary.Http`. Callers depend on the behaviour, not a concrete
+  module.
 
   ## Cache shape
 
-  Rows are keyed `(kind, cache_key, dict_version)` — the unique index in the
-  migration. `cache_key` is the term; `dict_version` is what the service
-  reports; `kind` derives from the term: a single CJK codepoint is a `"kanji"`
-  entry (KANJIDIC2 data), anything else a `"word"` (JMdict data). `payload` is
-  the entry map, stored as-is.
+  Rows are keyed `(kind, cache_key, dict_version)`. `cache_key` is the term;
+  `dict_version` is what the service reports; `kind` derives from the term: a
+  single CJK codepoint (U+4E00..U+9FFF) is a `"kanji"` entry, anything else a
+  `"word"`. `payload` is the entry map, stored as-is.
 
-  There is no TTL (§6.9): JMdict is immutable between releases, so a row is
-  either current or superseded wholesale. **A version bump mutates nothing** —
-  old rows simply stop matching and a fresh row is inserted, because the ledger
-  must not silently rewrite what it claims you studied (P9).
+  A row is either current or superseded wholesale, so there is no TTL. A version
+  bump mutates nothing: old rows stop matching and a fresh row is inserted with
+  the new version.
 
   The `dict_version/0` needed to build the key is memoised (`current_version/1`) and falls
   back to the newest `dict_version` already in the cache after a restart, so a cache hit
   makes no network call and keeps working while the service is down. Only a miss talks to
-  the service. `refresh_version/0` is what the scheduled release check (§6.9) calls to pick
-  up a new release; the lookup path never asks for the version once one is known.
+  the service. `refresh_version/0` re-reads the version from the service; the lookup path
+  never asks for it once one is known.
 
   Callbacks are the raw service calls; `Http` and `Fake` implement them.
   """
@@ -50,8 +45,8 @@ defmodule Ashiato.Dictionary do
   @callback dict_version() :: {:ok, String.t()} | {:error, term()}
 
   @doc """
-  The configured service module — this card's `impl/0` equivalent. See the
-  moduledoc for why the name differs from the other wave-2 cards.
+  The configured service module. Callers depend on this indirection rather than
+  on a concrete module.
   """
   @spec service() :: module()
   def service do
@@ -138,11 +133,10 @@ defmodule Ashiato.Dictionary do
   The `dict_version/0` the cache is keyed by, memoised so a cache hit makes no network call.
 
   The version is part of the cache key, so it has to be known before a row can be matched.
-  Asking the service on every lookup would mean a cache hit still hit the network — and a
-  cached word would become unavailable the moment the service went down, which is the
-  opposite of the degradation §7.1 asks for. A cold memo therefore reads the newest
-  `dict_version` already in the cache; only a database with no rows at all asks the service,
-  and that call can never replace a cache hit.
+  Asking the service on every lookup would make a cache hit hit the network, and a cached
+  word would become unavailable the moment the service went down. A cold memo therefore
+  reads the newest `dict_version` already in the cache; only a database with no rows at all
+  asks the service, and that call can never replace a cache hit.
 
   `refresh_version/0` changes the version; nothing on the lookup path does.
   """
@@ -176,13 +170,13 @@ defmodule Ashiato.Dictionary do
   @doc """
   Asks the service for its current `dict_version/0` and memoises it.
 
-  This is the only place the release is refreshed, and §6.9's scheduled check calls it, so a
-  new JMdict release never turns a cache hit into a network call. When the service is
-  unreachable the last known version is kept and returned, so a failed check changes nothing.
+  This is the only place the version is refreshed, so a new release never turns a cache hit
+  into a network call. When the service is unreachable the last known version is kept and
+  returned.
 
   The refreshed value lives in VM memory until the first row for the new version is written.
-  A restart inside that window re-derives the previous version from the cache. Durable
-  tracking needs a settings or migration card; no such store exists in this card's scope.
+  A restart inside that window re-derives the previous version from the cache. A durable
+  version store would remove that window.
   """
   @spec refresh_version() :: {:ok, String.t()} | {:error, term()}
   def refresh_version do
@@ -257,16 +251,15 @@ defmodule Ashiato.Dictionary do
 
   defp validate_terms(_terms), do: {:error, :invalid_term}
 
-  # kind is half of the cache identity, so deriving it from the term (one
-  # codepoint → KANJIDIC2 shape, otherwise JMdict) keeps the key deterministic.
   # A fresh entry comes back with atom or string keys depending on the service; a cached
-  # one always comes back from the JSON column string-keyed. Wave 3 must see one shape, so
-  # the service's entry is normalised before it is both cached and returned.
+  # one always comes back from the JSON column string-keyed. Normalising before the entry
+  # is cached and returned keeps one shape for callers.
   @spec normalise(entry()) :: entry()
   defp normalise(entry) when is_map(entry) do
     entry |> Jason.encode!() |> Jason.decode!()
   end
 
+  # kind is half of the cache identity; deriving it from the term keeps the key deterministic.
   @spec kind_for(String.t()) :: :word | :kanji
   defp kind_for(term) do
     if Utils.cjk_codepoint?(term), do: :kanji, else: :word

@@ -57,6 +57,7 @@ defmodule Ashiato.StorageTest do
 
     test "a traversal key is rejected and nothing is stored" do
       assert {:error, :invalid_key} = Fake.put("../escape", <<1>>)
+      assert {:error, :invalid_key} = Fake.put("page..jpg", <<1>>)
       assert Fake.objects() == %{}
       assert Fake.calls() == []
     end
@@ -82,7 +83,7 @@ defmodule Ashiato.StorageTest do
       assert {:error, :enoent} = Local.get("pages/missing.jpg")
     end
 
-    test "put overwrites atomically: the second write fully replaces the first" do
+    test "put overwrites the previous object and leaves no temp file" do
       :ok = Local.put("pages/1.jpg", "first")
       :ok = Local.put("pages/1.jpg", "second")
       assert {:ok, "second"} = Local.get("pages/1.jpg")
@@ -116,9 +117,16 @@ defmodule Ashiato.StorageTest do
       assert {:error, :invalid_key} = Local.put("nested/../escape", "nope")
       assert {:error, :invalid_key} = Local.put("", "nope")
       assert {:error, :invalid_key} = Local.put("pages/1\0.jpg", "nope")
+      assert {:error, :invalid_key} = Local.put("page..jpg", "nope")
       assert {:error, :invalid_key} = Local.presigned_get("../escape", 300)
 
       refute File.exists?(escape_path)
+    end
+
+    test "a root of / contains every absolute path" do
+      Application.put_env(:ashiato, Storage, root: "/")
+
+      assert {:ok, "file:///etc/hosts"} = Local.presigned_get("etc/hosts", 300)
     end
 
     defp path_for(key), do: Path.join(Local.root(), key)

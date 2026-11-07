@@ -30,15 +30,15 @@ defmodule Ashiato.Storage do
   @doc """
   Whether `key` is an acceptable object key.
 
-  `Path` has no realpath or containment predicate, so this is a cheap lexical
-  prefilter: the key must be relative and carry no `..` segment and no null
-  byte. A store still resolves the key against its root and rejects anything
-  that escapes it.
+  The key must be relative, contain no `..` substring, and carry no null byte.
+  `Path` has no realpath or containment predicate, so this is a lexical
+  prefilter. A store still resolves the key against its root and rejects
+  anything that escapes it.
   """
   @spec valid_key?(String.t()) :: boolean()
   def valid_key?(key) when is_binary(key) and byte_size(key) > 0 do
     Path.type(key) == :relative and
-      not Enum.member?(Path.split(key), "..") and
+      not String.contains?(key, "..") and
       not String.contains?(key, "\0")
   end
 

@@ -83,10 +83,11 @@ defmodule Ashiato.Storage.Local do
   defp resolve_key(key) do
     if Ashiato.Storage.valid_key?(key) do
       root = Path.expand(root())
+      prefix = if root == "/", do: "/", else: root <> "/"
       path = Path.expand(Path.join(root, key))
 
       # belt and braces: valid_key?/1 already rejects `..` segments
-      if String.starts_with?(path, root <> "/") do
+      if String.starts_with?(path, prefix) do
         {:ok, path}
       else
         {:error, :invalid_key}

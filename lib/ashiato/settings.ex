@@ -25,8 +25,11 @@ defmodule Ashiato.Settings do
 
   @callback get(integer(), String.t(), term()) :: term()
   @callback put(integer(), String.t(), term(), keyword()) ::
-              {:ok, Setting.t()} | {:error, Ecto.Changeset.t() | :not_encodable}
+              {:ok, Setting.t()}
+              | {:error, Ecto.Changeset.t() | :not_encodable | :secret_key_base_missing}
   @callback all(integer()) :: %{optional(String.t()) => term()}
+
+  @secret_salt "ashiato settings"
 
   # §8 defaults: a missing row must never force a caller to special-case nil
   # for the settings the requirements name.
@@ -39,7 +42,9 @@ defmodule Ashiato.Settings do
     "maturity_threshold_days" => 21
   }
 
-  @secret_salt "ashiato settings"
+  @doc "Requirement defaults for keys without a stored row."
+  @spec defaults() :: %{String.t() => term()}
+  def defaults(), do: @defaults
 
   @doc """
   Returns the configured implementation of the `get/3`, `put/4` and `all/1`
@@ -60,7 +65,7 @@ defmodule Ashiato.Settings do
   """
   @spec get(integer(), String.t(), term()) :: term()
   def get(user_id, key, default \\ nil) do
-    fallback = Map.get(@defaults, key, default)
+    fallback = Map.get(defaults(), key, default)
 
     case Repo.get_by(Setting, user_id: user_id, key: key) do
       nil ->
@@ -81,7 +86,8 @@ defmodule Ashiato.Settings do
   on the struct, never cast.
   """
   @spec put(integer(), String.t(), term(), keyword()) ::
-          {:ok, Setting.t()} | {:error, Ecto.Changeset.t() | :not_encodable}
+          {:ok, Setting.t()}
+          | {:error, Ecto.Changeset.t() | :not_encodable | :secret_key_base_missing}
   def put(user_id, key, value, opts \\ []) do
     secret? = Keyword.get(opts, :secret, false)
 
@@ -92,24 +98,46 @@ defmodule Ashiato.Settings do
 
   # Encode first, encrypt second: a pid, tuple or struct cannot be JSON, and a crash here
   # would be an ArgumentError out of the settings UI rather than an error it can show.
-  @spec store_value(term(), boolean()) :: {:ok, String.t()} | {:error, :not_encodable}
+  @spec store_value(term(), boolean()) ::
+          {:ok, String.t()} | {:error, :not_encodable | :secret_key_base_missing}
   defp store_value(value, secret?) do
     case Jason.encode(value) do
-      {:ok, json} when secret? -> {:ok, encrypt(json)}
-      {:ok, json} -> {:ok, json}
-      {:error, _reason} -> {:error, :not_encodable}
+      {:ok, json} when secret? ->
+        case encrypt(json) do
+          {:ok, encrypted} -> {:ok, encrypted}
+          {:error, :secret_key_base_missing} = err -> err
+        end
+
+      {:ok, json} ->
+        {:ok, json}
+
+      {:error, _reason} ->
+        {:error, :not_encodable}
     end
   end
 
   defp upsert(user_id, key, stored, secret?) do
     now = Utils.utc_now()
 
-    %Setting{user_id: user_id, key: key}
-    |> Ecto.Changeset.change(value: stored, secret: secret?)
-    |> Repo.insert(
+    changeset =
+      %Setting{user_id: user_id, key: key}
+      |> Ecto.Changeset.change(value: stored, secret: secret?)
+      |> Ecto.Changeset.validate_required([:user_id])
+
+    insert_setting(changeset,
       on_conflict: [set: [value: stored, secret: secret?, updated_at: now]],
       conflict_target: [:user_id, :key]
     )
+  end
+
+  # SQLite reports a foreign-key violation with a nil constraint name, so
+  # `foreign_key_constraint/3` cannot map it; translate the raise instead.
+  defp insert_setting(changeset, opts) do
+    Repo.insert(changeset, opts)
+  rescue
+    error in Ecto.ConstraintError ->
+      Logger.warning("setting #{changeset.data.key} cannot be stored: #{error.type} failed")
+      {:error, Ecto.Changeset.add_error(changeset, :user_id, "does not exist")}
   end
 
   @doc """
@@ -212,8 +240,14 @@ defmodule Ashiato.Settings do
   end
 
   defp encrypt(plain_json) do
-    key = derived_key()
-    Plug.Crypto.MessageEncryptor.encrypt(plain_json, key, key)
+    try do
+      key = derived_key()
+      {:ok, Plug.Crypto.MessageEncryptor.encrypt(plain_json, key, key)}
+    rescue
+      ArgumentError ->
+        Logger.warning("setting encryption failed: SECRET_KEY_BASE missing")
+        {:error, :secret_key_base_missing}
+    end
   end
 
   # A read must never raise: the ingest pipeline reads settings. A missing SECRET_KEY_BASE
@@ -257,9 +291,14 @@ defmodule Ashiato.Settings do
               "The Ashiato endpoint config is missing: SECRET_KEY_BASE cannot be read"
 
       config ->
-        config[:secret_key_base] ||
-          raise ArgumentError,
-                "SECRET_KEY_BASE is missing: refusing to store a secret unencrypted"
+        case config[:secret_key_base] do
+          key when is_binary(key) and key != "" ->
+            key
+
+          _ ->
+            raise ArgumentError,
+                  "SECRET_KEY_BASE is missing: refusing to store a secret unencrypted"
+        end
     end
   end
 end

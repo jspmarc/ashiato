@@ -109,6 +109,15 @@ defmodule Ashiato.StorageTest do
       assert {:ok, <<1, 2, 3>>} = File.read(path)
     end
 
+    test "presigned_get percent-encodes keys a URI would reinterpret" do
+      :ok = Local.put("pages/a#b?.jpg", <<1, 2, 3>>)
+
+      assert {:ok, url} = Local.presigned_get("pages/a#b?.jpg", 300)
+      assert %URI{scheme: "file", path: path} = URI.parse(url)
+      assert URI.decode(path) == path_for("pages/a#b?.jpg")
+      assert {:ok, <<1, 2, 3>>} = File.read(URI.decode(path))
+    end
+
     test "a traversal key is rejected and writes nothing outside the root" do
       escape_path = Path.expand(Path.join(Local.root(), "../escape"))
 

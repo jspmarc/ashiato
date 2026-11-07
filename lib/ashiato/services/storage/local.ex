@@ -58,12 +58,13 @@ defmodule Ashiato.Storage.Local do
 
   This is **not a real pre-signature**: a local file needs no authorisation.
   `ttl_seconds` is part of the shared contract and is deliberately ignored.
+  Reserved URI characters in the key are percent-encoded.
   """
   @impl true
   @spec presigned_get(String.t(), pos_integer()) :: {:ok, String.t()} | {:error, term()}
   def presigned_get(key, _ttl_seconds) do
     with {:ok, path} <- resolve_key(key) do
-      {:ok, "file://" <> path}
+      {:ok, "file://" <> encode_path(path)}
     end
   end
 
@@ -96,6 +97,10 @@ defmodule Ashiato.Storage.Local do
     else
       {:error, :invalid_key}
     end
+  end
+
+  defp encode_path(path) do
+    URI.encode(path, &(URI.char_unreserved?(&1) or &1 == ?/))
   end
 
   # A reader must never see a partial object: write to an exclusive temp file in

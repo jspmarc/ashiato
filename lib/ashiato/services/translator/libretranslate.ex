@@ -1,8 +1,7 @@
 defmodule Ashiato.Translator.LibreTranslate do
   @moduledoc """
-  Self-hosted LibreTranslate — fully offline, weakest quality (§7.5). One request
-  per page: `q` goes out as an array and `translatedText` comes back as an aligned
-  array.
+  Self-hosted LibreTranslate. One request per page: `q` goes out as an array and
+  `translatedText` comes back as an aligned array.
   """
   use Ashiato.Translator
 

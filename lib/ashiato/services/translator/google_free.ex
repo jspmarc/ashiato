@@ -1,11 +1,9 @@
 defmodule Ashiato.Translator.GoogleFree do
   @moduledoc """
-  The undocumented free web endpoint (`translate_a/single`) — no key (D45).
+  The free web endpoint (`translate_a/single`) — no key.
 
-  Caveats that come with it (§7.5): it is outside Google's terms, it can start
-  refusing without notice, and it sends your text to Google. That is why
-  `translation_enabled` is off by default and `google_cloud` exists as the
-  supported contract for the same engine.
+  Lines are joined with newlines for one page request. The nested segment array
+  is unwrapped into plain text, then split back into lines and trimmed.
   """
   use Ashiato.Translator
 

@@ -8,7 +8,7 @@ defmodule Ashiato.Translator.Fake do
   input that must trigger the shared per-line fallback.
 
   State lives in an Agent started by the test, never in application env: the VM is
-  shared and wave-2 cards run in parallel.
+  shared and tests may run concurrently.
   """
 
   use Agent

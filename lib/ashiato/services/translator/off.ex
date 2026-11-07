@@ -1,7 +1,7 @@
 defmodule Ashiato.Translator.Off do
   @moduledoc """
-  Translation disabled. Exists so the `translation_provider` setting has a value
-  that is not a missing key (D45).
+  Translation disabled. Returns `{:error, :disabled}` for every request so callers
+  can distinguish "off" from a missing provider.
   """
 
   @behaviour Ashiato.Translator

@@ -1,12 +1,11 @@
 defmodule Ashiato.Translator.Llm do
   @moduledoc """
-  OpenAI-compatible chat completions (D44) — the only provider that can use
-  surrounding lines, speaker, and register.
+  OpenAI-compatible chat completions.
 
-  The page is asked for as a **JSON array of strings**. When the reply does not
+  The page is requested as a **JSON array of strings**. When the reply does not
   parse as an array, the shared per-line fallback takes over. The endpoint comes
-  from `OPENAI_BASE_URL` (default `https://api.openai.com/v1`; any
-  OpenAI-compatible server works, D11) and the key from `OPENAI_API_KEY`.
+  from `OPENAI_BASE_URL` (default `https://api.openai.com/v1`) and the key from
+  `OPENAI_API_KEY`.
   """
   use Ashiato.Translator
 

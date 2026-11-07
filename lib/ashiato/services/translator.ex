@@ -1,6 +1,6 @@
 defmodule Ashiato.Translator do
   @moduledoc """
-  Translation provider behaviour (D44, D45).
+  Translation provider behaviour.
 
   A page is translated in **one request** so cross-line context survives. Providers
   return line-aligned text; when a page reply does not carry the same number of
@@ -23,10 +23,9 @@ defmodule Ashiato.Translator do
   by atom: `:google_free` (default), `:llm`, `:deepl`, `:google_cloud`,
   `:libretranslate`, `:off` — or directly as a module.
 
-  **No caching in this module.** `dict_cache_entries.kind` forbids `"translation"`;
-  caching waits for a migration that widens the CHECK constraint. Nothing here logs
-  the text being translated or any credential, and an unconfigured provider returns
-  `{:error, :not_configured}` instead of raising.
+  **No caching in this module.** Nothing here logs the text being translated or any
+  credential, and an unconfigured provider returns `{:error, :not_configured}`
+  instead of raising.
   """
 
   @callback translate_page(lines :: [String.t()], opts :: keyword()) ::
@@ -74,11 +73,9 @@ defmodule Ashiato.Translator do
   The configured provider module, or `Ashiato.Translator.Off` when the configured value
   names no provider.
 
-  Defaults to `:google_free` (D45): the only provider that works on a fresh install with no
-  key, no URL, and no local server. An unknown provider fails **closed**: falling back to
-  `google_free` would ship the page's dialogue to Google's undocumented endpoint because of
-  a typo in a setting, and the requirement is explicit that nothing leaves the host until
-  the user asks for it.
+  Defaults to `:google_free`. An unknown provider fails **closed** rather than
+  falling back to `:google_free`, so a typo cannot send text to a provider the
+  caller did not select.
   """
   @spec impl() :: module()
   def impl do
@@ -113,8 +110,7 @@ defmodule Ashiato.Translator do
   defp resolve(_provider), do: :error
 
   @doc """
-  Translates a page through `impl/0`. Later waves call this, never a concrete
-  provider module.
+  Translates a page through `impl/0`.
 
   Refused providers enter a 300 s cool-down keyed by provider module.
   """
@@ -177,11 +173,10 @@ defmodule Ashiato.Translator do
   defp cooldown_key(provider), do: {__MODULE__, :cooldown, provider}
 
   @doc """
-  The shared page→per-line rule (D44): accept a page reply only when it is
-  line-aligned. A reply with a different line count, or one that cannot be
-  interpreted (`:unparsable`), is retried as one request per line. Any other error
-  is returned as-is — in particular `:not_configured` never triggers per-line
-  traffic.
+  The shared page→per-line rule: accept a page reply only when it is line-aligned.
+  A reply with a different line count, or one that cannot be interpreted
+  (`:unparsable`), is retried as one request per line. Any other error is returned
+  as-is — in particular `:not_configured` never triggers per-line traffic.
   """
   @spec page_with_fallback(
           [String.t()],
@@ -223,10 +218,8 @@ defmodule Ashiato.Translator do
   end
 
   @doc """
-  Posts to `url` with `retry: false` — a failed page is surfaced to the caller
-  rather than silently re-sent, which would double-charge a paid API. A non-200
-  reply is reduced to its status: the body may echo the text being translated, so
-  it is never kept or logged. `:decode` in `req_opts` receives the 200 body.
+  Posts to `url` with `retry: false`. A non-200 reply returns its status only and
+  discards the body. `:decode` in `req_opts` receives the 200 body.
   """
   @spec http_post(String.t(), keyword()) :: {:ok, [String.t()]} | {:error, term()}
   def http_post(url, req_opts) do

@@ -91,11 +91,17 @@ defmodule Ashiato.TranslatorTest do
   end
 
   test "a provider error other than :unparsable is returned, never retried per line" do
-    request = fn _lines, _opts -> {:error, :not_configured} end
+    ref = make_ref()
 
-    # Retrying per line here would multiply traffic against a provider that cannot
-    # serve any of it, and would mask a configuration error as a content problem.
+    request = fn _lines, _opts ->
+      send(self(), {ref, :request})
+      {:error, :not_configured}
+    end
+
     assert Translator.page_with_fallback(["一", "二"], [], request) == {:error, :not_configured}
+
+    assert_received {^ref, :request}
+    refute_received {^ref, :request}
   end
 
   test "a missing target language is an error, not an auto-detect guess" do
@@ -103,5 +109,41 @@ defmodule Ashiato.TranslatorTest do
     assert Translator.langs(source_lang: "ja") == {:error, :missing_target_lang}
     assert Translator.langs(target_lang: "en") == {:ok, {"auto", "en"}}
     assert Translator.langs(source_lang: "ja", target_lang: "en") == {:ok, {"ja", "en"}}
+  end
+
+  test "langs/1 treats nil and empty source_lang as auto" do
+    assert Translator.langs(source_lang: nil, target_lang: "en") == {:ok, {"auto", "en"}}
+    assert Translator.langs(source_lang: "", target_lang: "en") == {:ok, {"auto", "en"}}
+  end
+
+  test "http_post/2 rejects malformed URLs" do
+    assert Translator.http_post("not a url", decode: & &1) == {:error, :invalid_url}
+    assert Translator.http_post("lt.example.com", decode: & &1) == {:error, :invalid_url}
+  end
+
+  test "http_post/2 does not return the body of a malformed JSON reply" do
+    Req.Test.stub(__MODULE__, fn conn ->
+      conn
+      |> Plug.Conn.put_resp_content_type("application/json")
+      |> Plug.Conn.send_resp(200, "{\"secret\": \"page text\"")
+    end)
+
+    assert Translator.http_post("http://translator.test/x",
+             decode: & &1,
+             plug: {Req.Test, __MODULE__}
+           ) == {:error, :unparsable}
+  end
+
+  test "refused provider enters cooldown" do
+    on_exit(fn -> Translator.clear_cooldowns() end)
+    Translator.clear_cooldowns()
+    start_supervised!({Fake, error: {:http, 429}})
+
+    assert Translator.translate_page(["一"], target_lang: "en") == {:error, {:http, 429}}
+
+    assert {:error, {:cooldown, seconds}} =
+             Translator.translate_page(["一"], target_lang: "en")
+
+    assert seconds >= 1
   end
 end

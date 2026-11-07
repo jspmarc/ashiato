@@ -115,9 +115,66 @@ defmodule Ashiato.Translator do
   @doc """
   Translates a page through `impl/0`. Later waves call this, never a concrete
   provider module.
+
+  Refused providers enter a 300 s cool-down keyed by provider module.
   """
   @spec translate_page([String.t()], keyword()) :: {:ok, [String.t()]} | {:error, term()}
-  def translate_page(lines, opts), do: impl().translate_page(lines, opts)
+  def translate_page(lines, opts) do
+    provider = impl()
+
+    case check_cooldown(provider) do
+      nil ->
+        case provider.translate_page(lines, opts) do
+          {:error, {:http, status}} when status in [403, 429] or status >= 500 ->
+            record_cooldown(provider)
+            {:error, {:http, status}}
+
+          other ->
+            other
+        end
+
+      remaining ->
+        {:error, {:cooldown, max(1, remaining)}}
+    end
+  end
+
+  @doc """
+  Erases only this module's cooldown keys from `:persistent_term`.
+
+  Use in tests and after a manual retry to clear stale cooldowns.
+  """
+  @spec clear_cooldowns() :: :ok
+  def clear_cooldowns() do
+    for {{__MODULE__, :cooldown, _provider} = key, _expiry} <- :persistent_term.get() do
+      :persistent_term.erase(key)
+    end
+
+    :ok
+  end
+
+  # ——————————————————————————————————————————————————————————— private ——————
+
+  @cooldown_secs 300
+
+  defp check_cooldown(provider) do
+    key = cooldown_key(provider)
+
+    case :persistent_term.get(key, nil) do
+      nil ->
+        nil
+
+      expiry_mono ->
+        diff = System.monotonic_time(:millisecond) - expiry_mono
+        if diff < 0, do: div(-diff + 999, 1000), else: nil
+    end
+  end
+
+  defp record_cooldown(provider) do
+    expiry = System.monotonic_time(:millisecond) + @cooldown_secs * 1000
+    :persistent_term.put(cooldown_key(provider), expiry)
+  end
+
+  defp cooldown_key(provider), do: {__MODULE__, :cooldown, provider}
 
   @doc """
   The shared page→per-line rule (D44): accept a page reply only when it is
@@ -150,22 +207,19 @@ defmodule Ashiato.Translator do
   end
 
   defp per_line(lines, opts, page_request) do
-    lines
-    |> Enum.map(&line_result(&1, opts, page_request))
-    |> collect()
-  end
+    result =
+      Enum.reduce_while(lines, {:ok, []}, fn line, {:ok, acc} ->
+        case page_request.([line], opts) do
+          {:ok, [translated]} -> {:cont, {:ok, [translated | acc]}}
+          {:ok, _misaligned} -> {:halt, {:error, :misaligned_line}}
+          {:error, reason} -> {:halt, {:error, reason}}
+        end
+      end)
 
-  defp line_result(line, opts, page_request) do
-    case page_request.([line], opts) do
-      {:ok, [translated]} -> {:ok, translated}
-      {:ok, _misaligned} -> {:error, :misaligned_line}
+    case result do
+      {:ok, results} -> {:ok, Enum.reverse(results)}
       {:error, reason} -> {:error, reason}
     end
-  end
-
-  defp collect(results) do
-    Enum.find(results, &match?({:error, _}, &1)) ||
-      {:ok, Enum.map(results, fn {:ok, translated} -> translated end)}
   end
 
   @doc """
@@ -181,11 +235,29 @@ defmodule Ashiato.Translator do
         {:error, :no_decoder}
 
       {decode, req_opts} ->
-        case Req.post(url, [retry: false] ++ req_opts) do
-          {:ok, %Req.Response{status: 200, body: body}} -> decode.(body)
-          {:ok, %Req.Response{status: status}} -> {:error, {:http, status}}
-          {:error, exception} -> {:error, exception}
+        case URI.new(url) do
+          {:ok, %{scheme: scheme, host: host}}
+          when scheme in ["http", "https"] and is_binary(host) and host != "" ->
+            do_post(url, decode, req_opts)
+
+          _ ->
+            {:error, :invalid_url}
         end
+    end
+  end
+
+  defp do_post(url, decode, req_opts) do
+    try do
+      case Req.post(url, [retry: false] ++ req_opts) do
+        {:ok, %Req.Response{status: 200, body: body}} -> decode.(body)
+        {:ok, %Req.Response{status: status}} -> {:error, {:http, status}}
+        # Req's JSON step turns a malformed body into an exception whose `data` is
+        # the response text; returning it would leak translated lines to the caller.
+        {:error, %Jason.DecodeError{}} -> {:error, :unparsable}
+        {:error, exception} -> {:error, exception}
+      end
+    rescue
+      _ -> {:error, :request_failed}
     end
   end
 
@@ -194,7 +266,13 @@ defmodule Ashiato.Translator do
   def langs(opts) do
     case Keyword.get(opts, :target_lang) do
       target when is_binary(target) and target != "" ->
-        {:ok, {Keyword.get(opts, :source_lang, "auto"), target}}
+        source =
+          case Keyword.get(opts, :source_lang) do
+            sl when is_binary(sl) and sl != "" -> sl
+            _ -> "auto"
+          end
+
+        {:ok, {source, target}}
 
       # nil and "" would be encoded as null and come back as an opaque HTTP 400
       _absent_or_empty ->

@@ -31,7 +31,14 @@ defmodule Ashiato.Ocr.Socket do
         # :gen_tcp.connect/3 defaults to an infinite timeout, so a wedged service with a
         # full listen backlog would block the ingest caller forever. The bound applies to
         # connect as well as to recv.
-        opts = [:binary, packet: 4, active: false, packet_size: @max_reply_bytes]
+        opts = [
+          :binary,
+          packet: 4,
+          active: false,
+          packet_size: @max_reply_bytes,
+          send_timeout: timeout(),
+          send_timeout_close: true
+        ]
 
         case :gen_tcp.connect({:local, path}, 0, opts, timeout()) do
           {:ok, sock} -> round_trip(sock, kind, value)
@@ -60,7 +67,7 @@ defmodule Ashiato.Ocr.Socket do
     with {:ok, payload} <- Jason.encode(%{"op" => "ocr", Atom.to_string(kind) => value}) do
       :gen_tcp.send(sock, payload)
     else
-      {:error, reason} -> {:error, {:encode, reason}}
+      {:error, _} -> {:error, :encode_failed}
     end
   end
 
@@ -68,7 +75,7 @@ defmodule Ashiato.Ocr.Socket do
     case Jason.decode(body) do
       {:ok, %{"lines" => lines}} when is_list(lines) -> validate_lines(lines)
       {:ok, _} -> {:error, :invalid_response}
-      {:error, reason} -> {:error, {:invalid_json, reason}}
+      {:error, _reason} -> {:error, :invalid_json}
     end
   end
 
@@ -80,7 +87,7 @@ defmodule Ashiato.Ocr.Socket do
         {block, index}, {:ok, acc} ->
           case validate_block(block) do
             {:ok, line} -> {:cont, {:ok, [line | acc]}}
-            {:error, _} -> {:halt, {:error, {:invalid_line, index, block}}}
+            {:error, _} -> {:halt, {:error, {:invalid_line, index}}}
           end
       end)
 

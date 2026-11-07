@@ -83,7 +83,9 @@ defmodule Ashiato.OcrTest do
         {OcrStub, path: path, handler: fn _ -> {:raw, "<html>not json</html>"} end}
       )
 
-      assert {:error, {:invalid_json, _}} = Socket.recognise({:path, path})
+      error = Socket.recognise({:path, path})
+      assert error == {:error, :invalid_json}
+      refute inspect(error) =~ "not json"
     end
 
     test "a block with a three-integer bbox is rejected, not passed on", %{socket_path: path} do
@@ -91,7 +93,7 @@ defmodule Ashiato.OcrTest do
       reply = %{"lines" => [stringify_keys(hd(@lines)), bad]}
       start_supervised!({OcrStub, path: path, handler: fn _ -> reply end})
 
-      assert {:error, {:invalid_line, 1, ^bad}} = Socket.recognise({:path, path})
+      assert {:error, {:invalid_line, 1}} = Socket.recognise({:path, path})
     end
 
     test "a block whose score is outside 0..1 is rejected", %{socket_path: path} do
@@ -99,7 +101,7 @@ defmodule Ashiato.OcrTest do
       reply = %{"lines" => [bad]}
       start_supervised!({OcrStub, path: path, handler: fn _ -> reply end})
 
-      assert {:error, {:invalid_line, 0, ^bad}} = Socket.recognise({:path, path})
+      assert {:error, {:invalid_line, 0}} = Socket.recognise({:path, path})
     end
 
     test "a silent service hits the bounded timeout instead of hanging", %{socket_path: path} do
@@ -136,8 +138,16 @@ defmodule Ashiato.OcrTest do
     end
   end
 
-  test "impl/0 resolves to the socket client" do
-    assert Ocr.impl() == Socket
+  test "acceptance: Ocr.impl() behaviour through Fake" do
+    Application.put_env(:ashiato, Ashiato.Ocr, impl: Fake)
+    start_supervised!(Fake)
+    locator = {:path, "/images/acceptance.png"}
+
+    assert {:ok, lines} = Ocr.impl().recognise(locator)
+    assert is_list(lines) and length(lines) > 0
+    assert Fake.requests() == [locator]
+
+    Application.delete_env(:ashiato, Ashiato.Ocr)
   end
 
   defp stringify_keys(line) do

@@ -15,14 +15,6 @@ defmodule Ashiato.DictionaryTest do
   @entry_b %{"gloss" => "bridge", "reading" => "はし"}
   @entry_c %{"gloss" => "chopsticks", "reading" => "はし"}
 
-  # The fake is selected through the same application config production uses, and the
-  # memoised dict_version is VM-wide, so each test starts from a cold memo.
-  setup do
-    Dictionary.forget_version()
-    on_exit(&Dictionary.forget_version/0)
-    :ok
-  end
-
   test "a cache hit performs zero service lookups" do
     start_supervised!({Dictionary.Fake, version: "2026-1", entries: %{"食べる" => @entry_a}})
 
@@ -73,9 +65,8 @@ defmodule Ashiato.DictionaryTest do
     snapshot = Map.take(old, [:id, :kind, :cache_key, :dict_version, :payload, :fetched_at])
 
     Dictionary.Fake.set_version("2026-2")
-    # a new release is picked up by an explicit refresh, not by each lookup asking
-    assert Dictionary.refresh_version() == {:ok, "2026-2"}
-
+    # the scheduled release check flips the version outside the lookup path
+    assert {:ok, "2026-2"} = Dictionary.refresh_version()
     assert {:ok, @entry_a} = Dictionary.lookup("食べる")
     assert Dictionary.Fake.calls() == 2
 

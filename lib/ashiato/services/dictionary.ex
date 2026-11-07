@@ -93,6 +93,9 @@ defmodule Ashiato.Dictionary do
   The `dict_version/0` the cache is keyed by, re-read from the service on a miss
   so the cache never goes stale on version changes.
 
+  `prune/0` and the scheduled release check call this to flip the version outside a
+  request; the next lookup then misses and refetches under the new version.
+
   A failed refresh propagates: caching a fresh response under a guessed version
   would silently mix releases until the next successful refresh.
   """
@@ -108,16 +111,6 @@ defmodule Ashiato.Dictionary do
       error ->
         error
     end
-  end
-
-  @doc """
-  Drops the memoised `dict_version/0` so the next lookup re-derives it. Tests use this for
-  isolation; the release check uses `refresh_version/0`.
-  """
-  @spec forget_version() :: :ok
-  def forget_version do
-    :persistent_term.erase(version_key(impl()))
-    :ok
   end
 
   @doc """

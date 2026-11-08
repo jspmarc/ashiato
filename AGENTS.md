@@ -27,7 +27,11 @@ This is a web application written using the Phoenix web framework.
 lib/ashiato/
   ledger.ex  srs.ex  settings.ex    contexts: the only modules that run queries
   schemas/                          Ashiato.Schemas.*, one Ecto schema per table
-  services/                         external clients: behaviour + impl + fake, one dir each
+  outbound/                         everything that leaves the BEAM:
+    http.ex                           Ashiato.HTTP — the shared transport
+    tokenizer.ex  tokenizer/          behaviour + implementation + fake, one dir each
+    dictionary.ex dictionary/         (same shape for ocr, translator, storage)
+    ...
   repo.ex  application.ex  mailer.ex  utils.ex
 ```
 
@@ -35,7 +39,9 @@ lib/ashiato/
   in `lib/ashiato/schemas/`. Do not add schemas to `lib/ashiato/` root, and never under `repo/` —
   `Ashiato.Repo` is the connection module.
 - Every external dependency (dictionary, tokenizer, OCR, translator, storage) is behind a behaviour in
-  `lib/ashiato/services/`, with a fake. Tests never call a real service.
+  `lib/ashiato/outbound/`, with a fake. Tests never call a real service.
+- `lib/ashiato/outbound/http.ex` is the **only** module that calls `Req`. A client that needs its own
+  rescue, status mapping, or timeout setup is telling you the shared module is missing a rule.
 - `Ashiato.Settings` is the only module allowed to treat settings as key-value rows.
 
 ### Phoenix v1.8 guidelines

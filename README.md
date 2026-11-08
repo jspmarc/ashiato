@@ -28,7 +28,9 @@ intended contracts, not running code.
 lib/ashiato/
   ledger.ex  srs.ex  settings.ex    contexts: the only modules that query the database
   schemas/                          one Ecto schema per table, Ashiato.Schemas.*
-  services/                         external clients: behaviour + implementation + fake
+  outbound/                         everything that leaves the BEAM: Ashiato.HTTP (shared
+                                    transport) plus one dir per client — behaviour,
+                                    implementation and fake
   repo.ex  application.ex  mailer.ex  utils.ex
 ```
 

@@ -29,7 +29,7 @@ lib/ashiato/
   ledger.ex  srs.ex                 contexts — the only modules that query the database
   settings.ex                       context, added by W2-6
   schemas/                          Ashiato.Schemas.*, one Ecto schema per table
-  services/                         external clients, one directory each:
+  outbound/                         everything that leaves the BEAM, one directory each:
     tokenizer.ex                      behaviour + impl()/0
     tokenizer/http.ex                 Ashiato.Tokenizer.Http
     tokenizer/fake.ex                 Ashiato.Tokenizer.Fake
@@ -44,11 +44,11 @@ so no schema name collides with a behaviour or context name. Do not add new file
 
 | # | Card | Owns (may edit) |
 |---|---|---|
-| W2-1 | `Ashiato.Tokenizer` behaviour + HTTP impl + fake | `lib/ashiato/services/tokenizer*`, `test/ashiato/tokenizer_test.exs` |
-| W2-2 | `Ashiato.Dictionary` + cache + fake | `lib/ashiato/services/dictionary*`, `test/ashiato/dictionary_test.exs` |
-| W2-3 | `Ashiato.Ocr` Unix-socket client + fake | `lib/ashiato/services/ocr*`, `test/ashiato/ocr_test.exs` |
-| W2-4 | `Ashiato.Translator` provider behaviour + fakes | `lib/ashiato/services/translator*`, `test/ashiato/translator_test.exs` |
-| W2-5 | `Ashiato.Storage` behaviour + local impl | `lib/ashiato/services/storage*`, `test/ashiato/storage_test.exs` |
+| W2-1 | `Ashiato.Tokenizer` behaviour + HTTP impl + fake | `lib/ashiato/outbound/tokenizer*`, `test/ashiato/tokenizer_test.exs` |
+| W2-2 | `Ashiato.Dictionary` + cache + fake | `lib/ashiato/outbound/dictionary*`, `test/ashiato/dictionary_test.exs` |
+| W2-3 | `Ashiato.Ocr` Unix-socket client + fake | `lib/ashiato/outbound/ocr*`, `test/ashiato/ocr_test.exs` |
+| W2-4 | `Ashiato.Translator` provider behaviour + fakes | `lib/ashiato/outbound/translator*`, `test/ashiato/translator_test.exs` |
+| W2-5 | `Ashiato.Storage` behaviour + local impl | `lib/ashiato/outbound/storage*`, `test/ashiato/storage_test.exs` |
 | W2-6 | `Ashiato.Settings` typed accessor + encrypted secrets | `lib/ashiato/settings*`, `test/ashiato/settings_test.exs` |
 
 ## Shape every card shares

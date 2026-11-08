@@ -29,7 +29,7 @@ defmodule Ashiato.Settings do
               | {:error, Ecto.Changeset.t() | :not_encodable | :secret_key_base_missing}
   @callback all(integer()) :: %{optional(String.t()) => term()}
 
-  @secret_salt "ashiato settings"
+  @key_salt "ashiato settings"
 
   # Built-in defaults: a missing row must never force a caller to special-case nil.
   @defaults %{
@@ -89,16 +89,16 @@ defmodule Ashiato.Settings do
   def put(user_id, key, value, opts \\ []) do
     secret? = Keyword.get(opts, :secret, false)
 
-    with {:ok, stored} <- store_value(value, secret?) do
+    with {:ok, stored} <- encode_value(value, secret?) do
       upsert(user_id, key, stored, secret?)
     end
   end
 
   # Encode first, encrypt second: a pid, tuple or struct cannot be JSON, and a crash here
   # would be an ArgumentError out of the settings UI rather than an error it can show.
-  @spec store_value(term(), boolean()) ::
+  @spec encode_value(term(), boolean()) ::
           {:ok, String.t()} | {:error, :not_encodable | :secret_key_base_missing}
-  defp store_value(value, secret?) do
+  defp encode_value(value, secret?) do
     case Jason.encode(value) do
       {:ok, json} when secret? ->
         case encrypt(json) do
@@ -122,20 +122,18 @@ defmodule Ashiato.Settings do
       |> Ecto.Changeset.change(value: stored, secret: secret?)
       |> Ecto.Changeset.validate_required([:user_id])
 
-    insert_setting(changeset,
-      on_conflict: [set: [value: stored, secret: secret?, updated_at: now]],
-      conflict_target: [:user_id, :key]
-    )
-  end
-
-  # SQLite reports a foreign-key violation with a nil constraint name, so
-  # `foreign_key_constraint/3` cannot map it; translate the raise instead.
-  defp insert_setting(changeset, opts) do
-    Repo.insert(changeset, opts)
-  rescue
-    error in Ecto.ConstraintError ->
-      Logger.warning("setting #{changeset.data.key} cannot be stored: #{error.type} failed")
-      {:error, Ecto.Changeset.add_error(changeset, :user_id, "does not exist")}
+    # SQLite reports a foreign-key violation with a nil constraint name, so
+    # `foreign_key_constraint/3` cannot map it; translate the raise instead.
+    try do
+      Repo.insert(changeset,
+        on_conflict: [set: [value: stored, secret: secret?, updated_at: now]],
+        conflict_target: [:user_id, :key]
+      )
+    rescue
+      error in Ecto.ConstraintError ->
+        Logger.warning("setting #{key} cannot be stored: #{error.type} failed")
+        {:error, Ecto.Changeset.add_error(changeset, :user_id, "does not exist")}
+    end
   end
 
   @doc """
@@ -147,8 +145,7 @@ defmodule Ashiato.Settings do
   """
   @spec all(integer()) :: %{optional(String.t()) => term()}
   def all(user_id) do
-    user_id
-    |> by_user()
+    from(s in Setting, where: s.user_id == ^user_id)
     |> Repo.all()
     |> Map.new(fn
       %Setting{key: key, secret: true} -> {key, :redacted}
@@ -171,7 +168,7 @@ defmodule Ashiato.Settings do
   @doc """
   The translation gate: `translation_enabled` is on AND the selected
   `translation_provider` is configured. `google_free` needs nothing, `off` is
-  never capable, and the other providers each need their key or URL.
+  never capable, and the other providers each need their key.
   """
   @spec translate_capable?(integer()) :: boolean()
   def translate_capable?(user_id) do
@@ -188,9 +185,6 @@ defmodule Ashiato.Settings do
   defp provider_configured?(user_id, "google_cloud"),
     do: credential?(user_id, "google_cloud_api_key")
 
-  defp provider_configured?(user_id, "libretranslate"),
-    do: credential?(user_id, "libretranslate_url")
-
   defp provider_configured?(user_id, "llm"), do: credential?(user_id, "OPENAI_API_KEY")
   defp provider_configured?(_user_id, _unknown), do: false
 
@@ -201,7 +195,7 @@ defmodule Ashiato.Settings do
 
   # The settings row wins and environment variables are the fallback. Environment
   # names are the uppercase form of the setting key (`OPENAI_API_KEY`,
-  # `DEEPL_API_KEY`, `LIBRETRANSLATE_URL`). An explicitly empty stored key stays
+  # `DEEPL_API_KEY`, `GOOGLE_CLOUD_API_KEY`). An explicitly empty stored key stays
   # empty rather than falling through, so it still disables the capability.
   defp credential?(user_id, key) do
     case impl().get(user_id, key, @missing) do
@@ -213,11 +207,6 @@ defmodule Ashiato.Settings do
   defp present?(value), do: is_binary(value) and value != ""
 
   # ── storage ─────────────────────────────────────────────────────────────────
-
-  @spec by_user(integer()) :: Ecto.Query.t()
-  defp by_user(user_id) do
-    from(s in Setting, where: s.user_id == ^user_id)
-  end
 
   # the value column is nullable, so a hand-written or half-migrated row can hold NULL
   defp decode(nil, key, fallback) do
@@ -251,14 +240,6 @@ defmodule Ashiato.Settings do
   # therefore degrades the read to the default and is logged without the value; only the
   # write path refuses (storing a secret unencrypted would be worse than failing).
   defp decrypt(cipher, key, fallback) do
-    do_decrypt(cipher, key, fallback)
-  rescue
-    error in ArgumentError ->
-      Logger.warning("setting #{key} cannot be decrypted (#{Exception.message(error)})")
-      fallback
-  end
-
-  defp do_decrypt(cipher, key, fallback) do
     crypto_key = derived_key()
 
     case Plug.Crypto.MessageEncryptor.decrypt(cipher, crypto_key, crypto_key) do
@@ -269,13 +250,17 @@ defmodule Ashiato.Settings do
         Logger.warning("setting #{key} failed authentication; returning default")
         fallback
     end
+  rescue
+    error in ArgumentError ->
+      Logger.warning("setting #{key} cannot be decrypted (#{Exception.message(error)})")
+      fallback
   end
 
   # Deterministic derivation: the same SECRET_KEY_BASE yields the same
   # 32-byte key on every boot, so no key column is needed. A missing
   # SECRET_KEY_BASE raises here rather than storing plaintext.
   defp derived_key do
-    Plug.Crypto.KeyGenerator.generate(secret_key_base(), @secret_salt,
+    Plug.Crypto.KeyGenerator.generate(secret_key_base(), @key_salt,
       iterations: 1000,
       length: 32
     )

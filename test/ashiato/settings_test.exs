@@ -145,8 +145,7 @@ defmodule Ashiato.SettingsTest do
       orig = %{
         "OPENAI_API_KEY" => System.get_env("OPENAI_API_KEY"),
         "DEEPL_API_KEY" => System.get_env("DEEPL_API_KEY"),
-        "GOOGLE_CLOUD_API_KEY" => System.get_env("GOOGLE_CLOUD_API_KEY"),
-        "LIBRETRANSLATE_URL" => System.get_env("LIBRETRANSLATE_URL")
+        "GOOGLE_CLOUD_API_KEY" => System.get_env("GOOGLE_CLOUD_API_KEY")
       }
 
       for {key, _} <- orig, do: System.delete_env(key)
@@ -209,12 +208,6 @@ defmodule Ashiato.SettingsTest do
       refute Settings.translate_capable?(user.id)
 
       impl.put(user.id, "deepl_api_key", "dl-1", [])
-      assert Settings.translate_capable?(user.id)
-
-      impl.put(user.id, "translation_provider", "libretranslate", [])
-      refute Settings.translate_capable?(user.id)
-
-      impl.put(user.id, "libretranslate_url", "http://localhost:5000", [])
       assert Settings.translate_capable?(user.id)
 
       impl.put(user.id, "translation_enabled", false, [])

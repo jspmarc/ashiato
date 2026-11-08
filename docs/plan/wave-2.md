@@ -61,6 +61,22 @@ Naming: `Ashiato.X` is the behaviour, `Ashiato.X.Http` (or `.Socket`, `.Local`) 
 `Ashiato.X.Fake` the test double, and `Ashiato.X.impl()` returns the configured implementation from
 application config so later waves depend on the behaviour and never on a concrete module.
 
+`impl/0` is the same one-liner in every card, because no card may edit `config/` and a missing key must
+not crash:
+
+```elixir
+@default_impl Ashiato.X.Http          # the card's real implementation
+
+@doc "The configured implementation. Later waves call this, never a concrete module."
+@spec impl() :: module()
+def impl, do: Application.get_env(:ashiato, __MODULE__, []) |> Keyword.get(:impl, @default_impl)
+```
+
+Fakes live in `lib/` next to their implementation, not in `test/support`: config can point a dev run at
+the fake, and each card then owns every file it needs. A fake is stateful per test process — keep it in
+an `Agent` or `:persistent_term`-free process table started per test, never a global `Application` env
+write, so cards stay parallel-safe.
+
 ---
 
 ## W2-1 — `Ashiato.Tokenizer`

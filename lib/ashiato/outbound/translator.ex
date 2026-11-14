@@ -228,8 +228,8 @@ defmodule Ashiato.Translator do
   end
 
   @doc """
-  Posts to `url` with `retry: false`. A non-200 reply returns its status only and
-  discards the body. `:decode` in `req_opts` receives the 200 body.
+  Posts to `url` through `Ashiato.HTTP`. A non-200 reply returns its status only
+  and discards the body. `:decode` in `req_opts` receives the 200 body.
   """
   @spec http_post(String.t(), keyword()) :: {:ok, [String.t()]} | {:error, term()}
   def http_post(url, req_opts) do
@@ -239,16 +239,22 @@ defmodule Ashiato.Translator do
       {nil, _opts} ->
         {:error, :no_decoder}
 
-      {decode, req_opts} ->
-        case URI.new(url) do
-          {:ok, %{scheme: scheme, host: host}}
-          when scheme in ["http", "https"] and is_binary(host) and host != "" ->
-            do_post(url, decode, req_opts)
+      {decode, opts} ->
+        case Ashiato.HTTP.post(url, opts) do
+          {:ok, body} ->
+            decode.(body)
 
-          _ ->
-            {:error, :invalid_url}
+          # Ashiato.HTTP discards the exception's `data` (the reply text); keeping
+          # only the atom here preserves that guarantee.
+          {:error, :invalid_json} ->
+            {:error, :unparsable}
+
+          {:error, reason} ->
+            {:error, reason}
         end
     end
+  rescue
+    _ -> {:error, :request_failed}
   end
 
   defp put_test_plug(req_opts) do
@@ -257,24 +263,6 @@ defmodule Ashiato.Translator do
       plug -> Keyword.put_new(req_opts, :plug, plug)
     end
   end
-
-  defp do_post(url, decode, req_opts) do
-    try do
-      case Req.post(url, [retry: false] ++ req_opts) do
-        {:ok, %Req.Response{status: 200, body: body}} -> decode.(body)
-        {:ok, %Req.Response{status: status}} -> {:error, {:http, status}}
-        # Req's JSON step turns a malformed body into an exception whose `data` is
-        # the response text; returning it would leak translated lines to the caller.
-        {:error, %Jason.DecodeError{}} -> {:error, :unparsable}
-        {:error, exception} -> {:error, {:transport, safe_reason(exception)}}
-      end
-    rescue
-      _ -> {:error, :request_failed}
-    end
-  end
-
-  defp safe_reason(%{reason: reason}) when is_atom(reason), do: reason
-  defp safe_reason(_exception), do: :unknown
 
   @doc false
   @spec langs(keyword()) :: {:ok, {String.t(), String.t()}} | {:error, :missing_target_lang}

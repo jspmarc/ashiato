@@ -84,7 +84,19 @@ defmodule Ashiato.TokenizerTest do
   test "a non-200 reply is an error tuple, not a crash" do
     stub_reply(fn conn -> Plug.Conn.send_resp(conn, 500, "boom") end)
 
-    assert Tokenizer.Http.tokenize("食べた") == {:error, {:unexpected_status, 500}}
+    assert Tokenizer.Http.tokenize("食べた") == {:error, {:http, 500}}
+  end
+
+  test "a trailing slash on the base URL does not double the path separator" do
+    stub_reply(
+      fn conn ->
+        assert conn.request_path == "/tokenize"
+        Req.Test.json(conn, %{"tokens" => []})
+      end,
+      "https://jp-dict.test/"
+    )
+
+    assert Tokenizer.Http.tokenize("食べた") == {:ok, []}
   end
 
   test "a 200 reply without a token list is rejected, not read as an empty page" do
@@ -143,10 +155,10 @@ defmodule Ashiato.TokenizerTest do
   end
 
   # Points the HTTP client at a Req.Test stub: no socket, no service.
-  defp stub_reply(plug) do
+  defp stub_reply(plug, base_url \\ "https://jp-dict.test") do
     Application.put_env(:ashiato, Tokenizer,
       impl: Tokenizer.Http,
-      base_url: "https://jp-dict.test",
+      base_url: base_url,
       plug: {Req.Test, Tokenizer.Http}
     )
 

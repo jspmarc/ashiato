@@ -135,6 +135,38 @@ defmodule Ashiato.TranslatorTest do
            ) == {:error, :unparsable}
   end
 
+  test "google_free translates through its real parser via Req.Test" do
+    Application.put_env(:ashiato, Translator,
+      provider: :google_free,
+      plug: {Req.Test, Ashiato.Translator.GoogleFree}
+    )
+
+    parent = self()
+
+    Req.Test.stub(Ashiato.Translator.GoogleFree, fn conn ->
+      {:ok, raw, conn} = Plug.Conn.read_body(conn)
+      send(parent, {:google_form, raw})
+      Req.Test.json(conn, [[["hello", "こんにちは"]], nil, "ja"])
+    end)
+
+    assert Ashiato.Translator.GoogleFree.translate_page(["こんにちは"], target_lang: "en") ==
+             {:ok, ["hello"]}
+
+    assert_received {:google_form, raw}
+    assert URI.decode_query(raw)["q"] == "こんにちは"
+  end
+
+  test "a crashing decoder returns request_failed" do
+    Req.Test.stub(__MODULE__, fn conn ->
+      Req.Test.json(conn, %{"ok" => true})
+    end)
+
+    assert Translator.http_post("http://translator.test/x",
+             decode: fn _body -> raise "boom" end,
+             plug: {Req.Test, __MODULE__}
+           ) == {:error, :request_failed}
+  end
+
   test "llm uses the Responses API with a JSON schema" do
     configure_llm()
     parent = self()

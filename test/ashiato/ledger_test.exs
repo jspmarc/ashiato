@@ -59,6 +59,28 @@ defmodule Ashiato.LedgerTest do
       assert Repo.aggregate(Lexeme, :count) == 1
     end
 
+    test "a nil part of speech is stored as an empty string and lookups do not raise" do
+      assert {:ok, first} = Ledger.find_or_create_lexeme("ねこ", "ねこ", nil)
+      assert first.part_of_speech == ""
+
+      # NULL is distinct in a unique index, so nil would insert a new row every call.
+      assert {:ok, second} = Ledger.find_or_create_lexeme("ねこ", "ねこ", nil)
+      assert second.id == first.id
+      assert Repo.aggregate(Lexeme, :count) == 1
+
+      user = user_fixture()
+      word_fixture(user_id: user.id, lexeme_id: first.id)
+      source = source_fixture(user_id: user.id)
+
+      assert Ledger.chrome_ratio(user.id, source.id) == %{}
+      assert Ledger.kanji_met_words(user.id, "ね") == []
+    end
+
+    test "an empty lemma returns the changeset" do
+      assert {:error, changeset} = Ledger.find_or_create_lexeme("", "ねこ", "noun")
+      assert %{lemma: ["can't be blank"]} = errors_on(changeset)
+    end
+
     test "concurrent callers end up with one row" do
       results =
         1..5

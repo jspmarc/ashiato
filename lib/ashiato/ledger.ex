@@ -64,45 +64,47 @@ defmodule Ashiato.Ledger do
   @doc """
   Finds the lexeme matching `(lemma, reading, part_of_speech)` or creates it.
 
-  Safe under races. The common path is fetch-first; if the row does not exist
-  we insert, and if we lose the race against a concurrent caller the declared
-  `lexemes_lemma_reading_part_of_speech_index` unique constraint surfaces as
-  `{:error, changeset}`, after which we fetch the row the winner just wrote.
-  Returns `{:ok, %Lexeme{}}` whether we created it or not.
+  Safe under races: the insert is an upsert (`on_conflict: :nothing` over the
+  `lexemes_lemma_reading_part_of_speech_index` unique index), so a lost race is
+  a no-op that returns a struct without `id`, and the row the winner just wrote
+  is fetched. No constraint violation is raised, so the refetch never runs
+  inside an aborted transaction. Should that refetch find no row, the original
+  changeset is surfaced as-is; validation failures return `{:error, changeset}`
+  without ever reaching the database. Returns `{:ok, %Lexeme{}}` whether we
+  created it or not.
 
-  `reading` is normalised `nil` → `""` to match the database default, so the
-  `lexemes_lemma_reading_part_of_speech_index` unique index actually bites
-  (multiple NULLs would pass).
+  `reading` and `part_of_speech` are normalised `nil` → `""` to match the
+  database defaults, so the unique index actually bites (multiple NULLs would
+  pass). Both ride on the struct, not through the changeset: cast/3 would turn
+  "" into nil (see Lexeme.changeset/2).
   """
   @spec find_or_create_lexeme(String.t(), String.t() | nil, String.t() | nil) ::
           {:ok, Lexeme.t()} | {:error, Ecto.Changeset.t()}
   def find_or_create_lexeme(lemma, reading, part_of_speech) do
     reading = reading || ""
+    part_of_speech = part_of_speech || ""
     identity = [lemma: lemma, reading: reading, part_of_speech: part_of_speech]
 
-    case Repo.get_by(Lexeme, identity) do
-      %Lexeme{} = existing ->
-        {:ok, existing}
+    changeset =
+      %Lexeme{reading: reading, part_of_speech: part_of_speech}
+      |> Lexeme.changeset(%{lemma: lemma})
 
-      nil ->
-        # reading goes on the struct, not through the changeset: cast/3 would
-        # turn "" into nil (see Lexeme.changeset/2).
-        %Lexeme{reading: reading}
-        |> Lexeme.changeset(%{lemma: lemma, part_of_speech: part_of_speech})
-        |> Repo.insert()
-        |> case do
-          {:ok, lexeme} ->
-            {:ok, lexeme}
-
-          {:error, changeset} ->
-            # A uniqueness race: the winner's row must be there now. Should the
-            # failure have been a validation error instead, the refetch finds
-            # nothing and we surface the original changeset as-is.
-            case Repo.get_by(Lexeme, identity) do
-              %Lexeme{} = existing -> {:ok, existing}
-              nil -> {:error, changeset}
-            end
+    case Repo.insert(changeset,
+           on_conflict: :nothing,
+           conflict_target: [:lemma, :reading, :part_of_speech]
+         ) do
+      {:ok, %Lexeme{id: nil}} ->
+        # lost the upsert race: the winner's row must be there now
+        case Repo.get_by(Lexeme, identity) do
+          %Lexeme{} = existing -> {:ok, existing}
+          nil -> {:error, changeset}
         end
+
+      {:ok, lexeme} ->
+        {:ok, lexeme}
+
+      {:error, changeset} ->
+        {:error, changeset}
     end
   end
 
@@ -831,28 +833,23 @@ defmodule Ashiato.Ledger do
     end
   end
 
-  # Fetch-first, so a lost insert race ends with the winner's row rather than a
-  # raise. `Word` has no changeset (both fields are set on the struct), so one
-  # is built here.
+  # The insert is an upsert (`on_conflict: :nothing` over the `(user_id,
+  # lexeme_id)` unique index): a lost race is a no-op that returns a struct
+  # without `id`, and the winner's row is refetched. No constraint violation
+  # occurs, so the refetch never runs inside an aborted PostgreSQL transaction.
+  # `Word` has no changeset (both fields are set on the struct).
   @spec find_or_create_word(integer(), integer()) :: {:ok, Word.t()}
   defp find_or_create_word(user_id, lexeme_id) do
-    case Repo.get_by(Word, user_id: user_id, lexeme_id: lexeme_id) do
-      %Word{} = word ->
+    case Repo.insert(%Word{user_id: user_id, lexeme_id: lexeme_id},
+           on_conflict: :nothing,
+           conflict_target: [:user_id, :lexeme_id]
+         ) do
+      {:ok, %Word{id: nil}} ->
+        # lost the race: the concurrent caller's row is there now
+        {:ok, Repo.get_by!(Word, user_id: user_id, lexeme_id: lexeme_id)}
+
+      {:ok, word} ->
         {:ok, word}
-
-      nil ->
-        %Word{user_id: user_id, lexeme_id: lexeme_id}
-        |> Ecto.Changeset.change()
-        |> Ecto.Changeset.unique_constraint([:user_id, :lexeme_id])
-        |> Repo.insert()
-        |> case do
-          {:ok, word} ->
-            {:ok, word}
-
-          # lost the race: the concurrent caller's row is there now
-          {:error, _changeset} ->
-            {:ok, Repo.get_by!(Word, user_id: user_id, lexeme_id: lexeme_id)}
-        end
     end
   end
 

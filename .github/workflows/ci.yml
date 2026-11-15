@@ -5,8 +5,8 @@ name: CI
 #
 # The SQLite job needs no service container. The PostgreSQL job runs against a
 # postgres:17 service and sets ASHIATO_TEST_ADAPTER so the suite compiles the
-# Postgres adapter; its cache key is adapter-specific so neither job can
-# restore the other's build.
+# Postgres adapter; both cache keys and restore prefixes are adapter-specific
+# (mix-sqlite- / mix-pg-) so neither job can restore the other's build.
 
 on:
   push:
@@ -41,8 +41,8 @@ jobs:
           path: |
             deps
             _build
-          key: mix-${{ runner.os }}-${{ hashFiles('mix.lock') }}
-          restore-keys: mix-${{ runner.os }}-
+          key: mix-sqlite-${{ runner.os }}-${{ hashFiles('mix.lock') }}
+          restore-keys: mix-sqlite-${{ runner.os }}-
 
       - name: Install dependencies
         run: mix deps.get
@@ -112,8 +112,8 @@ jobs:
           path: |
             deps
             _build
-          key: mix-${{ runner.os }}-pg-${{ hashFiles('mix.lock') }}
-          restore-keys: mix-${{ runner.os }}-pg-
+          key: mix-pg-${{ runner.os }}-${{ hashFiles('mix.lock') }}
+          restore-keys: mix-pg-${{ runner.os }}-
 
       - name: Install dependencies
         run: mix deps.get

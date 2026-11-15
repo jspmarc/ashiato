@@ -1,17 +1,32 @@
 import Config
-config :ashiato, Oban, testing: :manual
+
+default_url = "postgres://postgres:postgres@localhost:5432/ashiato_test"
+
+postgres? = System.get_env("ASHIATO_TEST_ADAPTER") == "postgres"
+engine = if postgres?, do: Oban.Engines.Basic, else: Oban.Engines.Lite
+
+config :ashiato, Oban, engine: engine, testing: :manual
 
 # Configure your database
 #
 # The MIX_TEST_PARTITION environment variable can be used
 # to provide built-in test partitioning in CI environment.
 # Run `mix help test` for more information.
-config :ashiato, :ecto_adapter, Ecto.Adapters.SQLite3
+if postgres? do
+  config :ashiato, :ecto_adapter, Ecto.Adapters.Postgres
 
-config :ashiato, Ashiato.Repo,
-  database: Path.expand("../ashiato_test.db", __DIR__),
-  pool_size: 5,
-  pool: Ecto.Adapters.SQL.Sandbox
+  config :ashiato, Ashiato.Repo,
+    url: System.get_env("DATABASE_URL") || default_url,
+    pool_size: 5,
+    pool: Ecto.Adapters.SQL.Sandbox
+else
+  config :ashiato, :ecto_adapter, Ecto.Adapters.SQLite3
+
+  config :ashiato, Ashiato.Repo,
+    database: Path.expand("../ashiato_test.db", __DIR__),
+    pool_size: 5,
+    pool: Ecto.Adapters.SQL.Sandbox
+end
 
 # We don't run a server during test. If one is required,
 # you can enable the server option below.

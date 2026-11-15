@@ -43,6 +43,26 @@ defmodule Ashiato.SettingsTest do
       assert Settings.get(user.id, "OPENAI_API_KEY") == "sk-live-1234"
     end
 
+    test "re-putting an existing secret without secret: true stays encrypted", %{user: user} do
+      assert {:ok, _} = Settings.put(user.id, "OPENAI_API_KEY", "sk-1", secret: true)
+      assert {:ok, row} = Settings.put(user.id, "OPENAI_API_KEY", "sk-2")
+
+      assert row.secret
+      refute row.value =~ "sk-2"
+      assert Settings.get(user.id, "OPENAI_API_KEY") == "sk-2"
+      assert Settings.all(user.id)["OPENAI_API_KEY"] == :redacted
+    end
+
+    test "explicit secret: false declassifies an existing secret", %{user: user} do
+      assert {:ok, _} = Settings.put(user.id, "OPENAI_API_KEY", "sk-1", secret: true)
+      assert {:ok, row} = Settings.put(user.id, "OPENAI_API_KEY", "sk-2", secret: false)
+
+      refute row.secret
+      assert row.value == "\"sk-2\""
+      assert Settings.get(user.id, "OPENAI_API_KEY") == "sk-2"
+      assert Settings.all(user.id)["OPENAI_API_KEY"] == "sk-2"
+    end
+
     test "upserts on (user_id, key) so a second put replaces instead of raising", %{user: user} do
       assert {:ok, _} = Settings.put(user.id, "OPENAI_API_KEY", "sk-1")
       assert {:ok, _} = Settings.put(user.id, "OPENAI_API_KEY", "sk-2", secret: true)
@@ -137,6 +157,60 @@ defmodule Ashiato.SettingsTest do
     end
   end
 
+  describe "credential/2" do
+    setup do
+      Application.delete_env(:ashiato, :settings)
+
+      orig = System.get_env("OPENAI_API_KEY")
+
+      on_exit(fn ->
+        case orig do
+          nil -> System.delete_env("OPENAI_API_KEY")
+          value -> System.put_env("OPENAI_API_KEY", value)
+        end
+      end)
+
+      System.delete_env("OPENAI_API_KEY")
+
+      {:ok, user: user_fixture()}
+    end
+
+    test "the stored row wins over the environment", %{user: user} do
+      System.put_env("OPENAI_API_KEY", "sk-from-env")
+      Settings.put(user.id, "OPENAI_API_KEY", "sk-stored", secret: true)
+
+      assert Settings.credential(user.id, "OPENAI_API_KEY") == "sk-stored"
+    end
+
+    test "falls back to the environment when no row exists", %{user: user} do
+      System.put_env("OPENAI_API_KEY", "sk-from-env")
+
+      assert Settings.credential(user.id, "OPENAI_API_KEY") == "sk-from-env"
+    end
+
+    test "an explicitly empty stored value blocks the environment and returns nil", %{
+      user: user
+    } do
+      System.put_env("OPENAI_API_KEY", "sk-from-env")
+
+      Settings.put(user.id, "OPENAI_API_KEY", "")
+      assert Settings.credential(user.id, "OPENAI_API_KEY") == nil
+
+      Settings.put(user.id, "OPENAI_API_KEY", nil)
+      assert Settings.credential(user.id, "OPENAI_API_KEY") == nil
+    end
+
+    test "an absent row with no environment value is nil", %{user: user} do
+      assert Settings.credential(user.id, "OPENAI_API_KEY") == nil
+    end
+
+    test "a stored non-binary value is nil", %{user: user} do
+      Settings.put(user.id, "OPENAI_API_KEY", 123)
+
+      assert Settings.credential(user.id, "OPENAI_API_KEY") == nil
+    end
+  end
+
   describe "capability gates through the fake" do
     setup do
       Application.put_env(:ashiato, :settings, Ashiato.Settings.Fake)
@@ -224,6 +298,35 @@ defmodule Ashiato.SettingsTest do
       impl.put(user.id, "deepl_api_key", nil, [])
 
       refute Settings.translate_capable?(user.id)
+    end
+
+    test "the fake preserves classification like the real store", %{user: user} do
+      impl = Settings.impl()
+      impl.put(user.id, "OPENAI_API_KEY", "sk-1", secret: true)
+      {:ok, row} = impl.put(user.id, "OPENAI_API_KEY", "sk-2", [])
+
+      assert row.secret
+      assert impl.all(user.id)["OPENAI_API_KEY"] == :redacted
+      assert impl.get(user.id, "OPENAI_API_KEY", nil) == "sk-2"
+
+      {:ok, row} = impl.put(user.id, "OPENAI_API_KEY", "sk-3", secret: false)
+      refute row.secret
+      assert impl.all(user.id)["OPENAI_API_KEY"] == "sk-3"
+    end
+
+    test "the fake credential/2 applies the same precedence as the real store", %{user: user} do
+      impl = Settings.impl()
+
+      assert impl.credential(user.id, "OPENAI_API_KEY") == nil
+
+      System.put_env("OPENAI_API_KEY", "sk-from-env")
+      assert impl.credential(user.id, "OPENAI_API_KEY") == "sk-from-env"
+
+      impl.put(user.id, "OPENAI_API_KEY", "", [])
+      assert impl.credential(user.id, "OPENAI_API_KEY") == nil
+
+      impl.put(user.id, "OPENAI_API_KEY", "sk-stored", [])
+      assert impl.credential(user.id, "OPENAI_API_KEY") == "sk-stored"
     end
 
     test "translate_capable? covers the google_cloud and llm branches", %{user: user} do

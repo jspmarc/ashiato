@@ -28,6 +28,7 @@ defmodule Ashiato.Settings do
               {:ok, Setting.t()}
               | {:error, Ecto.Changeset.t() | :not_encodable | :secret_key_base_missing}
   @callback all(integer()) :: %{optional(String.t()) => term()}
+  @callback credential(integer(), String.t()) :: String.t() | nil
 
   @key_salt "ashiato settings"
 
@@ -79,18 +80,41 @@ defmodule Ashiato.Settings do
 
   @doc """
   Stores one setting, JSON-encoded, upserting on `(user_id, key)`: a second
-  `put` replaces the row and never raises the unique constraint. `opts` may
-  carry `secret: true` to store the value encrypted at rest. `user_id` is set
-  on the struct, never cast.
+  `put` replaces the row and never raises the unique constraint.
+
+  `opts` decides the secret classification:
+
+  - `secret: true` stores the value encrypted at rest;
+  - `secret: false` declassifies — an existing secret row is rewritten in the
+    clear;
+  - omitting `:secret` preserves the existing row's classification, so
+    re-storing a secret without the flag stays encrypted, and a new row is
+    stored in the clear.
+
+  `user_id` is set on the struct, never cast.
   """
   @spec put(integer(), String.t(), term(), keyword()) ::
           {:ok, Setting.t()}
           | {:error, Ecto.Changeset.t() | :not_encodable | :secret_key_base_missing}
   def put(user_id, key, value, opts \\ []) do
-    secret? = Keyword.get(opts, :secret, false)
+    secret? =
+      case Keyword.fetch(opts, :secret) do
+        {:ok, explicit} -> explicit
+        :error -> existing_secret?(user_id, key)
+      end
 
     with {:ok, stored} <- encode_value(value, secret?) do
       upsert(user_id, key, stored, secret?)
+    end
+  end
+
+  # Omitting `:secret` means "keep whatever this row already is": a re-put of an
+  # existing secret must not silently store the plaintext, and a brand-new key
+  # is not a secret unless the caller says so.
+  defp existing_secret?(user_id, key) do
+    case Repo.get_by(Setting, user_id: user_id, key: key) do
+      nil -> false
+      %Setting{secret: secret?} -> secret?
     end
   end
 
@@ -188,23 +212,28 @@ defmodule Ashiato.Settings do
   defp provider_configured?(user_id, "llm"), do: credential?(user_id, "OPENAI_API_KEY")
   defp provider_configured?(_user_id, _unknown), do: false
 
-  # A row that exists and holds JSON `null` must not be confused with an absent row:
-  # `get/3` returns nil for both, and treating "cleared key" as "no key" would fall
-  # through to the environment and re-enable a capability the user just switched off.
-  @missing :__missing_setting__
+  @doc """
+  The credential for `key`: the stored row wins and the environment variable
+  named by the uppercase key (`OPENAI_API_KEY`, `DEEPL_API_KEY`,
+  `GOOGLE_CLOUD_API_KEY`) is the fallback. An explicitly empty stored value —
+  an empty string or JSON `null` — blocks the fallback, so a cleared key
+  disables the capability even when the environment still holds one. A secret
+  row is decrypted first, and a resolved value that is empty or not a binary
+  is `nil`.
+  """
+  @spec credential(integer(), String.t()) :: String.t() | nil
+  def credential(user_id, key) do
+    value =
+      case Repo.get_by(Setting, user_id: user_id, key: key) do
+        nil -> System.get_env(String.upcase(key))
+        %Setting{secret: true, value: cipher} -> decrypt(cipher, key, nil)
+        %Setting{value: json} -> decode(json, key, nil)
+      end
 
-  # The settings row wins and environment variables are the fallback. Environment
-  # names are the uppercase form of the setting key (`OPENAI_API_KEY`,
-  # `DEEPL_API_KEY`, `GOOGLE_CLOUD_API_KEY`). An explicitly empty stored key stays
-  # empty rather than falling through, so it still disables the capability.
-  defp credential?(user_id, key) do
-    case impl().get(user_id, key, @missing) do
-      @missing -> present?(System.get_env(String.upcase(key)))
-      value -> present?(value)
-    end
+    if is_binary(value) and value != "", do: value
   end
 
-  defp present?(value), do: is_binary(value) and value != ""
+  defp credential?(user_id, key), do: impl().credential(user_id, key) != nil
 
   # ── storage ─────────────────────────────────────────────────────────────────
 

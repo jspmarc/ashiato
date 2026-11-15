@@ -131,12 +131,6 @@ defmodule Ashiato.Settings do
     end
   end
 
-  # The users row is the serialisation point for the classification read: it
-  # always exists for a stored setting, and locking it makes a concurrent
-  # `secret: true` write commit before the read, so the flag can never be read
-  # as "absent/non-secret" and the row rewritten as plaintext. SQLite has no
-  # row locks (`lock:` raises "locks are not supported by SQLite3") and its
-  # single-writer engine serialises writes anyway, so it keeps the plain fetch.
   @spec lock_user_row(integer()) :: :ok
   defp lock_user_row(user_id) do
     if Application.fetch_env!(:ashiato, :ecto_adapter) == Ecto.Adapters.Postgres do

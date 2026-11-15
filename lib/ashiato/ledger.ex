@@ -246,11 +246,6 @@ defmodule Ashiato.Ledger do
     end
   end
 
-  # The words row is the serialisation point for concurrent reviews: it always
-  # exists for a queued word, unlike word_states, and locking it makes the
-  # second review read the first's committed state. SQLite has no row locks
-  # (`lock:` raises "locks are not supported by SQLite3") and its single-writer
-  # engine serialises writes anyway, so it keeps the plain fetch.
   @spec locked_word(integer()) :: Word.t() | nil
   defp locked_word(word_id) do
     if Application.fetch_env!(:ashiato, :ecto_adapter) == Ecto.Adapters.Postgres do

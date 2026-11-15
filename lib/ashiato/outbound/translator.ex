@@ -183,17 +183,18 @@ defmodule Ashiato.Translator do
     :persistent_term.put(cooldown_key(provider, opts), expiry)
   end
 
-  defp cooldown_key(provider, opts), do: {__MODULE__, :cooldown, provider, fingerprint(opts)}
-
-  defp fingerprint(opts) do
+  defp cooldown_key(provider, opts) do
     case Keyword.get(opts, :api_key) do
       key when is_binary(key) and key != "" ->
-        :crypto.hash(:sha256, key)
-        |> Base.encode16(case: :lower)
-        |> binary_part(0, 16)
+        fingerprint =
+          :crypto.hash(:sha256, key)
+          |> Base.encode16(case: :lower)
+          |> binary_part(0, 16)
+
+        {__MODULE__, :cooldown, provider, fingerprint}
 
       _absent_or_empty_or_non_binary ->
-        :none
+        {__MODULE__, :cooldown, provider, :none}
     end
   end
 

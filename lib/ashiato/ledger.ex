@@ -660,9 +660,12 @@ defmodule Ashiato.Ledger do
           {:ok, Page.t()} | {:error, :superseded}
   def accept_text(%Page{} = page, text) do
     query = from(p in Page, where: p.id == ^page.id and p.revision == ^page.revision)
+    now = DateTime.utc_now() |> DateTime.truncate(:second)
 
     {count, _} =
-      Repo.update_all(query, set: [accepted_text: text, revision: page.revision + 1])
+      Repo.update_all(query,
+        set: [accepted_text: text, revision: page.revision + 1, updated_at: now]
+      )
 
     case count do
       0 -> {:error, :superseded}
@@ -689,8 +692,10 @@ defmodule Ashiato.Ledger do
               p.status == ^page.status
         )
 
+      now = DateTime.utc_now() |> DateTime.truncate(:second)
+
       {count, _} =
-        Repo.update_all(query, set: [status: status])
+        Repo.update_all(query, set: [status: status, updated_at: now])
 
       case count do
         0 -> {:error, :superseded}
@@ -719,7 +724,9 @@ defmodule Ashiato.Ledger do
               p.status == ^page.status
         )
 
-      {count, _} = Repo.update_all(query, set: [status: status])
+      now = DateTime.utc_now() |> DateTime.truncate(:second)
+
+      {count, _} = Repo.update_all(query, set: [status: status, updated_at: now])
 
       case count do
         0 -> {:error, :superseded}

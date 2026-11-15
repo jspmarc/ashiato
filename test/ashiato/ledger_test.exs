@@ -1244,6 +1244,24 @@ defmodule Ashiato.LedgerTest do
         assert page.status == :failed
       end
     end
+
+    test "transition/2 and finish_page/2 bump updated_at even with stale old value",
+         %{user: user, source: source} do
+      old_time = ~U[2020-01-01 00:00:00Z]
+
+      page = make_page(user, source)
+      :ok = reset_updated_at(page.id, old_time)
+
+      assert {:ok, moved} = Ledger.transition(page, :detecting)
+      refute moved.updated_at == old_time
+      assert DateTime.diff(DateTime.utc_now(), moved.updated_at, :second) < 2
+
+      :ok = reset_updated_at(moved.id, old_time)
+
+      assert {:ok, finished} = Ledger.finish_page(moved, :text_ready)
+      refute finished.updated_at == old_time
+      assert DateTime.diff(DateTime.utc_now(), finished.updated_at, :second) < 2
+    end
   end
 
   defp make_page(user, source, attrs \\ %{}) do
@@ -1307,5 +1325,14 @@ defmodule Ashiato.LedgerTest do
     encounter
     |> Ecto.Changeset.change(discarded_at: DateTime.truncate(DateTime.utc_now(), :second))
     |> Repo.update!()
+  end
+
+  defp reset_updated_at(page_id, datetime) do
+    Repo.update_all(
+      from(p in Page, where: p.id == ^page_id),
+      set: [updated_at: datetime]
+    )
+
+    :ok
   end
 end

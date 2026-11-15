@@ -26,12 +26,17 @@ defmodule Ashiato.Fixtures do
   row seeds create for the real user.
   """
   def source_fixture(attrs \\ %{}) do
+    user_id = attrs[:user_id] || user_fixture().id
+
     attrs =
-      Enum.into(attrs, %{
-        user_id: user_fixture().id,
-        name: "ゲーム#{System.unique_integer([:positive])}",
-        kind: :game
-      })
+      Map.merge(
+        %{
+          user_id: user_id,
+          name: "ゲーム#{System.unique_integer([:positive])}",
+          kind: :game
+        },
+        Map.new(attrs)
+      )
 
     %Source{}
     |> Ecto.Changeset.change(attrs)
@@ -64,14 +69,26 @@ defmodule Ashiato.Fixtures do
   def page_fixture(attrs \\ %{}) do
     n = System.unique_integer([:positive])
 
+    user_id =
+      cond do
+        user_id = attrs[:user_id] -> user_id
+        source_id = attrs[:source_id] -> Repo.get!(Source, source_id).user_id
+        true -> user_fixture().id
+      end
+
+    source_id = attrs[:source_id] || source_fixture(user_id: user_id).id
+
     attrs =
-      Enum.into(attrs, %{
-        user_id: user_fixture().id,
-        source_id: source_fixture().id,
-        image_key: "pages/#{n}.jpg",
-        text_hash: "hash-#{n}",
-        status: :uploaded
-      })
+      Map.merge(
+        %{
+          user_id: user_id,
+          source_id: source_id,
+          image_key: "pages/#{n}.jpg",
+          text_hash: "hash-#{n}",
+          status: :uploaded
+        },
+        Map.new(attrs)
+      )
 
     %Page{}
     |> Ecto.Changeset.change(attrs)
@@ -83,12 +100,13 @@ defmodule Ashiato.Fixtures do
   """
   def word_fixture(attrs \\ %{}) do
     user_id = attrs[:user_id] || user_fixture().id
+    lexeme_id = attrs[:lexeme_id] || lexeme_fixture().id
 
     attrs =
-      Enum.into(attrs, %{
-        user_id: user_id,
-        lexeme_id: lexeme_fixture().id
-      })
+      Map.merge(
+        %{user_id: user_id, lexeme_id: lexeme_id},
+        Map.new(attrs)
+      )
 
     %Word{}
     |> Ecto.Changeset.change(attrs)

@@ -2,7 +2,7 @@
 
 **Spec:** `docs/specs/wave-2-6/spec.md`
 **Baseline:** `641d5fbbe5c96211f6cb5aed4c8cee34519d2546`, branch `wave-2-6-cleanup`
-**Status:** awaiting user approval (AC-10 rewrite; expert pass skipped by user direction)
+**Status:** implemented
 
 ## Approach
 
@@ -158,3 +158,24 @@ test adapter, PostgreSQL-only tests tagged `:postgres`.
 | 2 | F1 | accept | T5 now depends on T2 and T8 on T6; cells match the stated chain |
 | 2 | F2 | accept | Concurrency cases use a separate module with `Sandbox.unboxed_run/2`, real connections and commits, `on_exit` cleanup |
 | — | AC-10 rewrite | user-directed | Orchestration and entry points move to `DictionaryService`; expert pass explicitly skipped by the user |
+
+## Review findings
+
+| Pass | ID | Decision | Fix |
+|---|---|---|---|
+| 1 | R1 | accept | Adapter-specific cache namespaces `mix-sqlite-` / `mix-pg-`, no overlapping restore prefixes |
+| 1 | R2 | accept | `updated_at` set explicitly on `accept_text/2`, `finish_page/2`, `transition/2`; regression test fails without it |
+| 1 | R3 | accept | `Settings.put/4` classifies and upserts in one transaction, locking the `users` row on PostgreSQL; fake made atomic; mutation with the lock off reproduces the plaintext leak |
+| 2 | R4 | accept | Settings race test waits on `pg_locks` for the blocked backend before releasing the secret writer; mutation with the lock off fails deterministically |
+| 3 | — | ready | No issues |
+
+## Final gate
+
+| Check | Result |
+|---|---|
+| `git status --short --untracked-files=all` | clean |
+| `mix format --check-formatted` | exit 0 |
+| `mix compile --warnings-as-errors` | exit 0 |
+| `mix test` | 231 tests, 0 failures, 4 postgres excluded |
+| PG `mix test` | 231 tests, 0 failures |
+| CI workflow execution | not run on GitHub; the job's command sequence was reproduced locally against podman PostgreSQL |

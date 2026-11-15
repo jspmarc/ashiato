@@ -157,7 +157,9 @@ defmodule Ashiato.Ledger do
 
   Everything happens in one `Repo` transaction:
 
-    1. the `Word` row is fetched for `user_id` (error if missing)
+    1. the `Word` row is fetched for `user_id` (error if missing) — with
+       `FOR UPDATE` on PostgreSQL, so concurrent reviews serialise and the
+       second schedule is computed from the first
     2. the current `WordState` is fetched; an absent row just means *new*
        (state :new) — the state is rebuildable from the log, per §6.8
     3. the review is appended to `review_events` (append-only; the log is the
@@ -198,7 +200,7 @@ defmodule Ashiato.Ledger do
   @spec do_review(integer(), Srs.grade(), DateTime.t()) ::
           {:ok, WordState.t()} | {:error, Ecto.Changeset.t()}
   defp do_review(word_id, grade, now) do
-    case Repo.get(Word, word_id) do
+    case locked_word(word_id) do
       nil ->
         {:error, missing_word_changeset(word_id)}
 
@@ -232,6 +234,21 @@ defmodule Ashiato.Ledger do
                upsert_word_state(word_id, next, due_at, second, failure_streak) do
           {:ok, word_state}
         end
+    end
+  end
+
+  # The words row is the serialisation point for concurrent reviews: it always
+  # exists for a queued word, unlike word_states, and locking it makes the
+  # second review read the first's committed state. SQLite has no row locks
+  # (`lock:` raises "locks are not supported by SQLite3") and its single-writer
+  # engine serialises writes anyway, so it keeps the plain fetch.
+  @spec locked_word(integer()) :: Word.t() | nil
+  defp locked_word(word_id) do
+    if Application.fetch_env!(:ashiato, :ecto_adapter) == Ecto.Adapters.Postgres do
+      from(w in Word, where: w.id == ^word_id, lock: "FOR UPDATE")
+      |> Repo.one()
+    else
+      Repo.get(Word, word_id)
     end
   end
 

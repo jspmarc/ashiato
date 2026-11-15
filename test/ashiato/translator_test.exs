@@ -189,7 +189,8 @@ defmodule Ashiato.TranslatorTest do
       })
     end)
 
-    assert Llm.page_request(["一"], target_lang: "en") == {:ok, ["one", "two"]}
+    assert Llm.page_request(["一"], target_lang: "en", api_key: "test-key") ==
+             {:ok, ["one", "two"]}
 
     assert_received {:llm_request, "POST", "/v1/responses", ["Bearer test-key"], body}
     assert body["text"]["format"]["type"] == "json_schema"
@@ -212,7 +213,8 @@ defmodule Ashiato.TranslatorTest do
       })
     end)
 
-    assert Llm.page_request(["一"], target_lang: "en") == {:error, :unparsable}
+    assert Llm.page_request(["一"], target_lang: "en", api_key: "test-key") ==
+             {:error, :unparsable}
 
     Req.Test.stub(__MODULE__, fn conn ->
       Req.Test.json(conn, %{
@@ -223,7 +225,8 @@ defmodule Ashiato.TranslatorTest do
       })
     end)
 
-    assert Llm.page_request(["一"], target_lang: "en") == {:error, :unparsable}
+    assert Llm.page_request(["一"], target_lang: "en", api_key: "test-key") ==
+             {:error, :unparsable}
 
     Req.Test.stub(__MODULE__, fn conn ->
       Req.Test.json(conn, %{
@@ -239,7 +242,8 @@ defmodule Ashiato.TranslatorTest do
       })
     end)
 
-    assert Llm.page_request(["一"], target_lang: "en") == {:error, :unparsable}
+    assert Llm.page_request(["一"], target_lang: "en", api_key: "test-key") ==
+             {:error, :unparsable}
   end
 
   test "llm falls back to chat completions when responses is missing" do
@@ -263,7 +267,7 @@ defmodule Ashiato.TranslatorTest do
       end
     end)
 
-    assert Llm.page_request(["一"], target_lang: "en") == {:ok, ["one"]}
+    assert Llm.page_request(["一"], target_lang: "en", api_key: "test-key") == {:ok, ["one"]}
 
     assert_received {:chat_body, body}
     assert body["response_format"]["type"] == "json_schema"
@@ -288,29 +292,23 @@ defmodule Ashiato.TranslatorTest do
       end
     end)
 
-    assert Llm.page_request(["一"], target_lang: "en") == {:error, :unparsable}
+    assert Llm.page_request(["一"], target_lang: "en", api_key: "test-key") ==
+             {:error, :unparsable}
+  end
+
+  test "llm without api_key is not configured" do
+    configure_llm()
+
+    assert Llm.page_request(["一"], target_lang: "en") == {:error, :not_configured}
+    assert Llm.page_request(["一"], target_lang: "en", api_key: "") == {:error, :not_configured}
   end
 
   defp configure_llm do
-    key = System.get_env("OPENAI_API_KEY")
-    base = System.get_env("OPENAI_BASE_URL")
-
-    System.put_env("OPENAI_API_KEY", "test-key")
-    System.put_env("OPENAI_BASE_URL", "https://api.openai.com/v1")
-
-    on_exit(fn ->
-      restore_env("OPENAI_API_KEY", key)
-      restore_env("OPENAI_BASE_URL", base)
-    end)
-
     Application.put_env(:ashiato, Translator,
       provider: Llm,
       plug: {Req.Test, __MODULE__}
     )
   end
-
-  defp restore_env(name, nil), do: System.delete_env(name)
-  defp restore_env(name, value), do: System.put_env(name, value)
 
   test "refused provider enters cooldown" do
     on_exit(fn -> Translator.clear_cooldowns() end)
@@ -325,5 +323,51 @@ defmodule Ashiato.TranslatorTest do
              Translator.translate_page(["一"], target_lang: "en")
 
     assert seconds >= 1
+  end
+
+  test "a 403 blocks only the refused credential" do
+    on_exit(fn -> Translator.clear_cooldowns() end)
+    Translator.clear_cooldowns()
+
+    refused = fn _lines, _opts -> {:error, {:http, 403}} end
+
+    assert Translator.run_provider(Llm, ["一"], [api_key: "k1"], refused) ==
+             {:error, {:http, 403}}
+
+    assert {:error, {:cooldown, _}} =
+             Translator.run_provider(Llm, ["一"], [api_key: "k1"], refused)
+
+    assert Translator.run_provider(Llm, ["一"], [api_key: "k2"], refused) == {:error, {:http, 403}}
+  end
+
+  test "absent and empty keys share the :none fingerprint" do
+    on_exit(fn -> Translator.clear_cooldowns() end)
+    Translator.clear_cooldowns()
+
+    refused = fn _lines, _opts -> {:error, {:http, 403}} end
+
+    assert Translator.run_provider(Llm, ["一"], [], refused) == {:error, {:http, 403}}
+    assert {:error, {:cooldown, _}} = Translator.run_provider(Llm, ["一"], [], refused)
+    assert {:error, {:cooldown, _}} = Translator.run_provider(Llm, ["一"], [api_key: ""], refused)
+  end
+
+  test "clear_cooldowns/0 erases credential-scoped cooldowns" do
+    on_exit(fn -> Translator.clear_cooldowns() end)
+    Translator.clear_cooldowns()
+
+    refused = fn _lines, _opts -> {:error, {:http, 403}} end
+
+    assert Translator.run_provider(Llm, ["一"], [api_key: "k1"], refused) ==
+             {:error, {:http, 403}}
+
+    assert {:error, {:cooldown, _}} =
+             Translator.run_provider(Llm, ["一"], [api_key: "k1"], refused)
+
+    assert Translator.clear_cooldowns() == :ok
+
+    assert Translator.run_provider(Llm, ["一"], [api_key: "k1"], refused) ==
+             {:error, {:http, 403}}
+
+    assert Translator.run_provider(Llm, ["一"], [], refused) == {:error, {:http, 403}}
   end
 end

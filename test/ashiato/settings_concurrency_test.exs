@@ -56,14 +56,20 @@ defmodule Ashiato.SettingsConcurrencyTest do
 
     task_b =
       Task.async(fn ->
-        send(parent, :b_started)
-
         Ecto.Adapters.SQL.Sandbox.unboxed_run(Repo, fn ->
+          %{rows: [[backend_pid]]} = Repo.query!("SELECT pg_backend_pid()")
+          send(parent, {:b_backend_pid, backend_pid})
+
           Settings.put(user.id, "OPENAI_API_KEY", "sk-plain")
         end)
       end)
 
-    assert_receive :b_started, 5_000
+    assert_receive {:b_backend_pid, backend_pid}, 5_000
+
+    Ecto.Adapters.SQL.Sandbox.unboxed_run(Repo, fn ->
+      wait_until_blocked_on_lock(backend_pid)
+    end)
+
     send(task_a.pid, :commit)
 
     assert {:ok, %{secret: true}} = Task.await(task_b, 30_000)
@@ -76,5 +82,29 @@ defmodule Ashiato.SettingsConcurrencyTest do
       assert Settings.get(user.id, "OPENAI_API_KEY") == "sk-plain"
       assert Settings.all(user.id)["OPENAI_API_KEY"] == :redacted
     end)
+  end
+
+  # The parent may only release the secret writer once the plaintext writer is
+  # genuinely waiting on the `users` row lock; otherwise the plaintext writer
+  # could classify after the commit and the test would pass without the lock.
+  defp wait_until_blocked_on_lock(pid) do
+    poll_until_blocked(pid, System.monotonic_time(:millisecond) + 2_000)
+  end
+
+  defp poll_until_blocked(pid, deadline) do
+    %{rows: [[count]]} =
+      Repo.query!("SELECT count(*) FROM pg_locks WHERE pid = $1 AND NOT granted", [pid])
+
+    blocked? = count > 0
+
+    if blocked? or System.monotonic_time(:millisecond) >= deadline do
+      blocked? ||
+        flunk(
+          "task B never blocked on the users row lock: no ungranted lock for pid #{pid} within 2s"
+        )
+    else
+      Process.sleep(5)
+      poll_until_blocked(pid, deadline)
+    end
   end
 end

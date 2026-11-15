@@ -47,10 +47,6 @@ defmodule Ashiato.Ledger do
   # `introduce_words/3` lets a caller override it.
   @min_encounters 2
 
-  # Chrome-like in a source means appearing on more than this fraction of its
-  # pages — strictly more, so exactly half does not clear it.
-  @chrome_threshold 0.5
-
   # Forward edges of the ingest pipeline; `:failed` is reachable from any non-terminal state.
   @forward %{
     uploaded: [:detecting],
@@ -905,24 +901,40 @@ defmodule Ashiato.Ledger do
 
   # ── chrome_like ─────────────────────────────────────────────────────────────
 
-  # One chrome_ratio/2 pass per source, then one ratio list per word. The lists
-  # are never empty, so `all?/1` here is never vacuously true.
+  # Two aggregate passes for all sources at once: page counts per source, and
+  # distinct encounter-page counts per {source, word}. `2 * occurrences > pages`
+  # is the ratio threshold in integer arithmetic, so no float division is
+  # needed and the query count never grows with the number of sources. Only
+  # sources with encounters appear in the counts, so every word is judged on
+  # all of its sources; a word with no qualifying encounters is never listed.
   @spec chrome_word_ids(integer()) :: [integer()]
   defp chrome_word_ids(user_id) do
-    ratios_by_word =
-      user_id
-      |> source_ids()
-      |> Enum.flat_map(&chrome_ratio(user_id, &1))
-      |> Enum.group_by(fn {word_id, _ratio} -> word_id end, fn {_word_id, ratio} -> ratio end)
+    pages_by_source =
+      from(p in Page,
+        where: p.user_id == ^user_id,
+        select: {p.source_id, count(p.id)},
+        group_by: p.source_id
+      )
+      |> Repo.all()
+      |> Map.new()
 
-    for {word_id, ratios} <- ratios_by_word, Enum.all?(ratios, &(&1 > @chrome_threshold)) do
-      word_id
-    end
-  end
-
-  @spec source_ids(integer()) :: [integer()]
-  defp source_ids(user_id) do
-    Repo.all(from(s in Source, where: s.user_id == ^user_id, select: s.id))
+    from(e in Encounter,
+      where: e.user_id == ^user_id,
+      where: is_nil(e.discarded_at) and e.confirmed,
+      select: {e.source_id, e.word_id, count(e.page_id, :distinct)},
+      group_by: [e.source_id, e.word_id]
+    )
+    |> Repo.all()
+    |> Enum.group_by(
+      fn {_source_id, word_id, _occurrences} -> word_id end,
+      fn {source_id, _word_id, occurrences} ->
+        # an encounter always points at a page, so a missing count can only be 0
+        pages = Map.get(pages_by_source, source_id, 0)
+        pages > 0 and 2 * occurrences > pages
+      end
+    )
+    |> Enum.filter(fn {_word_id, passes} -> Enum.all?(passes) end)
+    |> Enum.map(fn {word_id, _passes} -> word_id end)
   end
 
   @spec flag_chrome(integer(), [integer()], DateTime.t()) :: {non_neg_integer(), nil}

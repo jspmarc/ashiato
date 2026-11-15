@@ -953,6 +953,35 @@ defmodule Ashiato.LedgerTest do
       refute Repo.reload!(real).chrome_like
     end
 
+    test "a word on a source with no pages and a word with no encounters stay unflagged",
+         %{user: user} do
+      %{word: word} = chrome_word(user)
+      source_fixture(user_id: user.id)
+      untouched = word_fixture(user_id: user.id)
+
+      assert {:ok, [flagged]} = Ledger.update_chrome_like(user.id)
+      assert flagged.id == word.id
+      assert Repo.reload!(word).chrome_like
+      refute Repo.reload!(untouched).chrome_like
+    end
+
+    test "the query count does not grow with the number of sources", %{user: user} do
+      %{word: _} = chrome_word(user)
+      {_, one_source} = counted_chrome_run(user)
+
+      for _ <- 1..2 do
+        source = source_fixture(user_id: user.id)
+        word = word_fixture(user_id: user.id)
+        pages = for _ <- 1..2, do: page_fixture(user_id: user.id, source_id: source.id)
+        Enum.each(pages, &record(user, source, word, &1, true))
+      end
+
+      {_, three_sources} = counted_chrome_run(user)
+
+      assert one_source > 0
+      assert one_source == three_sources
+    end
+
     test "when the flag lands, an existing card is suspended with reason chrome",
          %{user: user} do
       %{lexeme: lexeme, word: word} = chrome_word(user)
@@ -1017,6 +1046,25 @@ defmodule Ashiato.LedgerTest do
         assert reloaded.suspended and reloaded.suspended_reason == reason
       end
     end
+  end
+
+  # Runs update_chrome_like/1 with a `[:ashiato, :repo, :query]` counter
+  # attached; returns {result, query count}.
+  defp counted_chrome_run(user) do
+    handler_id = "ledger-test-query-count"
+    counter = :counters.new(1, [:atomics])
+
+    handler = fn _event, _measurements, _metadata, counter ->
+      :counters.add(counter, 1, 1)
+    end
+
+    :ok = :telemetry.attach(handler_id, [:ashiato, :repo, :query], handler, counter)
+    on_exit(fn -> :telemetry.detach(handler_id) end)
+
+    result = Ledger.update_chrome_like(user.id)
+    :ok = :telemetry.detach(handler_id)
+
+    {result, :counters.get(counter, 1)}
   end
 
   # A word met on `n` distinct confirmed pages of one source.

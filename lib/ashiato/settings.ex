@@ -21,6 +21,7 @@ defmodule Ashiato.Settings do
 
   alias Ashiato.Repo
   alias Ashiato.Schemas.Setting
+  alias Ashiato.Schemas.User
   alias Ashiato.Utils
 
   @callback get(integer(), String.t(), term()) :: term()
@@ -28,8 +29,14 @@ defmodule Ashiato.Settings do
               {:ok, Setting.t()}
               | {:error, Ecto.Changeset.t() | :not_encodable | :secret_key_base_missing}
   @callback all(integer()) :: %{optional(String.t()) => term()}
+  @callback credential(integer(), String.t()) :: String.t() | nil
 
   @key_salt "ashiato settings"
+
+  # Credential settings-row keys; the environment fallback is String.upcase/1 of these.
+  @openai_api_key "openai_api_key"
+  @deepl_api_key "deepl_api_key"
+  @google_cloud_api_key "google_cloud_api_key"
 
   # Built-in defaults: a missing row must never force a caller to special-case nil.
   @defaults %{
@@ -79,19 +86,64 @@ defmodule Ashiato.Settings do
 
   @doc """
   Stores one setting, JSON-encoded, upserting on `(user_id, key)`: a second
-  `put` replaces the row and never raises the unique constraint. `opts` may
-  carry `secret: true` to store the value encrypted at rest. `user_id` is set
-  on the struct, never cast.
+  `put` replaces the row and never raises the unique constraint.
+
+  `opts` decides the secret classification:
+
+  - `secret: true` stores the value encrypted at rest;
+  - `secret: false` declassifies — an existing secret row is rewritten in the
+    clear;
+  - omitting `:secret` preserves the existing row's classification, so
+    re-storing a secret without the flag stays encrypted, and a new row is
+    stored in the clear.
+
+  `user_id` is set on the struct, never cast.
+
+  The classification read and the upsert run in one transaction; on PostgreSQL
+  the owning `users` row is locked first, so a writer that omits `:secret`
+  cannot classify against an uncommitted `secret: true` write and rewrite the
+  row as plaintext.
   """
   @spec put(integer(), String.t(), term(), keyword()) ::
           {:ok, Setting.t()}
           | {:error, Ecto.Changeset.t() | :not_encodable | :secret_key_base_missing}
   def put(user_id, key, value, opts \\ []) do
-    secret? = Keyword.get(opts, :secret, false)
+    Repo.transaction(fn ->
+      lock_user_row(user_id)
 
-    with {:ok, stored} <- encode_value(value, secret?) do
-      upsert(user_id, key, stored, secret?)
+      secret? =
+        case Keyword.fetch(opts, :secret) do
+          {:ok, explicit} -> explicit
+          :error -> existing_secret?(user_id, key)
+        end
+
+      with {:ok, stored} <- encode_value(value, secret?),
+           {:ok, row} <- upsert(user_id, key, stored, secret?) do
+        row
+      else
+        {:error, reason} -> Repo.rollback(reason)
+      end
+    end)
+  end
+
+  # Omitting `:secret` means "keep whatever this row already is": a re-put of an
+  # existing secret must not silently store the plaintext, and a brand-new key
+  # is not a secret unless the caller says so.
+  defp existing_secret?(user_id, key) do
+    case Repo.get_by(Setting, user_id: user_id, key: key) do
+      nil -> false
+      %Setting{secret: secret?} -> secret?
     end
+  end
+
+  @spec lock_user_row(integer()) :: :ok
+  defp lock_user_row(user_id) do
+    if Application.fetch_env!(:ashiato, :ecto_adapter) == Ecto.Adapters.Postgres do
+      from(u in User, where: u.id == ^user_id, lock: "FOR UPDATE")
+      |> Repo.one()
+    end
+
+    :ok
   end
 
   # Encode first, encrypt second: a pid, tuple or struct cannot be JSON, and a crash here
@@ -101,10 +153,7 @@ defmodule Ashiato.Settings do
   defp encode_value(value, secret?) do
     case Jason.encode(value) do
       {:ok, json} when secret? ->
-        case encrypt(json) do
-          {:ok, encrypted} -> {:ok, encrypted}
-          {:error, :secret_key_base_missing} = err -> err
-        end
+        encrypt(json)
 
       {:ok, json} ->
         {:ok, json}
@@ -155,14 +204,14 @@ defmodule Ashiato.Settings do
 
   @doc """
   The AI gate: `ai_features_enabled` is on AND a non-empty
-  `OPENAI_API_KEY` exists — settings row first, then `System.get_env/1`. An
-  empty key disables the feature even with the switch on, so affordances hide
-  instead of failing at call time.
+  `openai_api_key` credential exists — settings row first, then the
+  `OPENAI_API_KEY` environment variable. An empty key disables the feature
+  even with the switch on, so affordances hide instead of failing at call time.
   """
   @spec ai_capable?(integer()) :: boolean()
   def ai_capable?(user_id) do
     impl().get(user_id, "ai_features_enabled", false) === true and
-      credential?(user_id, "OPENAI_API_KEY")
+      credential?(user_id, @openai_api_key)
   end
 
   @doc """
@@ -180,31 +229,37 @@ defmodule Ashiato.Settings do
 
   defp provider_configured?(_user_id, "google_free"), do: true
   defp provider_configured?(_user_id, "off"), do: false
-  defp provider_configured?(user_id, "deepl"), do: credential?(user_id, "deepl_api_key")
+  defp provider_configured?(user_id, "deepl"), do: credential?(user_id, @deepl_api_key)
 
   defp provider_configured?(user_id, "google_cloud"),
-    do: credential?(user_id, "google_cloud_api_key")
+    do: credential?(user_id, @google_cloud_api_key)
 
-  defp provider_configured?(user_id, "llm"), do: credential?(user_id, "OPENAI_API_KEY")
+  defp provider_configured?(user_id, "llm"), do: credential?(user_id, @openai_api_key)
   defp provider_configured?(_user_id, _unknown), do: false
 
-  # A row that exists and holds JSON `null` must not be confused with an absent row:
-  # `get/3` returns nil for both, and treating "cleared key" as "no key" would fall
-  # through to the environment and re-enable a capability the user just switched off.
-  @missing :__missing_setting__
+  @doc """
+  The credential for `key`: the stored row wins and the environment variable
+  named by the uppercase key (`OPENAI_API_KEY`, `DEEPL_API_KEY`,
+  `GOOGLE_CLOUD_API_KEY`) is the fallback, so the stored `openai_api_key` row
+  falls back to `OPENAI_API_KEY`. An explicitly empty stored value —
+  an empty string or JSON `null` — blocks the fallback, so a cleared key
+  disables the capability even when the environment still holds one. A secret
+  row is decrypted first, and a resolved value that is empty or not a binary
+  is `nil`.
+  """
+  @spec credential(integer(), String.t()) :: String.t() | nil
+  def credential(user_id, key) do
+    value =
+      case Repo.get_by(Setting, user_id: user_id, key: key) do
+        nil -> System.get_env(String.upcase(key))
+        %Setting{secret: true, value: cipher} -> decrypt(cipher, key, nil)
+        %Setting{value: json} -> decode(json, key, nil)
+      end
 
-  # The settings row wins and environment variables are the fallback. Environment
-  # names are the uppercase form of the setting key (`OPENAI_API_KEY`,
-  # `DEEPL_API_KEY`, `GOOGLE_CLOUD_API_KEY`). An explicitly empty stored key stays
-  # empty rather than falling through, so it still disables the capability.
-  defp credential?(user_id, key) do
-    case impl().get(user_id, key, @missing) do
-      @missing -> present?(System.get_env(String.upcase(key)))
-      value -> present?(value)
-    end
+    if is_binary(value) and value != "", do: value
   end
 
-  defp present?(value), do: is_binary(value) and value != ""
+  defp credential?(user_id, key), do: impl().credential(user_id, key) != nil
 
   # ── storage ─────────────────────────────────────────────────────────────────
 

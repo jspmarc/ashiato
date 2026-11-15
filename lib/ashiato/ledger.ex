@@ -47,10 +47,6 @@ defmodule Ashiato.Ledger do
   # `introduce_words/3` lets a caller override it.
   @min_encounters 2
 
-  # Chrome-like in a source means appearing on more than this fraction of its
-  # pages — strictly more, so exactly half does not clear it.
-  @chrome_threshold 0.5
-
   # Forward edges of the ingest pipeline; `:failed` is reachable from any non-terminal state.
   @forward %{
     uploaded: [:detecting],
@@ -64,45 +60,47 @@ defmodule Ashiato.Ledger do
   @doc """
   Finds the lexeme matching `(lemma, reading, part_of_speech)` or creates it.
 
-  Safe under races. The common path is fetch-first; if the row does not exist
-  we insert, and if we lose the race against a concurrent caller the declared
-  `lexemes_lemma_reading_part_of_speech_index` unique constraint surfaces as
-  `{:error, changeset}`, after which we fetch the row the winner just wrote.
-  Returns `{:ok, %Lexeme{}}` whether we created it or not.
+  Safe under races: the insert is an upsert (`on_conflict: :nothing` over the
+  `lexemes_lemma_reading_part_of_speech_index` unique index), so a lost race is
+  a no-op that returns a struct without `id`, and the row the winner just wrote
+  is fetched. No constraint violation is raised, so the refetch never runs
+  inside an aborted transaction. Should that refetch find no row, the original
+  changeset is surfaced as-is; validation failures return `{:error, changeset}`
+  without ever reaching the database. Returns `{:ok, %Lexeme{}}` whether we
+  created it or not.
 
-  `reading` is normalised `nil` → `""` to match the database default, so the
-  `lexemes_lemma_reading_part_of_speech_index` unique index actually bites
-  (multiple NULLs would pass).
+  `reading` and `part_of_speech` are normalised `nil` → `""` to match the
+  database defaults, so the unique index actually bites (multiple NULLs would
+  pass). Both ride on the struct, not through the changeset: cast/3 would turn
+  "" into nil (see Lexeme.changeset/2).
   """
   @spec find_or_create_lexeme(String.t(), String.t() | nil, String.t() | nil) ::
           {:ok, Lexeme.t()} | {:error, Ecto.Changeset.t()}
   def find_or_create_lexeme(lemma, reading, part_of_speech) do
     reading = reading || ""
+    part_of_speech = part_of_speech || ""
     identity = [lemma: lemma, reading: reading, part_of_speech: part_of_speech]
 
-    case Repo.get_by(Lexeme, identity) do
-      %Lexeme{} = existing ->
-        {:ok, existing}
+    changeset =
+      %Lexeme{reading: reading, part_of_speech: part_of_speech}
+      |> Lexeme.changeset(%{lemma: lemma})
 
-      nil ->
-        # reading goes on the struct, not through the changeset: cast/3 would
-        # turn "" into nil (see Lexeme.changeset/2).
-        %Lexeme{reading: reading}
-        |> Lexeme.changeset(%{lemma: lemma, part_of_speech: part_of_speech})
-        |> Repo.insert()
-        |> case do
-          {:ok, lexeme} ->
-            {:ok, lexeme}
-
-          {:error, changeset} ->
-            # A uniqueness race: the winner's row must be there now. Should the
-            # failure have been a validation error instead, the refetch finds
-            # nothing and we surface the original changeset as-is.
-            case Repo.get_by(Lexeme, identity) do
-              %Lexeme{} = existing -> {:ok, existing}
-              nil -> {:error, changeset}
-            end
+    case Repo.insert(changeset,
+           on_conflict: :nothing,
+           conflict_target: [:lemma, :reading, :part_of_speech]
+         ) do
+      {:ok, %Lexeme{id: nil}} ->
+        # lost the upsert race: the winner's row must be there now
+        case Repo.get_by(Lexeme, identity) do
+          %Lexeme{} = existing -> {:ok, existing}
+          nil -> {:error, changeset}
         end
+
+      {:ok, lexeme} ->
+        {:ok, lexeme}
+
+      {:error, changeset} ->
+        {:error, changeset}
     end
   end
 
@@ -157,7 +155,9 @@ defmodule Ashiato.Ledger do
 
   Everything happens in one `Repo` transaction:
 
-    1. the `Word` row is fetched for `user_id` (error if missing)
+    1. the `Word` row is fetched for `user_id` (error if missing) — with
+       `FOR UPDATE` on PostgreSQL, so concurrent reviews serialise and the
+       second schedule is computed from the first
     2. the current `WordState` is fetched; an absent row just means *new*
        (state :new) — the state is rebuildable from the log, per §6.8
     3. the review is appended to `review_events` (append-only; the log is the
@@ -182,10 +182,6 @@ defmodule Ashiato.Ledger do
         {:error, changeset} -> Repo.rollback(changeset)
       end
     end)
-    |> case do
-      {:ok, word_state} -> {:ok, word_state}
-      {:error, changeset} -> {:error, changeset}
-    end
   end
 
   def review(_word_id, _grade, _now) do
@@ -198,16 +194,31 @@ defmodule Ashiato.Ledger do
   @spec do_review(integer(), Srs.grade(), DateTime.t()) ::
           {:ok, WordState.t()} | {:error, Ecto.Changeset.t()}
   defp do_review(word_id, grade, now) do
-    case Repo.get(Word, word_id) do
+    case locked_word(word_id) do
       nil ->
-        {:error, missing_word_changeset(word_id)}
+        {:error,
+         %WordState{word_id: word_id}
+         |> Ecto.Changeset.change()
+         |> Ecto.Changeset.add_error(:word_id, "does not exist")}
 
       word ->
         # a missing row means "new"
         word_state =
           case Repo.get(WordState, word_id) do
-            %WordState{} = existing -> existing
-            nil -> new_word_state(word_id, now)
+            %WordState{} = existing ->
+              existing
+
+            nil ->
+              %WordState{
+                word_id: word_id,
+                state: :new,
+                stability: nil,
+                difficulty: nil,
+                reps: 0,
+                lapses: 0,
+                failure_streak: 0,
+                due_at: now
+              }
           end
 
         %{state: next, interval_days: interval} = Srs.grade(word_state, grade, now)
@@ -232,6 +243,16 @@ defmodule Ashiato.Ledger do
                upsert_word_state(word_id, next, due_at, second, failure_streak) do
           {:ok, word_state}
         end
+    end
+  end
+
+  @spec locked_word(integer()) :: Word.t() | nil
+  defp locked_word(word_id) do
+    if Application.fetch_env!(:ashiato, :ecto_adapter) == Ecto.Adapters.Postgres do
+      from(w in Word, where: w.id == ^word_id, lock: "FOR UPDATE")
+      |> Repo.one()
+    else
+      Repo.get(Word, word_id)
     end
   end
 
@@ -284,27 +305,6 @@ defmodule Ashiato.Ledger do
     %WordState{word_id: word_id}
     |> WordState.changeset(attrs)
     |> Repo.insert(on_conflict: [set: Map.to_list(attrs)], conflict_target: :word_id)
-  end
-
-  @spec new_word_state(integer(), DateTime.t()) :: WordState.t()
-  defp new_word_state(word_id, now) do
-    %WordState{
-      word_id: word_id,
-      state: :new,
-      stability: nil,
-      difficulty: nil,
-      reps: 0,
-      lapses: 0,
-      failure_streak: 0,
-      due_at: now
-    }
-  end
-
-  @spec missing_word_changeset(integer()) :: Ecto.Changeset.t()
-  defp missing_word_changeset(word_id) do
-    %WordState{word_id: word_id}
-    |> Ecto.Changeset.change()
-    |> Ecto.Changeset.add_error(:word_id, "does not exist")
   end
 
   @doc """
@@ -521,12 +521,38 @@ defmodule Ashiato.Ledger do
         Enum.map(Utils.cjk_codepoints(sighting.lemma), &{&1, sighting})
       end)
       |> Enum.reduce(%{}, fn {glyph, sighting}, acc ->
-        Map.update(acc, glyph, new_stats(sighting), &add_sighting(&1, sighting))
+        Map.update(
+          acc,
+          glyph,
+          %{
+            pages: MapSet.new([sighting.page_id]),
+            days: MapSet.new([sighting.seen_on]),
+            word_ids: MapSet.new(),
+            mature?: false
+          },
+          fn stats ->
+            %{
+              stats
+              | pages: MapSet.put(stats.pages, sighting.page_id),
+                days: MapSet.put(stats.days, sighting.seen_on)
+            }
+          end
+        )
       end)
 
     stats
     |> fold_word_facts(word_facts)
-    |> Enum.map(&glyph_entry/1)
+    |> Enum.map(fn {glyph, stats} ->
+      %{
+        glyph: glyph,
+        occurrences: MapSet.size(stats.pages),
+        days_seen: MapSet.size(stats.days),
+        first_seen: Enum.min(stats.days, Date),
+        last_seen: Enum.max(stats.days, Date),
+        distinct_words: MapSet.size(stats.word_ids),
+        has_mature_word: stats.mature?
+      }
+    end)
     |> Enum.sort_by(&{-&1.occurrences, &1.glyph})
   end
 
@@ -539,45 +565,14 @@ defmodule Ashiato.Ledger do
       Enum.map(Utils.cjk_codepoints(fact.lemma), &{&1, fact})
     end)
     |> Enum.reduce(stats, fn {glyph, fact}, acc ->
-      Map.update!(acc, glyph, &add_word_fact(&1, fact))
+      Map.update!(acc, glyph, fn stats ->
+        %{
+          stats
+          | word_ids: MapSet.put(stats.word_ids, fact.lexeme_id),
+            mature?: stats.mature? or fact.has_mature_word != nil
+        }
+      end)
     end)
-  end
-
-  defp new_stats(sighting) do
-    %{
-      pages: MapSet.new([sighting.page_id]),
-      days: MapSet.new([sighting.seen_on]),
-      word_ids: MapSet.new(),
-      mature?: false
-    }
-  end
-
-  defp add_sighting(stats, sighting) do
-    %{
-      stats
-      | pages: MapSet.put(stats.pages, sighting.page_id),
-        days: MapSet.put(stats.days, sighting.seen_on)
-    }
-  end
-
-  defp add_word_fact(stats, fact) do
-    %{
-      stats
-      | word_ids: MapSet.put(stats.word_ids, fact.lexeme_id),
-        mature?: stats.mature? or fact.has_mature_word != nil
-    }
-  end
-
-  defp glyph_entry({glyph, stats}) do
-    %{
-      glyph: glyph,
-      occurrences: MapSet.size(stats.pages),
-      days_seen: MapSet.size(stats.days),
-      first_seen: Enum.min(stats.days, Date),
-      last_seen: Enum.max(stats.days, Date),
-      distinct_words: MapSet.size(stats.word_ids),
-      has_mature_word: stats.mature?
-    }
   end
 
   @doc """
@@ -602,10 +597,13 @@ defmodule Ashiato.Ledger do
       due_at = Utils.utc_now()
       words = resolve_words(user_id, lexeme_ids, force?)
 
-      words
-      |> qualify(user_id, min_encounters, force?)
-      |> Enum.map(&introduce_word(&1, due_at))
-      |> in_lexeme_order(lexeme_ids)
+      introduced =
+        words
+        |> qualify(user_id, min_encounters, force?)
+        |> Enum.map(&introduce_word(&1, due_at))
+
+      by_lexeme = Map.new(introduced, &{&1.lexeme_id, &1})
+      for(lexeme_id <- lexeme_ids, word = Map.get(by_lexeme, lexeme_id), do: word)
     end)
   end
 
@@ -657,9 +655,12 @@ defmodule Ashiato.Ledger do
           {:ok, Page.t()} | {:error, :superseded}
   def accept_text(%Page{} = page, text) do
     query = from(p in Page, where: p.id == ^page.id and p.revision == ^page.revision)
+    now = DateTime.utc_now() |> DateTime.truncate(:second)
 
     {count, _} =
-      Repo.update_all(query, set: [accepted_text: text, revision: page.revision + 1])
+      Repo.update_all(query,
+        set: [accepted_text: text, revision: page.revision + 1, updated_at: now]
+      )
 
     case count do
       0 -> {:error, :superseded}
@@ -669,8 +670,8 @@ defmodule Ashiato.Ledger do
 
   @doc """
   Writes a job's final status, but only while the page still carries the
-  `revision` the job started from. A stale write matches no rows and returns
-  `{:error, :superseded}`; a move the pipeline forbids returns
+  `revision` and `status` the job started from. A stale write matches no rows
+  and returns `{:error, :superseded}`; a move the pipeline forbids returns
   `{:error, :invalid_transition}`.
   """
   @spec finish_page(Page.t(), atom()) ::
@@ -679,10 +680,17 @@ defmodule Ashiato.Ledger do
     unless valid_transition?(page.status, status) do
       {:error, :invalid_transition}
     else
-      query = from(p in Page, where: p.id == ^page.id and p.revision == ^page.revision)
+      query =
+        from(p in Page,
+          where:
+            p.id == ^page.id and p.revision == ^page.revision and
+              p.status == ^page.status
+        )
+
+      now = DateTime.utc_now() |> DateTime.truncate(:second)
 
       {count, _} =
-        Repo.update_all(query, set: [status: status])
+        Repo.update_all(query, set: [status: status, updated_at: now])
 
       case count do
         0 -> {:error, :superseded}
@@ -693,16 +701,32 @@ defmodule Ashiato.Ledger do
 
   @doc """
   Moves a page to the next status in the ingest pipeline, or to `:failed` from
-  any non-terminal state. Anything else returns `{:error, :invalid_transition}`.
+  any non-terminal state. A move the pipeline forbids returns
+  `{:error, :invalid_transition}`; a page whose row no longer carries the
+  `revision` and `status` the struct was read with returns
+  `{:error, :superseded}`.
   """
-  @spec transition(Page.t(), atom()) :: {:ok, Page.t()} | {:error, :invalid_transition}
+  @spec transition(Page.t(), atom()) ::
+          {:ok, Page.t()} | {:error, :invalid_transition | :superseded}
   def transition(%Page{} = page, status) do
     unless valid_transition?(page.status, status) do
       {:error, :invalid_transition}
     else
-      page
-      |> Page.changeset(%{status: status})
-      |> Repo.update()
+      query =
+        from(p in Page,
+          where:
+            p.id == ^page.id and p.revision == ^page.revision and
+              p.status == ^page.status
+        )
+
+      now = DateTime.utc_now() |> DateTime.truncate(:second)
+
+      {count, _} = Repo.update_all(query, set: [status: status, updated_at: now])
+
+      case count do
+        0 -> {:error, :superseded}
+        1 -> {:ok, Repo.get!(Page, page.id)}
+      end
     end
   end
 
@@ -757,7 +781,39 @@ defmodule Ashiato.Ledger do
   """
   @spec update_chrome_like(integer()) :: {:ok, [Word.t()]}
   def update_chrome_like(user_id) do
-    chrome_ids = chrome_word_ids(user_id)
+    # Two aggregate passes for all sources at once: page counts per source, and
+    # distinct encounter-page counts per {source, word}. `2 * occurrences > pages`
+    # is the ratio threshold in integer arithmetic, so no float division is
+    # needed and the query count never grows with the number of sources. Only
+    # sources with encounters appear in the counts, so every word is judged on
+    # all of its sources; a word with no qualifying encounters is never listed.
+    pages_by_source =
+      from(p in Page,
+        where: p.user_id == ^user_id,
+        select: {p.source_id, count(p.id)},
+        group_by: p.source_id
+      )
+      |> Repo.all()
+      |> Map.new()
+
+    chrome_ids =
+      from(e in Encounter,
+        where: e.user_id == ^user_id,
+        where: is_nil(e.discarded_at) and e.confirmed,
+        select: {e.source_id, e.word_id, count(e.page_id, :distinct)},
+        group_by: [e.source_id, e.word_id]
+      )
+      |> Repo.all()
+      |> Enum.group_by(
+        fn {_source_id, word_id, _occurrences} -> word_id end,
+        fn {source_id, _word_id, occurrences} ->
+          # an encounter always points at a page, so a missing count can only be 0
+          pages = Map.get(pages_by_source, source_id, 0)
+          pages > 0 and 2 * occurrences > pages
+        end
+      )
+      |> Enum.filter(fn {_word_id, passes} -> Enum.all?(passes) end)
+      |> Enum.map(fn {word_id, _passes} -> word_id end)
 
     Repo.transaction(fn ->
       flagged_at = Utils.utc_now()
@@ -795,28 +851,23 @@ defmodule Ashiato.Ledger do
     end
   end
 
-  # Fetch-first, so a lost insert race ends with the winner's row rather than a
-  # raise. `Word` has no changeset (both fields are set on the struct), so one
-  # is built here.
+  # The insert is an upsert (`on_conflict: :nothing` over the `(user_id,
+  # lexeme_id)` unique index): a lost race is a no-op that returns a struct
+  # without `id`, and the winner's row is refetched. No constraint violation
+  # occurs, so the refetch never runs inside an aborted PostgreSQL transaction.
+  # `Word` has no changeset (both fields are set on the struct).
   @spec find_or_create_word(integer(), integer()) :: {:ok, Word.t()}
   defp find_or_create_word(user_id, lexeme_id) do
-    case Repo.get_by(Word, user_id: user_id, lexeme_id: lexeme_id) do
-      %Word{} = word ->
+    case Repo.insert(%Word{user_id: user_id, lexeme_id: lexeme_id},
+           on_conflict: :nothing,
+           conflict_target: [:user_id, :lexeme_id]
+         ) do
+      {:ok, %Word{id: nil}} ->
+        # lost the race: the concurrent caller's row is there now
+        {:ok, Repo.get_by!(Word, user_id: user_id, lexeme_id: lexeme_id)}
+
+      {:ok, word} ->
         {:ok, word}
-
-      nil ->
-        %Word{user_id: user_id, lexeme_id: lexeme_id}
-        |> Ecto.Changeset.change()
-        |> Ecto.Changeset.unique_constraint([:user_id, :lexeme_id])
-        |> Repo.insert()
-        |> case do
-          {:ok, word} ->
-            {:ok, word}
-
-          # lost the race: the concurrent caller's row is there now
-          {:error, _changeset} ->
-            {:ok, Repo.get_by!(Word, user_id: user_id, lexeme_id: lexeme_id)}
-        end
     end
   end
 
@@ -864,33 +915,7 @@ defmodule Ashiato.Ledger do
     end
   end
 
-  @spec in_lexeme_order([Word.t()], [integer()]) :: [Word.t()]
-  defp in_lexeme_order(introduced, lexeme_ids) do
-    by_lexeme = Map.new(introduced, &{&1.lexeme_id, &1})
-    for(lexeme_id <- lexeme_ids, word = Map.get(by_lexeme, lexeme_id), do: word)
-  end
-
   # ── chrome_like ─────────────────────────────────────────────────────────────
-
-  # One chrome_ratio/2 pass per source, then one ratio list per word. The lists
-  # are never empty, so `all?/1` here is never vacuously true.
-  @spec chrome_word_ids(integer()) :: [integer()]
-  defp chrome_word_ids(user_id) do
-    ratios_by_word =
-      user_id
-      |> source_ids()
-      |> Enum.flat_map(&chrome_ratio(user_id, &1))
-      |> Enum.group_by(fn {word_id, _ratio} -> word_id end, fn {_word_id, ratio} -> ratio end)
-
-    for {word_id, ratios} <- ratios_by_word, Enum.all?(ratios, &(&1 > @chrome_threshold)) do
-      word_id
-    end
-  end
-
-  @spec source_ids(integer()) :: [integer()]
-  defp source_ids(user_id) do
-    Repo.all(from(s in Source, where: s.user_id == ^user_id, select: s.id))
-  end
 
   @spec flag_chrome(integer(), [integer()], DateTime.t()) :: {non_neg_integer(), nil}
   defp flag_chrome(user_id, chrome_ids, flagged_at) do

@@ -21,29 +21,26 @@ defmodule Ashiato.Translator.Deepl do
     key = Keyword.get(opts, :api_key)
 
     if Translator.configured?(key) do
-      request(lines, opts, key)
+      with {:ok, {source, target}} <- Translator.langs(opts) do
+        body = %{text: lines, target_lang: String.upcase(target)}
+
+        body =
+          case source do
+            "auto" -> body
+            _source -> Map.put(body, :source_lang, String.upcase(source))
+          end
+
+        Translator.http_post(
+          base_url(key) <> "/v2/translate",
+          headers: [{"authorization", "DeepL-Auth-Key " <> key}],
+          json: body,
+          decode: &decode/1
+        )
+      end
     else
       {:error, :not_configured}
     end
   end
-
-  defp request(lines, opts, key) do
-    with {:ok, {source, target}} <- Translator.langs(opts) do
-      body =
-        %{text: lines, target_lang: String.upcase(target)}
-        |> put_source(source)
-
-      Translator.http_post(
-        base_url(key) <> "/v2/translate",
-        headers: [{"authorization", "DeepL-Auth-Key " <> key}],
-        json: body,
-        decode: &decode/1
-      )
-    end
-  end
-
-  defp put_source(body, "auto"), do: body
-  defp put_source(body, source), do: Map.put(body, :source_lang, String.upcase(source))
 
   # Free-tier keys end with ":fx"; matching the prefix would send every free key to the
   # paid host and get it rejected.

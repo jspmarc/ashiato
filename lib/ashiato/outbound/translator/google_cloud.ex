@@ -18,29 +18,26 @@ defmodule Ashiato.Translator.GoogleCloud do
     key = Keyword.get(opts, :api_key)
 
     if Translator.configured?(key) do
-      request(lines, opts, key)
+      with {:ok, {source, target}} <- Translator.langs(opts) do
+        body = %{q: lines, target: target, format: "text"}
+
+        body =
+          case source do
+            "auto" -> body
+            _source -> Map.put(body, :source, source)
+          end
+
+        Translator.http_post(
+          @url,
+          params: [key: key],
+          json: body,
+          decode: &decode/1
+        )
+      end
     else
       {:error, :not_configured}
     end
   end
-
-  defp request(lines, opts, key) do
-    with {:ok, {source, target}} <- Translator.langs(opts) do
-      body =
-        %{q: lines, target: target, format: "text"}
-        |> put_source(source)
-
-      Translator.http_post(
-        @url,
-        params: [key: key],
-        json: body,
-        decode: &decode/1
-      )
-    end
-  end
-
-  defp put_source(body, "auto"), do: body
-  defp put_source(body, source), do: Map.put(body, :source, source)
 
   defp decode(%{"data" => %{"translations" => translations}}) when is_list(translations) do
     if Enum.all?(translations, &match?(%{"translatedText" => text} when is_binary(text), &1)) do

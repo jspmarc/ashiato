@@ -6,6 +6,11 @@ defmodule Ashiato.Settings.Fake do
   property of the repo-backed store; what callers observe here is that `all/1` redacts a
   secret and `get/3` returns it.
 
+  It mirrors the repo-backed semantics: omitting `:secret` preserves the existing
+  row's classification (`secret: false` declassifies, `secret: true` encrypts), and
+  `credential/2` applies the same stored-row-then-environment precedence, where an
+  explicitly empty stored value blocks the environment fallback.
+
   It lives in `test/support` rather than inside a test file so that any test — including a
   single-file run of another test — can start it.
   """
@@ -37,20 +42,40 @@ defmodule Ashiato.Settings.Fake do
   @doc """
   Stores a decoded value and returns a `Ashiato.Schemas.Setting` shaped like the real
   store's reply, so a caller asserting on the returned row sees the value it wrote.
+  Omitting `:secret` preserves the existing row's classification, like the real store.
   """
   @spec put(integer(), String.t(), term(), keyword()) ::
           {:ok, Setting.t()} | {:error, :not_encodable}
   def put(user_id, key, value, opts) do
-    secret? = Keyword.get(opts, :secret, false)
-
     case Jason.encode(value) do
       {:ok, json} ->
         decoded = Jason.decode!(json)
-        Agent.update(__MODULE__, &Map.put(&1, {user_id, key}, {decoded, secret?}))
+
+        # classification read and write in one atomic call, like the
+        # repo-backed store's transaction, so a concurrent re-put cannot
+        # declassify an uncommitted secret
+        secret? =
+          Agent.get_and_update(__MODULE__, fn store ->
+            secret? =
+              case Keyword.fetch(opts, :secret) do
+                {:ok, explicit} -> explicit
+                :error -> stored_secret?(store, user_id, key)
+              end
+
+            {secret?, Map.put(store, {user_id, key}, {decoded, secret?})}
+          end)
+
         {:ok, %Setting{user_id: user_id, key: key, value: json, secret: secret?}}
 
       {:error, _reason} ->
         {:error, :not_encodable}
+    end
+  end
+
+  defp stored_secret?(store, user_id, key) do
+    case Map.fetch(store, {user_id, key}) do
+      {:ok, {_value, secret?}} -> secret?
+      :error -> false
     end
   end
 
@@ -64,5 +89,25 @@ defmodule Ashiato.Settings.Fake do
         if secret?, do: {key, :redacted}, else: {key, value}
       end
     end)
+  end
+
+  @impl true
+  @doc """
+  The credential for `key` with the same precedence as the repo-backed store:
+  a stored row wins — an explicitly empty one blocks the fallback — and the
+  environment variable named by the uppercase key is the fallback. A resolved
+  value that is empty or not a binary is `nil`.
+  """
+  @spec credential(integer(), String.t()) :: String.t() | nil
+  def credential(user_id, key) do
+    value =
+      Agent.get(__MODULE__, fn store ->
+        case Map.fetch(store, {user_id, key}) do
+          {:ok, {value, _secret?}} -> value
+          :error -> System.get_env(String.upcase(key))
+        end
+      end)
+
+    if is_binary(value) and value != "", do: value
   end
 end

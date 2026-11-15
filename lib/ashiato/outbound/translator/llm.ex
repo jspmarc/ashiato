@@ -5,7 +5,7 @@ defmodule Ashiato.Translator.Llm do
   The page is requested as a JSON object with a `translations` array, enforced by
   a strict JSON schema. When the reply does not match that shape, the shared
   per-line fallback takes over. The endpoint comes from `OPENAI_BASE_URL`
-  (default `https://api.openai.com/v1`) and the key from `OPENAI_API_KEY`.
+  (default `https://api.openai.com/v1`) and the key from the `:api_key` option.
   """
   use Ashiato.Translator
 
@@ -24,12 +24,12 @@ defmodule Ashiato.Translator.Llm do
   @doc """
   Options: `:model` — the model to request, default `"gpt-4o-mini"`.
 
-  A missing or empty `OPENAI_API_KEY` returns `{:error, :not_configured}`; the key
-  is only ever placed in the authorization header, never logged.
+  A missing or empty `:api_key` option returns `{:error, :not_configured}`; the
+  key is only ever placed in the authorization header, never logged.
   """
   @spec page_request([String.t()], keyword()) :: {:ok, [String.t()]} | {:error, term()}
   def page_request(lines, opts) do
-    key = System.get_env("OPENAI_API_KEY")
+    key = Keyword.get(opts, :api_key)
     base_url = System.get_env("OPENAI_BASE_URL") || @default_base_url
 
     if Translator.configured?(key) do
@@ -137,18 +137,14 @@ defmodule Ashiato.Translator.Llm do
     case Jason.decode(text) do
       {:ok, %{"translations" => lines} = decoded}
       when map_size(decoded) == 1 and is_list(lines) ->
-        valid_lines(lines)
+        if Enum.all?(lines, &is_binary/1) do
+          {:ok, Enum.map(lines, &String.trim/1)}
+        else
+          {:error, :unparsable}
+        end
 
       _other ->
         {:error, :unparsable}
-    end
-  end
-
-  defp valid_lines(lines) do
-    if Enum.all?(lines, &is_binary/1) do
-      {:ok, Enum.map(lines, &String.trim/1)}
-    else
-      {:error, :unparsable}
     end
   end
 end

@@ -26,6 +26,7 @@ defmodule Ashiato.LedgerTest do
   use Ashiato.DataCase, async: false
 
   import Ashiato.Fixtures
+  import Ecto.Query, only: [from: 2]
 
   alias Ashiato.{Ledger, Repo, Srs}
   alias Ashiato.Schemas.{Encounter, Lexeme, Page, ReviewEvent, WordState}
@@ -56,6 +57,28 @@ defmodule Ashiato.LedgerTest do
       assert first.id == second.id
       assert first.reading == ""
       assert Repo.aggregate(Lexeme, :count) == 1
+    end
+
+    test "a nil part of speech is stored as an empty string and lookups do not raise" do
+      assert {:ok, first} = Ledger.find_or_create_lexeme("ねこ", "ねこ", nil)
+      assert first.part_of_speech == ""
+
+      # NULL is distinct in a unique index, so nil would insert a new row every call.
+      assert {:ok, second} = Ledger.find_or_create_lexeme("ねこ", "ねこ", nil)
+      assert second.id == first.id
+      assert Repo.aggregate(Lexeme, :count) == 1
+
+      user = user_fixture()
+      word_fixture(user_id: user.id, lexeme_id: first.id)
+      source = source_fixture(user_id: user.id)
+
+      assert Ledger.chrome_ratio(user.id, source.id) == %{}
+      assert Ledger.kanji_met_words(user.id, "ね") == []
+    end
+
+    test "an empty lemma returns the changeset" do
+      assert {:error, changeset} = Ledger.find_or_create_lexeme("", "ねこ", "noun")
+      assert %{lemma: ["can't be blank"]} = errors_on(changeset)
     end
 
     test "concurrent callers end up with one row" do
@@ -930,6 +953,35 @@ defmodule Ashiato.LedgerTest do
       refute Repo.reload!(real).chrome_like
     end
 
+    test "a word on a source with no pages and a word with no encounters stay unflagged",
+         %{user: user} do
+      %{word: word} = chrome_word(user)
+      source_fixture(user_id: user.id)
+      untouched = word_fixture(user_id: user.id)
+
+      assert {:ok, [flagged]} = Ledger.update_chrome_like(user.id)
+      assert flagged.id == word.id
+      assert Repo.reload!(word).chrome_like
+      refute Repo.reload!(untouched).chrome_like
+    end
+
+    test "the query count does not grow with the number of sources", %{user: user} do
+      %{word: _} = chrome_word(user)
+      {_, one_source} = counted_chrome_run(user)
+
+      for _ <- 1..2 do
+        source = source_fixture(user_id: user.id)
+        word = word_fixture(user_id: user.id)
+        pages = for _ <- 1..2, do: page_fixture(user_id: user.id, source_id: source.id)
+        Enum.each(pages, &record(user, source, word, &1, true))
+      end
+
+      {_, three_sources} = counted_chrome_run(user)
+
+      assert one_source > 0
+      assert one_source == three_sources
+    end
+
     test "when the flag lands, an existing card is suspended with reason chrome",
          %{user: user} do
       %{lexeme: lexeme, word: word} = chrome_word(user)
@@ -994,6 +1046,25 @@ defmodule Ashiato.LedgerTest do
         assert reloaded.suspended and reloaded.suspended_reason == reason
       end
     end
+  end
+
+  # Runs update_chrome_like/1 with a `[:ashiato, :repo, :query]` counter
+  # attached; returns {result, query count}.
+  defp counted_chrome_run(user) do
+    handler_id = "ledger-test-query-count"
+    counter = :counters.new(1, [:atomics])
+
+    handler = fn _event, _measurements, _metadata, counter ->
+      :counters.add(counter, 1, 1)
+    end
+
+    :ok = :telemetry.attach(handler_id, [:ashiato, :repo, :query], handler, counter)
+    on_exit(fn -> :telemetry.detach(handler_id) end)
+
+    result = Ledger.update_chrome_like(user.id)
+    :ok = :telemetry.detach(handler_id)
+
+    {result, :counters.get(counter, 1)}
   end
 
   # A word met on `n` distinct confirmed pages of one source.
@@ -1130,6 +1201,27 @@ defmodule Ashiato.LedgerTest do
       assert {:error, :superseded} = Ledger.finish_page(page, :detecting)
     end
 
+    test "a stale status finish_page write is discarded as :superseded and writes nothing",
+         %{user: user, source: source} do
+      page = make_page(user, source)
+
+      # status moved in the DB without a revision bump
+      Repo.update_all(from(p in Page, where: p.id == ^page.id), set: [status: :detecting])
+
+      assert {:error, :superseded} = Ledger.finish_page(page, :detecting)
+      assert %{status: :detecting, revision: 1} = Repo.get!(Page, page.id)
+    end
+
+    test "transition/2 with a stale struct returns :superseded", %{user: user, source: source} do
+      page = make_page(user, source)
+
+      # status moved in the DB without a revision bump
+      Repo.update_all(from(p in Page, where: p.id == ^page.id), set: [status: :detecting])
+
+      assert {:error, :superseded} = Ledger.transition(page, :detecting)
+      assert %{status: :detecting, revision: 1} = Repo.get!(Page, page.id)
+    end
+
     test "backward transitions are rejected", %{user: user, source: source} do
       page = make_page(user, source)
       assert {:ok, page} = Ledger.transition(page, :detecting)
@@ -1151,6 +1243,24 @@ defmodule Ashiato.LedgerTest do
         assert {:ok, page} = Ledger.transition(page, :failed)
         assert page.status == :failed
       end
+    end
+
+    test "transition/2 and finish_page/2 bump updated_at even with stale old value",
+         %{user: user, source: source} do
+      old_time = ~U[2020-01-01 00:00:00Z]
+
+      page = make_page(user, source)
+      :ok = reset_updated_at(page.id, old_time)
+
+      assert {:ok, moved} = Ledger.transition(page, :detecting)
+      refute moved.updated_at == old_time
+      assert DateTime.diff(DateTime.utc_now(), moved.updated_at, :second) < 2
+
+      :ok = reset_updated_at(moved.id, old_time)
+
+      assert {:ok, finished} = Ledger.finish_page(moved, :text_ready)
+      refute finished.updated_at == old_time
+      assert DateTime.diff(DateTime.utc_now(), finished.updated_at, :second) < 2
     end
   end
 
@@ -1215,5 +1325,14 @@ defmodule Ashiato.LedgerTest do
     encounter
     |> Ecto.Changeset.change(discarded_at: DateTime.truncate(DateTime.utc_now(), :second))
     |> Repo.update!()
+  end
+
+  defp reset_updated_at(page_id, datetime) do
+    Repo.update_all(
+      from(p in Page, where: p.id == ^page_id),
+      set: [updated_at: datetime]
+    )
+
+    :ok
   end
 end

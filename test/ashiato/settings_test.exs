@@ -36,22 +36,42 @@ defmodule Ashiato.SettingsTest do
     end
 
     test "encrypts a secret at rest and decrypts on read", %{user: user} do
-      assert {:ok, row} = Settings.put(user.id, "OPENAI_API_KEY", "sk-live-1234", secret: true)
+      assert {:ok, row} = Settings.put(user.id, "openai_api_key", "sk-live-1234", secret: true)
 
       assert row.secret
       refute row.value =~ "sk-live-1234"
-      assert Settings.get(user.id, "OPENAI_API_KEY") == "sk-live-1234"
+      assert Settings.get(user.id, "openai_api_key") == "sk-live-1234"
+    end
+
+    test "re-putting an existing secret without secret: true stays encrypted", %{user: user} do
+      assert {:ok, _} = Settings.put(user.id, "openai_api_key", "sk-1", secret: true)
+      assert {:ok, row} = Settings.put(user.id, "openai_api_key", "sk-2")
+
+      assert row.secret
+      refute row.value =~ "sk-2"
+      assert Settings.get(user.id, "openai_api_key") == "sk-2"
+      assert Settings.all(user.id)["openai_api_key"] == :redacted
+    end
+
+    test "explicit secret: false declassifies an existing secret", %{user: user} do
+      assert {:ok, _} = Settings.put(user.id, "openai_api_key", "sk-1", secret: true)
+      assert {:ok, row} = Settings.put(user.id, "openai_api_key", "sk-2", secret: false)
+
+      refute row.secret
+      assert row.value == "\"sk-2\""
+      assert Settings.get(user.id, "openai_api_key") == "sk-2"
+      assert Settings.all(user.id)["openai_api_key"] == "sk-2"
     end
 
     test "upserts on (user_id, key) so a second put replaces instead of raising", %{user: user} do
-      assert {:ok, _} = Settings.put(user.id, "OPENAI_API_KEY", "sk-1")
-      assert {:ok, _} = Settings.put(user.id, "OPENAI_API_KEY", "sk-2", secret: true)
+      assert {:ok, _} = Settings.put(user.id, "openai_api_key", "sk-1")
+      assert {:ok, _} = Settings.put(user.id, "openai_api_key", "sk-2", secret: true)
 
-      assert Settings.get(user.id, "OPENAI_API_KEY") == "sk-2"
+      assert Settings.get(user.id, "openai_api_key") == "sk-2"
 
       count = Repo.one(from(s in Setting, where: s.user_id == ^user.id, select: count(s.id)))
       assert count == 1
-      assert Repo.get_by!(Setting, user_id: user.id, key: "OPENAI_API_KEY").secret
+      assert Repo.get_by!(Setting, user_id: user.id, key: "openai_api_key").secret
     end
 
     test "missing rows fall back to the built-in defaults", %{user: user} do
@@ -96,14 +116,14 @@ defmodule Ashiato.SettingsTest do
 
       Application.delete_env(:ashiato, AshiatoWeb.Endpoint)
 
-      assert Settings.put(user.id, "OPENAI_API_KEY", "sk-1", secret: true) ==
+      assert Settings.put(user.id, "openai_api_key", "sk-1", secret: true) ==
                {:error, :secret_key_base_missing}
     end
 
     test "a secret that fails authentication returns the default, logged without the value", %{
       user: user
     } do
-      {:ok, _} = Settings.put(user.id, "OPENAI_API_KEY", "sk-tamper-me", secret: true)
+      {:ok, _} = Settings.put(user.id, "openai_api_key", "sk-tamper-me", secret: true)
 
       log =
         capture_log(fn ->
@@ -111,7 +131,7 @@ defmodule Ashiato.SettingsTest do
             set: [value: "XCP.not-the-ciphertext"]
           )
 
-          assert Settings.get(user.id, "OPENAI_API_KEY", "fallback") == "fallback"
+          assert Settings.get(user.id, "openai_api_key", "fallback") == "fallback"
         end)
 
       assert log =~ "failed authentication"
@@ -134,6 +154,60 @@ defmodule Ashiato.SettingsTest do
     test "a value that cannot be JSON is an error tuple, not a raise", %{user: user} do
       assert Settings.put(user.id, "weird", {:a, :tuple}) == {:error, :not_encodable}
       assert Settings.get(user.id, "weird", :fallback) == :fallback
+    end
+  end
+
+  describe "credential/2" do
+    setup do
+      Application.delete_env(:ashiato, :settings)
+
+      orig = System.get_env("OPENAI_API_KEY")
+
+      on_exit(fn ->
+        case orig do
+          nil -> System.delete_env("OPENAI_API_KEY")
+          value -> System.put_env("OPENAI_API_KEY", value)
+        end
+      end)
+
+      System.delete_env("OPENAI_API_KEY")
+
+      {:ok, user: user_fixture()}
+    end
+
+    test "the stored row wins over the environment", %{user: user} do
+      System.put_env("OPENAI_API_KEY", "sk-from-env")
+      Settings.put(user.id, "openai_api_key", "sk-stored", secret: true)
+
+      assert Settings.credential(user.id, "openai_api_key") == "sk-stored"
+    end
+
+    test "falls back to the environment when no row exists", %{user: user} do
+      System.put_env("OPENAI_API_KEY", "sk-from-env")
+
+      assert Settings.credential(user.id, "openai_api_key") == "sk-from-env"
+    end
+
+    test "an explicitly empty stored value blocks the environment and returns nil", %{
+      user: user
+    } do
+      System.put_env("OPENAI_API_KEY", "sk-from-env")
+
+      Settings.put(user.id, "openai_api_key", "")
+      assert Settings.credential(user.id, "openai_api_key") == nil
+
+      Settings.put(user.id, "openai_api_key", nil)
+      assert Settings.credential(user.id, "openai_api_key") == nil
+    end
+
+    test "an absent row with no environment value is nil", %{user: user} do
+      assert Settings.credential(user.id, "openai_api_key") == nil
+    end
+
+    test "a stored non-binary value is nil", %{user: user} do
+      Settings.put(user.id, "openai_api_key", 123)
+
+      assert Settings.credential(user.id, "openai_api_key") == nil
     end
   end
 
@@ -175,11 +249,11 @@ defmodule Ashiato.SettingsTest do
     test "ai_capable? holds only when the switch is on and a non-empty key exists", %{user: user} do
       impl = Settings.impl()
       impl.put(user.id, "ai_features_enabled", true, [])
-      impl.put(user.id, "OPENAI_API_KEY", "", [])
+      impl.put(user.id, "openai_api_key", "", [])
 
       refute Settings.ai_capable?(user.id)
 
-      impl.put(user.id, "OPENAI_API_KEY", "sk-1", [])
+      impl.put(user.id, "openai_api_key", "sk-1", [])
       assert Settings.ai_capable?(user.id)
 
       impl.put(user.id, "ai_features_enabled", false, [])
@@ -226,6 +300,35 @@ defmodule Ashiato.SettingsTest do
       refute Settings.translate_capable?(user.id)
     end
 
+    test "the fake preserves classification like the real store", %{user: user} do
+      impl = Settings.impl()
+      impl.put(user.id, "openai_api_key", "sk-1", secret: true)
+      {:ok, row} = impl.put(user.id, "openai_api_key", "sk-2", [])
+
+      assert row.secret
+      assert impl.all(user.id)["openai_api_key"] == :redacted
+      assert impl.get(user.id, "openai_api_key", nil) == "sk-2"
+
+      {:ok, row} = impl.put(user.id, "openai_api_key", "sk-3", secret: false)
+      refute row.secret
+      assert impl.all(user.id)["openai_api_key"] == "sk-3"
+    end
+
+    test "the fake credential/2 applies the same precedence as the real store", %{user: user} do
+      impl = Settings.impl()
+
+      assert impl.credential(user.id, "openai_api_key") == nil
+
+      System.put_env("OPENAI_API_KEY", "sk-from-env")
+      assert impl.credential(user.id, "openai_api_key") == "sk-from-env"
+
+      impl.put(user.id, "openai_api_key", "", [])
+      assert impl.credential(user.id, "openai_api_key") == nil
+
+      impl.put(user.id, "openai_api_key", "sk-stored", [])
+      assert impl.credential(user.id, "openai_api_key") == "sk-stored"
+    end
+
     test "translate_capable? covers the google_cloud and llm branches", %{user: user} do
       impl = Settings.impl()
       impl.put(user.id, "translation_enabled", true, [])
@@ -236,9 +339,9 @@ defmodule Ashiato.SettingsTest do
       assert Settings.translate_capable?(user.id)
 
       impl.put(user.id, "translation_provider", "llm", [])
-      impl.put(user.id, "OPENAI_API_KEY", "", [])
+      impl.put(user.id, "openai_api_key", "", [])
       refute Settings.translate_capable?(user.id)
-      impl.put(user.id, "OPENAI_API_KEY", "sk-1", [])
+      impl.put(user.id, "openai_api_key", "sk-1", [])
       assert Settings.translate_capable?(user.id)
     end
   end

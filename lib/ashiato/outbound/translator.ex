@@ -14,8 +14,8 @@ defmodule Ashiato.Translator do
       `"auto"`, which every provider either supports natively or omits.
     * `:target_lang` — ISO code of the target language, e.g. `"en"`. Required;
       without it providers return `{:error, :missing_target_lang}`.
-    * `:api_key` — credential for `deepl` and `google_cloud`. Passed in by the
-      settings context; never logged.
+    * `:api_key` — credential for `llm`, `deepl`, and `google_cloud`. Passed in by
+      the settings context; never logged.
     * `:model` — model name for `llm`; see `Ashiato.Translator.Llm`.
 
   Known providers, selectable as `config :ashiato, Ashiato.Translator, provider: ...`
@@ -115,7 +115,9 @@ defmodule Ashiato.Translator do
   @doc """
   Translates a page through `impl/0`.
 
-  Refused providers enter a 300 s cool-down keyed by provider module.
+  Refused providers enter a 300 s cool-down keyed by provider module and
+  credential fingerprint, so a refused key never blocks another key of the same
+  provider.
   """
   @spec translate_page([String.t()], keyword()) :: {:ok, [String.t()]} | {:error, term()}
   def translate_page(lines, opts), do: impl().translate_page(lines, opts)
@@ -128,11 +130,11 @@ defmodule Ashiato.Translator do
           ([String.t()], keyword() -> {:ok, [String.t()]} | {:error, term()})
         ) :: {:ok, [String.t()]} | {:error, term()}
   def run_provider(provider, lines, opts, page_request) do
-    case check_cooldown(provider) do
+    case check_cooldown(provider, opts) do
       nil ->
         case page_with_fallback(lines, opts, page_request) do
           {:error, {:http, status}} = error when status in [403, 429] or status >= 500 ->
-            record_cooldown(provider)
+            record_cooldown(provider, opts)
             error
 
           other ->
@@ -151,7 +153,8 @@ defmodule Ashiato.Translator do
   """
   @spec clear_cooldowns() :: :ok
   def clear_cooldowns() do
-    for {{__MODULE__, :cooldown, _provider} = key, _expiry} <- :persistent_term.get() do
+    for {{__MODULE__, :cooldown, _provider, _fingerprint} = key, _expiry} <-
+          :persistent_term.get() do
       :persistent_term.erase(key)
     end
 
@@ -162,8 +165,8 @@ defmodule Ashiato.Translator do
 
   @cooldown_secs 300
 
-  defp check_cooldown(provider) do
-    key = cooldown_key(provider)
+  defp check_cooldown(provider, opts) do
+    key = cooldown_key(provider, opts)
 
     case :persistent_term.get(key, nil) do
       nil ->
@@ -175,12 +178,25 @@ defmodule Ashiato.Translator do
     end
   end
 
-  defp record_cooldown(provider) do
+  defp record_cooldown(provider, opts) do
     expiry = System.monotonic_time(:millisecond) + @cooldown_secs * 1000
-    :persistent_term.put(cooldown_key(provider), expiry)
+    :persistent_term.put(cooldown_key(provider, opts), expiry)
   end
 
-  defp cooldown_key(provider), do: {__MODULE__, :cooldown, provider}
+  defp cooldown_key(provider, opts) do
+    case Keyword.get(opts, :api_key) do
+      key when is_binary(key) and key != "" ->
+        fingerprint =
+          :crypto.hash(:sha256, key)
+          |> Base.encode16(case: :lower)
+          |> binary_part(0, 16)
+
+        {__MODULE__, :cooldown, provider, fingerprint}
+
+      _absent_or_empty_or_non_binary ->
+        {__MODULE__, :cooldown, provider, :none}
+    end
+  end
 
   @doc """
   The shared page→per-line rule: accept a page reply only when it is line-aligned.
@@ -233,7 +249,11 @@ defmodule Ashiato.Translator do
   """
   @spec http_post(String.t(), keyword()) :: {:ok, [String.t()]} | {:error, term()}
   def http_post(url, req_opts) do
-    req_opts = put_test_plug(req_opts)
+    req_opts =
+      case Application.get_env(:ashiato, __MODULE__, [])[:plug] do
+        nil -> req_opts
+        plug -> Keyword.put_new(req_opts, :plug, plug)
+      end
 
     case Keyword.pop(req_opts, :decode) do
       {nil, _opts} ->
@@ -255,13 +275,6 @@ defmodule Ashiato.Translator do
     end
   rescue
     _ -> {:error, :request_failed}
-  end
-
-  defp put_test_plug(req_opts) do
-    case Application.get_env(:ashiato, __MODULE__, [])[:plug] do
-      nil -> req_opts
-      plug -> Keyword.put_new(req_opts, :plug, plug)
-    end
   end
 
   @doc false

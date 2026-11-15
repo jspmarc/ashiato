@@ -27,10 +27,12 @@ defmodule Ashiato.Schemas.Lexeme do
   @doc """
   Changeset used by `Ashiato.Ledger.find_or_create_lexeme/3`.
 
-  The `unique_constraint` declaration is what turns a
-  lost insert race into `{:error, changeset}` instead of a raised
-  `Ecto.ConstraintError`, so the ledger can fall back to fetching the row the
-  concurrent caller just won.
+  The insert runs as an upsert (`on_conflict: :nothing` over the
+  `lexemes_lemma_reading_part_of_speech_index` unique index), so a lost race is
+  a no-op that returns a struct without `id` and the ledger refetches the row
+  the winner just wrote — no constraint violation is raised. The
+  `unique_constraint` declaration remains as the mapping should a violation
+  ever surface anyway.
   """
   def changeset(lexeme, attrs) do
     lexeme

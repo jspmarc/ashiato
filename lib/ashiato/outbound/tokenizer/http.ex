@@ -27,19 +27,17 @@ defmodule Ashiato.Tokenizer.Http do
   @spec tokenize(String.t()) :: {:ok, [Ashiato.Tokenizer.token()]} | {:error, term()}
   def tokenize(text) do
     with {:ok, base_url} <- base_url(),
-         {:ok, body} <- Ashiato.HTTP.post(request_url(base_url), request_opts(text)) do
+         {:ok, body} <-
+           Ashiato.HTTP.post(
+             String.trim_trailing(base_url, "/") <> "/tokenize",
+             # `:plug` is never set in production; tests inject a test plug through it so the mapping
+             # is exercised without a socket.
+             Application.get_env(:ashiato, Ashiato.Tokenizer, [])
+             |> Keyword.take([:plug])
+             |> Keyword.put(:json, %{text: text})
+           ) do
       parse(body)
     end
-  end
-
-  defp request_url(base_url), do: String.trim_trailing(base_url, "/") <> "/tokenize"
-
-  # `:plug` is never set in production; tests inject a test plug through it so the mapping
-  # is exercised without a socket.
-  defp request_opts(text) do
-    Application.get_env(:ashiato, Ashiato.Tokenizer, [])
-    |> Keyword.take([:plug])
-    |> Keyword.put(:json, %{text: text})
   end
 
   defp base_url do

@@ -41,7 +41,7 @@ defmodule Ashiato.SettingsConcurrencyTest do
             Repo.one!(from(u in User, where: u.id == ^user.id, lock: "FOR UPDATE"))
 
             assert {:ok, _} =
-                     Settings.put(user.id, "OPENAI_API_KEY", "sk-secret", secret: true)
+                     Settings.put(user.id, "openai_api_key", "sk-secret", secret: true)
 
             send(parent, :a_uncommitted)
 
@@ -60,7 +60,7 @@ defmodule Ashiato.SettingsConcurrencyTest do
           %{rows: [[backend_pid]]} = Repo.query!("SELECT pg_backend_pid()")
           send(parent, {:b_backend_pid, backend_pid})
 
-          Settings.put(user.id, "OPENAI_API_KEY", "sk-plain")
+          Settings.put(user.id, "openai_api_key", "sk-plain")
         end)
       end)
 
@@ -76,11 +76,11 @@ defmodule Ashiato.SettingsConcurrencyTest do
     Task.await(task_a, 30_000)
 
     Ecto.Adapters.SQL.Sandbox.unboxed_run(Repo, fn ->
-      row = Repo.get_by!(Setting, user_id: user.id, key: "OPENAI_API_KEY")
+      row = Repo.get_by!(Setting, user_id: user.id, key: "openai_api_key")
       assert row.secret
       refute row.value =~ "sk-plain"
-      assert Settings.get(user.id, "OPENAI_API_KEY") == "sk-plain"
-      assert Settings.all(user.id)["OPENAI_API_KEY"] == :redacted
+      assert Settings.get(user.id, "openai_api_key") == "sk-plain"
+      assert Settings.all(user.id)["openai_api_key"] == :redacted
     end)
   end
 

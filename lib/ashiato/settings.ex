@@ -33,6 +33,11 @@ defmodule Ashiato.Settings do
 
   @key_salt "ashiato settings"
 
+  # Credential settings-row keys; the environment fallback is String.upcase/1 of these.
+  @openai_api_key "openai_api_key"
+  @deepl_api_key "deepl_api_key"
+  @google_cloud_api_key "google_cloud_api_key"
+
   # Built-in defaults: a missing row must never force a caller to special-case nil.
   @defaults %{
     "ai_features_enabled" => false,
@@ -199,14 +204,14 @@ defmodule Ashiato.Settings do
 
   @doc """
   The AI gate: `ai_features_enabled` is on AND a non-empty
-  `OPENAI_API_KEY` exists — settings row first, then `System.get_env/1`. An
-  empty key disables the feature even with the switch on, so affordances hide
-  instead of failing at call time.
+  `openai_api_key` credential exists — settings row first, then the
+  `OPENAI_API_KEY` environment variable. An empty key disables the feature
+  even with the switch on, so affordances hide instead of failing at call time.
   """
   @spec ai_capable?(integer()) :: boolean()
   def ai_capable?(user_id) do
     impl().get(user_id, "ai_features_enabled", false) === true and
-      credential?(user_id, "OPENAI_API_KEY")
+      credential?(user_id, @openai_api_key)
   end
 
   @doc """
@@ -224,18 +229,19 @@ defmodule Ashiato.Settings do
 
   defp provider_configured?(_user_id, "google_free"), do: true
   defp provider_configured?(_user_id, "off"), do: false
-  defp provider_configured?(user_id, "deepl"), do: credential?(user_id, "deepl_api_key")
+  defp provider_configured?(user_id, "deepl"), do: credential?(user_id, @deepl_api_key)
 
   defp provider_configured?(user_id, "google_cloud"),
-    do: credential?(user_id, "google_cloud_api_key")
+    do: credential?(user_id, @google_cloud_api_key)
 
-  defp provider_configured?(user_id, "llm"), do: credential?(user_id, "OPENAI_API_KEY")
+  defp provider_configured?(user_id, "llm"), do: credential?(user_id, @openai_api_key)
   defp provider_configured?(_user_id, _unknown), do: false
 
   @doc """
   The credential for `key`: the stored row wins and the environment variable
   named by the uppercase key (`OPENAI_API_KEY`, `DEEPL_API_KEY`,
-  `GOOGLE_CLOUD_API_KEY`) is the fallback. An explicitly empty stored value —
+  `GOOGLE_CLOUD_API_KEY`) is the fallback, so the stored `openai_api_key` row
+  falls back to `OPENAI_API_KEY`. An explicitly empty stored value —
   an empty string or JSON `null` — blocks the fallback, so a cleared key
   disables the capability even when the environment still holds one. A secret
   row is decrypted first, and a resolved value that is empty or not a binary

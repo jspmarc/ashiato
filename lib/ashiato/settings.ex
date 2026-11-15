@@ -21,6 +21,7 @@ defmodule Ashiato.Settings do
 
   alias Ashiato.Repo
   alias Ashiato.Schemas.Setting
+  alias Ashiato.Schemas.User
   alias Ashiato.Utils
 
   @callback get(integer(), String.t(), term()) :: term()
@@ -92,20 +93,32 @@ defmodule Ashiato.Settings do
     stored in the clear.
 
   `user_id` is set on the struct, never cast.
+
+  The classification read and the upsert run in one transaction; on PostgreSQL
+  the owning `users` row is locked first, so a writer that omits `:secret`
+  cannot classify against an uncommitted `secret: true` write and rewrite the
+  row as plaintext.
   """
   @spec put(integer(), String.t(), term(), keyword()) ::
           {:ok, Setting.t()}
           | {:error, Ecto.Changeset.t() | :not_encodable | :secret_key_base_missing}
   def put(user_id, key, value, opts \\ []) do
-    secret? =
-      case Keyword.fetch(opts, :secret) do
-        {:ok, explicit} -> explicit
-        :error -> existing_secret?(user_id, key)
-      end
+    Repo.transaction(fn ->
+      lock_user_row(user_id)
 
-    with {:ok, stored} <- encode_value(value, secret?) do
-      upsert(user_id, key, stored, secret?)
-    end
+      secret? =
+        case Keyword.fetch(opts, :secret) do
+          {:ok, explicit} -> explicit
+          :error -> existing_secret?(user_id, key)
+        end
+
+      with {:ok, stored} <- encode_value(value, secret?),
+           {:ok, row} <- upsert(user_id, key, stored, secret?) do
+        row
+      else
+        {:error, reason} -> Repo.rollback(reason)
+      end
+    end)
   end
 
   # Omitting `:secret` means "keep whatever this row already is": a re-put of an
@@ -116,6 +129,22 @@ defmodule Ashiato.Settings do
       nil -> false
       %Setting{secret: secret?} -> secret?
     end
+  end
+
+  # The users row is the serialisation point for the classification read: it
+  # always exists for a stored setting, and locking it makes a concurrent
+  # `secret: true` write commit before the read, so the flag can never be read
+  # as "absent/non-secret" and the row rewritten as plaintext. SQLite has no
+  # row locks (`lock:` raises "locks are not supported by SQLite3") and its
+  # single-writer engine serialises writes anyway, so it keeps the plain fetch.
+  @spec lock_user_row(integer()) :: :ok
+  defp lock_user_row(user_id) do
+    if Application.fetch_env!(:ashiato, :ecto_adapter) == Ecto.Adapters.Postgres do
+      from(u in User, where: u.id == ^user_id, lock: "FOR UPDATE")
+      |> Repo.one()
+    end
+
+    :ok
   end
 
   # Encode first, encrypt second: a pid, tuple or struct cannot be JSON, and a crash here

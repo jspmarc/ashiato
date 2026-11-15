@@ -47,16 +47,24 @@ defmodule Ashiato.Settings.Fake do
   @spec put(integer(), String.t(), term(), keyword()) ::
           {:ok, Setting.t()} | {:error, :not_encodable}
   def put(user_id, key, value, opts) do
-    secret? =
-      case Keyword.fetch(opts, :secret) do
-        {:ok, explicit} -> explicit
-        :error -> stored_secret?(user_id, key)
-      end
-
     case Jason.encode(value) do
       {:ok, json} ->
         decoded = Jason.decode!(json)
-        Agent.update(__MODULE__, &Map.put(&1, {user_id, key}, {decoded, secret?}))
+
+        # classification read and write in one atomic call, like the
+        # repo-backed store's transaction, so a concurrent re-put cannot
+        # declassify an uncommitted secret
+        secret? =
+          Agent.get_and_update(__MODULE__, fn store ->
+            secret? =
+              case Keyword.fetch(opts, :secret) do
+                {:ok, explicit} -> explicit
+                :error -> stored_secret?(store, user_id, key)
+              end
+
+            {secret?, Map.put(store, {user_id, key}, {decoded, secret?})}
+          end)
+
         {:ok, %Setting{user_id: user_id, key: key, value: json, secret: secret?}}
 
       {:error, _reason} ->
@@ -64,13 +72,11 @@ defmodule Ashiato.Settings.Fake do
     end
   end
 
-  defp stored_secret?(user_id, key) do
-    Agent.get(__MODULE__, fn store ->
-      case Map.fetch(store, {user_id, key}) do
-        {:ok, {_value, secret?}} -> secret?
-        :error -> false
-      end
-    end)
+  defp stored_secret?(store, user_id, key) do
+    case Map.fetch(store, {user_id, key}) do
+      {:ok, {_value, secret?}} -> secret?
+      :error -> false
+    end
   end
 
   @impl true

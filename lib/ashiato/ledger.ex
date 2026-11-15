@@ -182,10 +182,6 @@ defmodule Ashiato.Ledger do
         {:error, changeset} -> Repo.rollback(changeset)
       end
     end)
-    |> case do
-      {:ok, word_state} -> {:ok, word_state}
-      {:error, changeset} -> {:error, changeset}
-    end
   end
 
   def review(_word_id, _grade, _now) do
@@ -200,14 +196,29 @@ defmodule Ashiato.Ledger do
   defp do_review(word_id, grade, now) do
     case locked_word(word_id) do
       nil ->
-        {:error, missing_word_changeset(word_id)}
+        {:error,
+         %WordState{word_id: word_id}
+         |> Ecto.Changeset.change()
+         |> Ecto.Changeset.add_error(:word_id, "does not exist")}
 
       word ->
         # a missing row means "new"
         word_state =
           case Repo.get(WordState, word_id) do
-            %WordState{} = existing -> existing
-            nil -> new_word_state(word_id, now)
+            %WordState{} = existing ->
+              existing
+
+            nil ->
+              %WordState{
+                word_id: word_id,
+                state: :new,
+                stability: nil,
+                difficulty: nil,
+                reps: 0,
+                lapses: 0,
+                failure_streak: 0,
+                due_at: now
+              }
           end
 
         %{state: next, interval_days: interval} = Srs.grade(word_state, grade, now)
@@ -299,27 +310,6 @@ defmodule Ashiato.Ledger do
     %WordState{word_id: word_id}
     |> WordState.changeset(attrs)
     |> Repo.insert(on_conflict: [set: Map.to_list(attrs)], conflict_target: :word_id)
-  end
-
-  @spec new_word_state(integer(), DateTime.t()) :: WordState.t()
-  defp new_word_state(word_id, now) do
-    %WordState{
-      word_id: word_id,
-      state: :new,
-      stability: nil,
-      difficulty: nil,
-      reps: 0,
-      lapses: 0,
-      failure_streak: 0,
-      due_at: now
-    }
-  end
-
-  @spec missing_word_changeset(integer()) :: Ecto.Changeset.t()
-  defp missing_word_changeset(word_id) do
-    %WordState{word_id: word_id}
-    |> Ecto.Changeset.change()
-    |> Ecto.Changeset.add_error(:word_id, "does not exist")
   end
 
   @doc """
@@ -536,12 +526,38 @@ defmodule Ashiato.Ledger do
         Enum.map(Utils.cjk_codepoints(sighting.lemma), &{&1, sighting})
       end)
       |> Enum.reduce(%{}, fn {glyph, sighting}, acc ->
-        Map.update(acc, glyph, new_stats(sighting), &add_sighting(&1, sighting))
+        Map.update(
+          acc,
+          glyph,
+          %{
+            pages: MapSet.new([sighting.page_id]),
+            days: MapSet.new([sighting.seen_on]),
+            word_ids: MapSet.new(),
+            mature?: false
+          },
+          fn stats ->
+            %{
+              stats
+              | pages: MapSet.put(stats.pages, sighting.page_id),
+                days: MapSet.put(stats.days, sighting.seen_on)
+            }
+          end
+        )
       end)
 
     stats
     |> fold_word_facts(word_facts)
-    |> Enum.map(&glyph_entry/1)
+    |> Enum.map(fn {glyph, stats} ->
+      %{
+        glyph: glyph,
+        occurrences: MapSet.size(stats.pages),
+        days_seen: MapSet.size(stats.days),
+        first_seen: Enum.min(stats.days, Date),
+        last_seen: Enum.max(stats.days, Date),
+        distinct_words: MapSet.size(stats.word_ids),
+        has_mature_word: stats.mature?
+      }
+    end)
     |> Enum.sort_by(&{-&1.occurrences, &1.glyph})
   end
 
@@ -554,45 +570,14 @@ defmodule Ashiato.Ledger do
       Enum.map(Utils.cjk_codepoints(fact.lemma), &{&1, fact})
     end)
     |> Enum.reduce(stats, fn {glyph, fact}, acc ->
-      Map.update!(acc, glyph, &add_word_fact(&1, fact))
+      Map.update!(acc, glyph, fn stats ->
+        %{
+          stats
+          | word_ids: MapSet.put(stats.word_ids, fact.lexeme_id),
+            mature?: stats.mature? or fact.has_mature_word != nil
+        }
+      end)
     end)
-  end
-
-  defp new_stats(sighting) do
-    %{
-      pages: MapSet.new([sighting.page_id]),
-      days: MapSet.new([sighting.seen_on]),
-      word_ids: MapSet.new(),
-      mature?: false
-    }
-  end
-
-  defp add_sighting(stats, sighting) do
-    %{
-      stats
-      | pages: MapSet.put(stats.pages, sighting.page_id),
-        days: MapSet.put(stats.days, sighting.seen_on)
-    }
-  end
-
-  defp add_word_fact(stats, fact) do
-    %{
-      stats
-      | word_ids: MapSet.put(stats.word_ids, fact.lexeme_id),
-        mature?: stats.mature? or fact.has_mature_word != nil
-    }
-  end
-
-  defp glyph_entry({glyph, stats}) do
-    %{
-      glyph: glyph,
-      occurrences: MapSet.size(stats.pages),
-      days_seen: MapSet.size(stats.days),
-      first_seen: Enum.min(stats.days, Date),
-      last_seen: Enum.max(stats.days, Date),
-      distinct_words: MapSet.size(stats.word_ids),
-      has_mature_word: stats.mature?
-    }
   end
 
   @doc """
@@ -617,10 +602,13 @@ defmodule Ashiato.Ledger do
       due_at = Utils.utc_now()
       words = resolve_words(user_id, lexeme_ids, force?)
 
-      words
-      |> qualify(user_id, min_encounters, force?)
-      |> Enum.map(&introduce_word(&1, due_at))
-      |> in_lexeme_order(lexeme_ids)
+      introduced =
+        words
+        |> qualify(user_id, min_encounters, force?)
+        |> Enum.map(&introduce_word(&1, due_at))
+
+      by_lexeme = Map.new(introduced, &{&1.lexeme_id, &1})
+      for(lexeme_id <- lexeme_ids, word = Map.get(by_lexeme, lexeme_id), do: word)
     end)
   end
 
@@ -791,7 +779,39 @@ defmodule Ashiato.Ledger do
   """
   @spec update_chrome_like(integer()) :: {:ok, [Word.t()]}
   def update_chrome_like(user_id) do
-    chrome_ids = chrome_word_ids(user_id)
+    # Two aggregate passes for all sources at once: page counts per source, and
+    # distinct encounter-page counts per {source, word}. `2 * occurrences > pages`
+    # is the ratio threshold in integer arithmetic, so no float division is
+    # needed and the query count never grows with the number of sources. Only
+    # sources with encounters appear in the counts, so every word is judged on
+    # all of its sources; a word with no qualifying encounters is never listed.
+    pages_by_source =
+      from(p in Page,
+        where: p.user_id == ^user_id,
+        select: {p.source_id, count(p.id)},
+        group_by: p.source_id
+      )
+      |> Repo.all()
+      |> Map.new()
+
+    chrome_ids =
+      from(e in Encounter,
+        where: e.user_id == ^user_id,
+        where: is_nil(e.discarded_at) and e.confirmed,
+        select: {e.source_id, e.word_id, count(e.page_id, :distinct)},
+        group_by: [e.source_id, e.word_id]
+      )
+      |> Repo.all()
+      |> Enum.group_by(
+        fn {_source_id, word_id, _occurrences} -> word_id end,
+        fn {source_id, _word_id, occurrences} ->
+          # an encounter always points at a page, so a missing count can only be 0
+          pages = Map.get(pages_by_source, source_id, 0)
+          pages > 0 and 2 * occurrences > pages
+        end
+      )
+      |> Enum.filter(fn {_word_id, passes} -> Enum.all?(passes) end)
+      |> Enum.map(fn {word_id, _passes} -> word_id end)
 
     Repo.transaction(fn ->
       flagged_at = Utils.utc_now()
@@ -893,49 +913,7 @@ defmodule Ashiato.Ledger do
     end
   end
 
-  @spec in_lexeme_order([Word.t()], [integer()]) :: [Word.t()]
-  defp in_lexeme_order(introduced, lexeme_ids) do
-    by_lexeme = Map.new(introduced, &{&1.lexeme_id, &1})
-    for(lexeme_id <- lexeme_ids, word = Map.get(by_lexeme, lexeme_id), do: word)
-  end
-
   # ── chrome_like ─────────────────────────────────────────────────────────────
-
-  # Two aggregate passes for all sources at once: page counts per source, and
-  # distinct encounter-page counts per {source, word}. `2 * occurrences > pages`
-  # is the ratio threshold in integer arithmetic, so no float division is
-  # needed and the query count never grows with the number of sources. Only
-  # sources with encounters appear in the counts, so every word is judged on
-  # all of its sources; a word with no qualifying encounters is never listed.
-  @spec chrome_word_ids(integer()) :: [integer()]
-  defp chrome_word_ids(user_id) do
-    pages_by_source =
-      from(p in Page,
-        where: p.user_id == ^user_id,
-        select: {p.source_id, count(p.id)},
-        group_by: p.source_id
-      )
-      |> Repo.all()
-      |> Map.new()
-
-    from(e in Encounter,
-      where: e.user_id == ^user_id,
-      where: is_nil(e.discarded_at) and e.confirmed,
-      select: {e.source_id, e.word_id, count(e.page_id, :distinct)},
-      group_by: [e.source_id, e.word_id]
-    )
-    |> Repo.all()
-    |> Enum.group_by(
-      fn {_source_id, word_id, _occurrences} -> word_id end,
-      fn {source_id, _word_id, occurrences} ->
-        # an encounter always points at a page, so a missing count can only be 0
-        pages = Map.get(pages_by_source, source_id, 0)
-        pages > 0 and 2 * occurrences > pages
-      end
-    )
-    |> Enum.filter(fn {_word_id, passes} -> Enum.all?(passes) end)
-    |> Enum.map(fn {word_id, _passes} -> word_id end)
-  end
 
   @spec flag_chrome(integer(), [integer()], DateTime.t()) :: {non_neg_integer(), nil}
   defp flag_chrome(user_id, chrome_ids, flagged_at) do

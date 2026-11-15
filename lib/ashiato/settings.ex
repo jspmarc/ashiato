@@ -125,10 +125,7 @@ defmodule Ashiato.Settings do
   defp encode_value(value, secret?) do
     case Jason.encode(value) do
       {:ok, json} when secret? ->
-        case encrypt(json) do
-          {:ok, encrypted} -> {:ok, encrypted}
-          {:error, :secret_key_base_missing} = err -> err
-        end
+        encrypt(json)
 
       {:ok, json} ->
         {:ok, json}

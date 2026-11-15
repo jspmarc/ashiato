@@ -137,18 +137,14 @@ defmodule Ashiato.Translator.Llm do
     case Jason.decode(text) do
       {:ok, %{"translations" => lines} = decoded}
       when map_size(decoded) == 1 and is_list(lines) ->
-        valid_lines(lines)
+        if Enum.all?(lines, &is_binary/1) do
+          {:ok, Enum.map(lines, &String.trim/1)}
+        else
+          {:error, :unparsable}
+        end
 
       _other ->
         {:error, :unparsable}
-    end
-  end
-
-  defp valid_lines(lines) do
-    if Enum.all?(lines, &is_binary/1) do
-      {:ok, Enum.map(lines, &String.trim/1)}
-    else
-      {:error, :unparsable}
     end
   end
 end

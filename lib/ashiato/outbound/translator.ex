@@ -248,7 +248,11 @@ defmodule Ashiato.Translator do
   """
   @spec http_post(String.t(), keyword()) :: {:ok, [String.t()]} | {:error, term()}
   def http_post(url, req_opts) do
-    req_opts = put_test_plug(req_opts)
+    req_opts =
+      case Application.get_env(:ashiato, __MODULE__, [])[:plug] do
+        nil -> req_opts
+        plug -> Keyword.put_new(req_opts, :plug, plug)
+      end
 
     case Keyword.pop(req_opts, :decode) do
       {nil, _opts} ->
@@ -270,13 +274,6 @@ defmodule Ashiato.Translator do
     end
   rescue
     _ -> {:error, :request_failed}
-  end
-
-  defp put_test_plug(req_opts) do
-    case Application.get_env(:ashiato, __MODULE__, [])[:plug] do
-      nil -> req_opts
-      plug -> Keyword.put_new(req_opts, :plug, plug)
-    end
   end
 
   @doc false

@@ -6,7 +6,7 @@ defmodule Ashiato.Tokenizer.Http do
   @moduledoc """
   HTTP client for the tokenizer endpoint on `jp-dict-api` (docs/requirements.md §7.2).
 
-  One `Req.post!` to `{base_url}/tokenize` with a `{"text": ...}` JSON body, expecting a reply of
+  One `Ashiato.HTTP.post/2` to `{base_url}/tokenize` with a `{"text": ...}` JSON body, expecting a reply of
   the shape `{"tokens": [{"surface" => ..., "lemma" => ..., "reading" => ..., "part_of_speech" => ...}]}`.
   The base URL comes from application config (`:base_url` under `Ashiato.Tokenizer`), populated
   from `JP_DICT_API_URL` in `config/runtime.exs`.
@@ -26,28 +26,20 @@ defmodule Ashiato.Tokenizer.Http do
   """
   @spec tokenize(String.t()) :: {:ok, [Ashiato.Tokenizer.token()]} | {:error, term()}
   def tokenize(text) do
-    with {:ok, base_url} <- base_url() do
-      response = Req.post!(req(base_url), url: "/tokenize", json: %{text: text})
-      parse(response)
+    with {:ok, base_url} <- base_url(),
+         {:ok, body} <- Ashiato.HTTP.post(request_url(base_url), request_opts(text)) do
+      parse(body)
     end
-  rescue
-    e in Req.TransportError -> {:error, {:transport, safe_reason(e.reason)}}
-    e in Req.HTTPError -> {:error, {:http, safe_reason(e.reason)}}
-    _e in Jason.DecodeError -> {:error, :invalid_json}
   end
 
-  # Protocol reasons can carry server-controlled binaries (HTTP/2 debug data); only atoms are
-  # safe to put in a term that reaches a log.
-  defp safe_reason(reason) when is_atom(reason), do: reason
-  defp safe_reason(_reason), do: :unknown
+  defp request_url(base_url), do: String.trim_trailing(base_url, "/") <> "/tokenize"
 
-  # `:plug` is never set in production; tests inject `Req.Test` through it so the mapping is
-  # exercised without a socket.
-  defp req(base_url) do
-    env = Application.get_env(:ashiato, Ashiato.Tokenizer, [])
-    opts = Keyword.take(env, [:plug])
-
-    Req.new(Keyword.put(opts, :base_url, base_url))
+  # `:plug` is never set in production; tests inject a test plug through it so the mapping
+  # is exercised without a socket.
+  defp request_opts(text) do
+    Application.get_env(:ashiato, Ashiato.Tokenizer, [])
+    |> Keyword.take([:plug])
+    |> Keyword.put(:json, %{text: text})
   end
 
   defp base_url do
@@ -57,7 +49,7 @@ defmodule Ashiato.Tokenizer.Http do
     end
   end
 
-  defp parse(%Req.Response{status: 200, body: body}) do
+  defp parse(body) do
     case body do
       # the envelope is part of the contract too: a 200 without a token list is a broken
       # reply, not an empty page, and must not record zero encounters silently.
@@ -65,8 +57,6 @@ defmodule Ashiato.Tokenizer.Http do
       _ -> {:error, {:malformed_reply, shape(body)}}
     end
   end
-
-  defp parse(%Req.Response{status: status}), do: {:error, {:unexpected_status, status}}
 
   defp parse_tokens(tokens) do
     tokens

@@ -167,7 +167,7 @@ defmodule Ashiato.DictionaryTest do
       assert {:ok, %{"食べる" => _, "橋" => _}} = Dictionary.Http.lookup_many(["食べる", "橋"])
     end
 
-    test "maps malformed JSON to unexpected_response and transport errors" do
+    test "maps malformed JSON to invalid_json and transport errors" do
       Req.Test.stub(__MODULE__, fn conn ->
         case Enum.map(conn.path_info, &URI.decode/1) do
           ["lookup", "壊"] ->
@@ -180,7 +180,7 @@ defmodule Ashiato.DictionaryTest do
         end
       end)
 
-      assert Dictionary.Http.lookup("壊") == {:error, :unexpected_response}
+      assert Dictionary.Http.lookup("壊") == {:error, :invalid_json}
       assert Dictionary.Http.lookup("落") == {:error, {:transport, :econnrefused}}
     end
 
@@ -193,7 +193,7 @@ defmodule Ashiato.DictionaryTest do
 
       log =
         ExUnit.CaptureLog.capture_log(fn ->
-          assert Dictionary.Http.lookup_many(["爆"]) == {:error, :lookup_failed}
+          assert Dictionary.Http.lookup_many(["爆"]) == {:error, :request_failed}
         end)
 
       refute log =~ "爆"

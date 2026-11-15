@@ -104,55 +104,24 @@ defmodule Ashiato.Dictionary.Http do
 
   defp empty_reply?(words, kanji), do: (is_nil(words) or words == []) and is_nil(kanji)
 
-  @spec safe_reason(term()) :: atom()
-  defp safe_reason(reason) when is_atom(reason), do: reason
-  defp safe_reason(_reason), do: :unknown
-
   @spec request(String.t()) :: {:ok, term()} | {:error, term()}
   defp request(path) do
     with {:ok, base} <- base_url() do
-      req = Req.new(Keyword.take(Application.get_env(:ashiato, Ashiato.Dictionary, []), [:plug]))
-
-      case Req.request(req,
-             url: base <> path,
-             redirect: false,
-             retry: false,
-             receive_timeout: @timeout,
-             request_timeout: @timeout
-           ) do
-        {:ok, %Req.Response{status: 200, body: body}} ->
-          {:ok, body}
-
-        {:ok, %Req.Response{status: status}} ->
-          {:error, {:unexpected_status, status}}
-
-        {:error, %Req.TransportError{reason: reason}} ->
-          {:error, {:transport, safe_reason(reason)}}
-
-        {:error, %{__exception__: true}} ->
-          {:error, :unexpected_response}
-
-        {:error, _reason} ->
-          {:error, :transport_error}
-      end
+      # `:plug` is never set in production; tests inject a test plug through it so the
+      # client is exercised without a socket.
+      opts = Keyword.take(Application.get_env(:ashiato, Ashiato.Dictionary, []), [:plug])
+      Ashiato.HTTP.get(String.trim_trailing(base, "/") <> path, opts)
     end
   end
 
-  @spec base_url() :: {:ok, String.t()} | {:error, :base_url_not_configured | :invalid_base_url}
+  @spec base_url() :: {:ok, String.t()} | {:error, :base_url_not_configured}
   defp base_url do
     case Application.get_env(:ashiato, Ashiato.Dictionary, [])[:base_url] do
       nil ->
         {:error, :base_url_not_configured}
 
       url ->
-        case URI.new(url) do
-          {:ok, %URI{scheme: scheme, host: host, query: nil, fragment: nil}}
-          when scheme in ["http", "https"] and host != nil and host != "" ->
-            {:ok, String.trim_trailing(url, "/")}
-
-          _ ->
-            {:error, :invalid_base_url}
-        end
+        {:ok, url}
     end
   end
 end

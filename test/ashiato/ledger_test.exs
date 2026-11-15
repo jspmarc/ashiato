@@ -26,6 +26,7 @@ defmodule Ashiato.LedgerTest do
   use Ashiato.DataCase, async: false
 
   import Ashiato.Fixtures
+  import Ecto.Query, only: [from: 2]
 
   alias Ashiato.{Ledger, Repo, Srs}
   alias Ashiato.Schemas.{Encounter, Lexeme, Page, ReviewEvent, WordState}
@@ -1128,6 +1129,27 @@ defmodule Ashiato.LedgerTest do
 
       # the job still carries the page it read at the start (revision 1)
       assert {:error, :superseded} = Ledger.finish_page(page, :detecting)
+    end
+
+    test "a stale status finish_page write is discarded as :superseded and writes nothing",
+         %{user: user, source: source} do
+      page = make_page(user, source)
+
+      # status moved in the DB without a revision bump
+      Repo.update_all(from(p in Page, where: p.id == ^page.id), set: [status: :detecting])
+
+      assert {:error, :superseded} = Ledger.finish_page(page, :detecting)
+      assert %{status: :detecting, revision: 1} = Repo.get!(Page, page.id)
+    end
+
+    test "transition/2 with a stale struct returns :superseded", %{user: user, source: source} do
+      page = make_page(user, source)
+
+      # status moved in the DB without a revision bump
+      Repo.update_all(from(p in Page, where: p.id == ^page.id), set: [status: :detecting])
+
+      assert {:error, :superseded} = Ledger.transition(page, :detecting)
+      assert %{status: :detecting, revision: 1} = Repo.get!(Page, page.id)
     end
 
     test "backward transitions are rejected", %{user: user, source: source} do

@@ -669,8 +669,8 @@ defmodule Ashiato.Ledger do
 
   @doc """
   Writes a job's final status, but only while the page still carries the
-  `revision` the job started from. A stale write matches no rows and returns
-  `{:error, :superseded}`; a move the pipeline forbids returns
+  `revision` and `status` the job started from. A stale write matches no rows
+  and returns `{:error, :superseded}`; a move the pipeline forbids returns
   `{:error, :invalid_transition}`.
   """
   @spec finish_page(Page.t(), atom()) ::
@@ -679,7 +679,12 @@ defmodule Ashiato.Ledger do
     unless valid_transition?(page.status, status) do
       {:error, :invalid_transition}
     else
-      query = from(p in Page, where: p.id == ^page.id and p.revision == ^page.revision)
+      query =
+        from(p in Page,
+          where:
+            p.id == ^page.id and p.revision == ^page.revision and
+              p.status == ^page.status
+        )
 
       {count, _} =
         Repo.update_all(query, set: [status: status])
@@ -693,16 +698,30 @@ defmodule Ashiato.Ledger do
 
   @doc """
   Moves a page to the next status in the ingest pipeline, or to `:failed` from
-  any non-terminal state. Anything else returns `{:error, :invalid_transition}`.
+  any non-terminal state. A move the pipeline forbids returns
+  `{:error, :invalid_transition}`; a page whose row no longer carries the
+  `revision` and `status` the struct was read with returns
+  `{:error, :superseded}`.
   """
-  @spec transition(Page.t(), atom()) :: {:ok, Page.t()} | {:error, :invalid_transition}
+  @spec transition(Page.t(), atom()) ::
+          {:ok, Page.t()} | {:error, :invalid_transition | :superseded}
   def transition(%Page{} = page, status) do
     unless valid_transition?(page.status, status) do
       {:error, :invalid_transition}
     else
-      page
-      |> Page.changeset(%{status: status})
-      |> Repo.update()
+      query =
+        from(p in Page,
+          where:
+            p.id == ^page.id and p.revision == ^page.revision and
+              p.status == ^page.status
+        )
+
+      {count, _} = Repo.update_all(query, set: [status: status])
+
+      case count do
+        0 -> {:error, :superseded}
+        1 -> {:ok, Repo.get!(Page, page.id)}
+      end
     end
   end
 

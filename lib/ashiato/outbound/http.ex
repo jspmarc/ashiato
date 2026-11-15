@@ -74,6 +74,8 @@ defmodule Ashiato.HTTP do
 
   defp execute(method, url, opts) do
     case Req.request(Req.new(req_opts(method, url, opts))) do
+      # 200 only: every current service returns 200. Widen to 2xx deliberately when a
+      # service needs 201/204, and add an empty-body rule for the callers at the same time.
       {:ok, %Req.Response{status: 200} = response} ->
         decode_body(response)
 

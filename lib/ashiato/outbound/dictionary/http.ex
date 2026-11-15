@@ -110,25 +110,18 @@ defmodule Ashiato.Dictionary.Http do
       # `:plug` is never set in production; tests inject a test plug through it so the
       # client is exercised without a socket.
       opts = Keyword.take(Application.get_env(:ashiato, Ashiato.Dictionary, []), [:plug])
-      Ashiato.HTTP.get(base <> path, opts)
+      Ashiato.HTTP.get(String.trim_trailing(base, "/") <> path, opts)
     end
   end
 
-  @spec base_url() :: {:ok, String.t()} | {:error, :base_url_not_configured | :invalid_base_url}
+  @spec base_url() :: {:ok, String.t()} | {:error, :base_url_not_configured}
   defp base_url do
     case Application.get_env(:ashiato, Ashiato.Dictionary, [])[:base_url] do
       nil ->
         {:error, :base_url_not_configured}
 
       url ->
-        case URI.new(url) do
-          {:ok, %URI{scheme: scheme, host: host, query: nil, fragment: nil}}
-          when scheme in ["http", "https"] and host != nil and host != "" ->
-            {:ok, String.trim_trailing(url, "/")}
-
-          _ ->
-            {:error, :invalid_base_url}
-        end
+        {:ok, url}
     end
   end
 end

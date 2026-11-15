@@ -99,7 +99,8 @@ No logging in this module.
 | | `{:transport, reason}` | unchanged |
 | | `:request_failed` | unchanged |
 
-Dictionary keeps `:base_url_not_configured` and `:invalid_base_url` for the base URL it owns.
+Dictionary keeps `:base_url_not_configured`; a malformed base URL is rejected by
+`Ashiato.HTTP` as `:invalid_url`.
 Translator keeps `:no_decoder`, `:invalid_url`, and the cooldown rule.
 
 ## Risks and mitigations

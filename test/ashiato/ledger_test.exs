@@ -375,6 +375,22 @@ defmodule Ashiato.LedgerTest do
       assert {:ok, _} = Ledger.record_encounter(second)
       assert Repo.aggregate(Encounter, :count) == 2
     end
+
+    test "accepts a nil crop_key: embedded text has no line geometry", %{attrs: attrs} do
+      assert {:ok, encounter} = Ledger.record_encounter(%{attrs | crop_key: nil})
+
+      assert encounter.id
+      assert encounter.crop_key == nil
+      assert Repo.aggregate(Encounter, :count) == 1
+    end
+
+    test "still rejects a nil required field", %{attrs: attrs} do
+      assert {:error, %Ecto.Changeset{errors: errors}} =
+               Ledger.record_encounter(%{attrs | seen_on: nil})
+
+      assert errors[:seen_on]
+      assert Repo.aggregate(Encounter, :count) == 0
+    end
   end
 
   describe "chrome_ratio/2" do

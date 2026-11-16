@@ -117,9 +117,10 @@ defmodule Ashiato.Ledger do
   still there to find.
 
   `attrs` may be a map or keyword list with atom keys and must include
-  `user_id`, `word_id`, `page_id`, `source_id`, `text_hash`, `crop_key`,
-  `seen_on` (a `Date`), and optionally `confirmed` (default `false`) and
-  `bbox`. `user_id` is set programmatically, never cast.
+  `user_id`, `word_id`, `page_id`, `source_id`, `text_hash`, `seen_on` (a
+  `Date`), and optionally `crop_key` (nil is allowed: an embedded-text page
+  has no OCR line geometry), `confirmed` (default `false`), and `bbox`.
+  `user_id` is set programmatically, never cast.
   """
   @spec record_encounter(keyword() | map()) ::
           {:ok, Encounter.t()} | {:error, Ecto.Changeset.t()}

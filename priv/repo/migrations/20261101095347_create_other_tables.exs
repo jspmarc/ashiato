@@ -142,8 +142,9 @@ defmodule Ashiato.Repo.Migrations.CreateOtherTables do
       add :text_hash, :string, null: false
 
       add :crop_key, :string,
-        null: false,
-        comment: "per-line crop, permanent: card front and OCR audit trail"
+        null: true,
+        comment:
+          "per-line crop, permanent: card front and OCR audit trail. nil means the page had embedded text and no OCR line geometry."
 
       add :crop_store, :string, null: false, default: "local"
 

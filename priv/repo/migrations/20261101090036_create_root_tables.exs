@@ -81,5 +81,40 @@ defmodule Ashiato.Repo.Migrations.CreateRootTables do
     # an entry is either current or superseded wholesale when dict_version
     # flips. This is also the mass-lookup for per-page token enrichment.
     create unique_index(:dict_cache_entries, [:kind, :cache_key, :dict_version])
+
+    create table(:translations) do
+      add :provider, :string,
+        null: false,
+        comment:
+          "provider_name() of the pinned provider: switching provider never reads another's rows"
+
+      add :lang, :string,
+        null: false,
+        comment: "target language of the cached line"
+
+      add :source_hash, :string,
+        null: false,
+        comment: "lowercase hex SHA-256 of the source line, so no source text column is stored"
+
+      add :translated_text, :text,
+        null: false,
+        comment: "the provider's output for that line"
+
+      add :fetched_at, :utc_datetime,
+        null: false,
+        comment:
+          "second precision; 30-day TTL: fetched_at >= now - 2_592_000 is fresh, older expires"
+    end
+
+    # global scope like dict_cache_entries: the cache is shared by all users,
+    # never per user, so there are no foreign keys. Provider-scoped identity:
+    # one row per (provider, lang, source_hash), so different providers never
+    # reuse each other's translations. The default Ecto index name keeps one
+    # declared constraint matching on both Postgres and SQLite.
+    create unique_index(:translations, [:provider, :lang, :source_hash])
+
+    # the 30-day TTL: the prune deletes rows with fetched_at older than the
+    # cutoff, so this index keeps that sweep a range scan
+    create index(:translations, [:fetched_at])
   end
 end

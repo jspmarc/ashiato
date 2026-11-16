@@ -10,7 +10,8 @@
 // in kana contributes no kanji, which is the correct answer.
 //
 // Two scopes:
-//   GLOBAL  (no user_id): kanji, lexemes, kanji_lexemes, dict_cache_entries
+//   GLOBAL  (no user_id): kanji, lexemes, kanji_lexemes, dict_cache_entries,
+//                        translations
 //   PER USER           : sources, documents, pages, words, encounters,
 //                        review_events, word_states
 //
@@ -48,6 +49,22 @@ Table dict_cache_entries {
   indexes {
     (kind, cache_key, dict_version) [unique]
   }
+}
+
+Table translations {
+  id int [pk, increment]
+  provider varchar [not null, note: 'provider_name() of the pinned provider: switching provider never reads another\'s rows']
+  lang varchar [not null, note: 'target language of the cached line']
+  source_hash varchar [not null, note: 'lowercase hex SHA-256 of the source line, so no source text column is stored']
+  translated_text text [not null, note: 'the provider\'s output for that line']
+  fetched_at timestamptz [not null, note: 'second precision; 30-day TTL: fetched_at >= now - 2_592_000 is fresh, older expires']
+
+  indexes {
+    (provider, lang, source_hash) [unique, name: 'translations_provider_lang_source_hash_index', note: 'global scope like dict_cache_entries, no foreign keys']
+    (fetched_at) [name: 'translations_fetched_at_index', note: 'the TTL prune deletes rows older than the cutoff']
+  }
+
+  Note: 'Global, shared by all users. Provider-scoped identity: one row per (provider, lang, source_hash), so different providers never reuse each other\'s translations. 30-day TTL: stale rows are ignored on read, replaced for the page\'s keys, and pruned.'
 }
 
 // ───────────────────────────── per user: the ledger ─────────────────────────────
@@ -140,7 +157,7 @@ Table encounters {
   page_id int [not null]
   source_id int [not null]
   text_hash varchar [not null]
-  crop_key varchar [not null, note: 'per-line crop, permanent: card front and OCR audit trail']
+  crop_key varchar [note: 'per-line crop, permanent: card front and OCR audit trail. nil means the page had embedded text and no OCR line geometry.']
   crop_store varchar [not null, default: 'local']
   bbox varchar [note: 'normalised 0-1000 x1 y1 x2 y2, so a crop can be re-cut from the page']
   seen_on date [not null]

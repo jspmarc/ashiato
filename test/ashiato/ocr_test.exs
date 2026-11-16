@@ -53,10 +53,10 @@ defmodule Ashiato.OcrTest do
       Application.put_env(:ashiato, Ocr, impl: Fake)
       start_supervised!(Fake)
 
-      assert {:ok, lines} = Ocr.recognise(fake_key)
+      assert {:ok, lines} = Ocr.recognise({:key, fake_key})
       assert is_list(lines) and length(lines) > 0
-      assert {:ok, _} = Ocr.recognise(local_key)
-      assert Fake.requests() == [fake_key, local_key]
+      assert {:ok, _} = Ocr.recognise({:key, local_key})
+      assert Fake.requests() == [{:key, fake_key}, {:key, local_key}]
 
       Application.delete_env(:ashiato, Ocr)
     end

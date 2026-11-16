@@ -10,8 +10,8 @@ defmodule Ashiato.Ocr.Fake do
   @behaviour Ashiato.Ocr
 
   @default_lines [
-    %{bbox: [10, 20, 500, 90], text: "こんにちは", score: 0.98},
-    %{bbox: [10, 110, 500, 180], text: "またあした", score: 0.95}
+    %{bbox: [10, 20, 500, 90], text: "こんにちは", score: 0.98, crop: "fake-crop-line-1"},
+    %{bbox: [10, 110, 500, 180], text: "またあした", score: 0.95, crop: "fake-crop-line-2"}
   ]
 
   @doc """
@@ -19,7 +19,8 @@ defmodule Ashiato.Ocr.Fake do
 
   ## Options
 
-    * `:lines` — canned lines `recognise/1` returns (default: two sample lines)
+    * `:lines` — canned lines `recognise/1` returns, each with a `crop` binary
+      (default: two sample lines)
     * `:error` — when set, `recognise/1` returns `{:error, error}` instead
   """
   @spec start_link(keyword()) :: Agent.on_start()

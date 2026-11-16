@@ -16,13 +16,13 @@ defmodule Ashiato.Ocr.Socket do
   @default_timeout 60_000
 
   # Cap the buffered frame, because a corrupt length prefix would otherwise let
-  # the socket collect gigabytes before any timeout fires.
-  @max_reply_bytes 4_000_000
+  # the socket collect gigabytes before any timeout fires. Exactly 16 MiB.
+  @max_reply_bytes 16_777_216
 
   @doc "Runs OCR for one image locator against the configured socket."
   @spec recognise(Ashiato.Ocr.locator()) ::
           {:ok, [Ashiato.Ocr.line()]} | {:error, term()}
-  def recognise({kind, value}) when kind in [:path, :url] and is_binary(value) do
+  def recognise({kind, value}) when kind in [:path, :url, :key] and is_binary(value) do
     case socket_path() do
       nil ->
         {:error, :socket_path_missing}
@@ -94,17 +94,29 @@ defmodule Ashiato.Ocr.Socket do
     end
   end
 
-  defp validate_block(%{"bbox" => bbox, "text" => text, "score" => score} = block)
-       when is_binary(text) and is_number(score) do
+  defp validate_block(%{"bbox" => bbox, "text" => text, "score" => score, "crop" => crop} = block)
+       when is_binary(text) and is_number(score) and is_binary(crop) do
     if bbox_ok?(bbox) and score >= 0 and score <= 1 do
-      # JSON `1` decodes as an integer; multiply so every score is a float.
-      {:ok, %{bbox: bbox, text: text, score: score * 1.0}}
+      case decode_crop(crop) do
+        # JSON `1` decodes as an integer; multiply so every score is a float.
+        {:ok, bytes} -> {:ok, %{bbox: bbox, text: text, score: score * 1.0, crop: bytes}}
+        :error -> {:error, block}
+      end
     else
       {:error, block}
     end
   end
 
   defp validate_block(block), do: {:error, block}
+
+  # The crop is required: valid base64 that decodes to a non-empty binary. No
+  # JPEG signature or image validation.
+  defp decode_crop(crop) do
+    case Base.decode64(crop) do
+      {:ok, bytes} when bytes != "" -> {:ok, bytes}
+      _ -> :error
+    end
+  end
 
   defp bbox_ok?([x1, y1, x2, y2])
        when is_integer(x1) and is_integer(y1) and is_integer(x2) and is_integer(y2) do

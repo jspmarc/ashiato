@@ -46,6 +46,24 @@ defmodule Ashiato.TranslatorService do
     end
   end
 
+  @doc """
+  Deletes every expired translation row and returns the deleted count.
+
+  A row is expired when `fetched_at < now - 2_592_000`; equality stays. Accepts
+  a `now` (a `DateTime`) for deterministic tests; production omits it and uses
+  `Utils.utc_now/0`.
+  """
+  @spec prune_expired(DateTime.t()) :: {:ok, non_neg_integer()}
+  def prune_expired(now \\ Utils.utc_now()) do
+    cutoff = DateTime.add(now, -@ttl_seconds, :second)
+
+    {deleted, _} =
+      from(t in Translation, where: t.fetched_at < ^cutoff)
+      |> Repo.delete_all(log: false)
+
+    {:ok, deleted}
+  end
+
   # ——————————————————————————————————————————————————————————— private ——————
 
   defp translate_cached([], _opts, _provider, _name, _lang), do: {:ok, []}

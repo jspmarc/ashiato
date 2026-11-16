@@ -16,4 +16,22 @@ defmodule Ashiato.ConfigTest do
 
     assert oban[:engine] == Oban.Engines.Basic
   end
+
+  test "prod config schedules the prune worker daily at 03:00 UTC" do
+    prod = Config.Reader.read!("config/prod.exs", env: :prod)
+    oban = prod |> Keyword.fetch!(:ashiato) |> Keyword.fetch!(Oban)
+
+    assert [{Oban.Plugins.Cron, cron_opts}] = Keyword.fetch!(oban, :plugins)
+
+    assert {"0 3 * * *", Ashiato.TranslatorService.PruneWorker} in Keyword.fetch!(
+             cron_opts,
+             :crontab
+           )
+  end
+
+  test "test-env Oban config has no Cron plugin" do
+    oban = Application.fetch_env!(:ashiato, Oban)
+
+    refute Enum.any?(Keyword.get(oban, :plugins, []), &match?({Oban.Plugins.Cron, _}, &1))
+  end
 end

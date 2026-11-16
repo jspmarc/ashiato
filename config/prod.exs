@@ -2,7 +2,9 @@ import Config
 
 config :ashiato, :ecto_adapter, Ecto.Adapters.Postgres
 
-config :ashiato, Oban, engine: Oban.Engines.Basic
+config :ashiato, Oban,
+  engine: Oban.Engines.Basic,
+  plugins: [{Oban.Plugins.Cron, crontab: [{"0 3 * * *", Ashiato.TranslatorService.PruneWorker}]}]
 
 # Force using SSL in production. This also sets the "strict-security-transport" header,
 # known as HSTS. If you have a health check endpoint, you may want to exclude it below.

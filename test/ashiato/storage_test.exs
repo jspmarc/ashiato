@@ -55,6 +55,16 @@ defmodule Ashiato.StorageTest do
       assert {:ok, "fake://pages/1.jpg"} = Fake.presigned_get("pages/1.jpg", 300)
     end
 
+    test "locator records the call and hands back the key" do
+      assert {:ok, {:key, "pages/1.png"}} = Fake.locator("pages/1.png", 300)
+      assert [{:locator, "pages/1.png", 300}] = Fake.calls()
+    end
+
+    test "locator rejects an invalid key and records nothing" do
+      assert {:error, :invalid_key} = Fake.locator("../escape", 300)
+      assert Fake.calls() == []
+    end
+
     test "a traversal key is rejected and nothing is stored" do
       assert {:error, :invalid_key} = Fake.put("../escape", <<1>>)
       assert {:error, :invalid_key} = Fake.put("page..jpg", <<1>>)
@@ -118,6 +128,21 @@ defmodule Ashiato.StorageTest do
       assert {:ok, <<1, 2, 3>>} = File.read(URI.decode(path))
     end
 
+    test "locator returns the key without requiring the object to exist" do
+      refute File.exists?(path_for("pages/absent.png"))
+      assert {:ok, {:key, "pages/absent.png"}} = Local.locator("pages/absent.png", 300)
+    end
+
+    test "locator ignores the TTL" do
+      assert {:ok, {:key, "pages/1.png"}} = Local.locator("pages/1.png", 1)
+      assert {:ok, {:key, "pages/1.png"}} = Local.locator("pages/1.png", 3_600)
+    end
+
+    test "locator rejects an invalid key" do
+      assert {:error, :invalid_key} = Local.locator("../escape", 300)
+      assert {:error, :invalid_key} = Local.locator("", 300)
+    end
+
     test "a traversal key is rejected and writes nothing outside the root" do
       escape_path = Path.expand(Path.join(Local.root(), "../escape"))
 
@@ -151,6 +176,15 @@ defmodule Ashiato.StorageTest do
       on_exit(fn -> Application.delete_env(:ashiato, Storage) end)
 
       assert Storage.impl() == Storage.Fake
+    end
+
+    test "locator/2 delegates to impl()" do
+      Application.put_env(:ashiato, Storage, impl: Storage.Fake)
+      on_exit(fn -> Application.delete_env(:ashiato, Storage) end)
+      start_supervised!(Storage.Fake)
+
+      assert {:ok, {:key, "pages/1.png"}} = Storage.locator("pages/1.png", 300)
+      assert [{:locator, "pages/1.png", 300}] = Storage.Fake.calls()
     end
   end
 end

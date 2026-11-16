@@ -66,6 +66,19 @@ defmodule Ashiato.Storage.Fake do
   end
 
   @impl true
+  @doc """
+  Returns the key itself; there is no filesystem to point at. The call is
+  recorded like the other operations.
+  """
+  @spec locator(String.t(), pos_integer()) :: {:ok, {:key, String.t()}} | {:error, term()}
+  def locator(key, ttl_seconds) do
+    with :ok <- check(key) do
+      record({:locator, key, ttl_seconds})
+      {:ok, {:key, key}}
+    end
+  end
+
+  @impl true
   @doc "Deletes a key. Idempotent: deleting an absent key returns `:ok`."
   @spec delete(String.t()) :: :ok | {:error, term()}
   def delete(key) do

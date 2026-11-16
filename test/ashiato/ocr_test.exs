@@ -44,6 +44,22 @@ defmodule Ashiato.OcrTest do
 
       Application.delete_env(:ashiato, Ocr)
     end
+
+    test "accepts the {:key, key} locator shape the storage fake and local store return" do
+      start_supervised!(Ashiato.Storage.Fake)
+      assert {:ok, {:key, fake_key}} = Ashiato.Storage.Fake.locator("pages/fake.png", 300)
+      assert {:ok, {:key, local_key}} = Ashiato.Storage.Local.locator("pages/local.png", 300)
+
+      Application.put_env(:ashiato, Ocr, impl: Fake)
+      start_supervised!(Fake)
+
+      assert {:ok, lines} = Ocr.recognise(fake_key)
+      assert is_list(lines) and length(lines) > 0
+      assert {:ok, _} = Ocr.recognise(local_key)
+      assert Fake.requests() == [fake_key, local_key]
+
+      Application.delete_env(:ashiato, Ocr)
+    end
   end
 
   describe "Ashiato.Ocr.Socket.recognise/1" do

@@ -12,6 +12,8 @@ defmodule Ashiato.Storage do
   @callback get(key :: String.t()) :: {:ok, binary()} | {:error, term()}
   @callback presigned_get(key :: String.t(), ttl_seconds :: pos_integer()) ::
               {:ok, String.t()} | {:error, term()}
+  @callback locator(key :: String.t(), ttl_seconds :: pos_integer()) ::
+              {:ok, {:key, String.t()} | {:url, String.t()}} | {:error, term()}
   @callback delete(key :: String.t()) :: :ok | {:error, term()}
 
   @doc """
@@ -43,4 +45,13 @@ defmodule Ashiato.Storage do
   end
 
   def valid_key?(_), do: false
+
+  @doc """
+  Returns a locator the OCR service can resolve itself: the object key for the
+  local store, a presigned URL for a remote one. `ttl_seconds` is part of the
+  shared contract; a store that does not need it ignores it.
+  """
+  @spec locator(String.t(), pos_integer()) ::
+          {:ok, {:key, String.t()} | {:url, String.t()}} | {:error, term()}
+  def locator(key, ttl_seconds), do: impl().locator(key, ttl_seconds)
 end

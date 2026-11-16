@@ -144,6 +144,64 @@ defmodule Ashiato.LedgerConcurrencyTest do
     end)
   end
 
+  # Two tasks, each on its own connection, race the public word mint on the
+  # same never-met lexeme. The upsert turns the lost race into a no-op plus a
+  # refetch, so every caller returns `{:ok, %Word{}}` and exactly one `words`
+  # row exists — with no `word_states` row, since this mints the identity only.
+  test "concurrent find_or_create_word calls create exactly one word" do
+    lemma = "造語#{System.unique_integer([:positive])}"
+
+    {user, lexeme} =
+      Ecto.Adapters.SQL.Sandbox.unboxed_run(Repo, fn ->
+        user = Repo.insert!(%User{})
+        lexeme = Repo.insert!(%Lexeme{lemma: lemma, reading: "", part_of_speech: "noun"})
+        {user, lexeme}
+      end)
+
+    on_exit(fn ->
+      Ecto.Adapters.SQL.Sandbox.unboxed_run(Repo, fn ->
+        word_ids = Repo.all(from(w in Word, where: w.user_id == ^user.id, select: w.id))
+
+        Repo.delete_all(from(ws in WordState, where: ws.word_id in ^word_ids))
+        Repo.delete_all(from(w in Word, where: w.user_id == ^user.id))
+        Repo.delete_all(from(l in Lexeme, where: l.id == ^lexeme.id))
+        Repo.delete_all(from(u in User, where: u.id == ^user.id))
+      end)
+    end)
+
+    parent = self()
+
+    tasks =
+      for n <- 1..2 do
+        Task.async(fn ->
+          send(parent, {:ready, n})
+
+          receive do
+            :go -> :ok
+          end
+
+          Ecto.Adapters.SQL.Sandbox.unboxed_run(Repo, fn ->
+            Ledger.find_or_create_word(user.id, lexeme.id)
+          end)
+        end)
+      end
+
+    for n <- 1..2, do: assert_receive({:ready, ^n}, 5_000)
+    Enum.each(tasks, &send(&1.pid, :go))
+    results = Enum.map(tasks, &Task.await(&1, 30_000))
+
+    assert Enum.all?(results, &match?({:ok, %Word{}}, &1))
+
+    Ecto.Adapters.SQL.Sandbox.unboxed_run(Repo, fn ->
+      words = Repo.all(from(w in Word, where: w.user_id == ^user.id))
+      assert length(words) == 1
+      assert hd(words).lexeme_id == lexeme.id
+
+      word_ids = Enum.map(words, & &1.id)
+      assert Repo.aggregate(from(ws in WordState, where: ws.word_id in ^word_ids), :count) == 0
+    end)
+  end
+
   # Two tasks, each with its own connection, held at a barrier until both are
   # ready, so the reviews actually overlap instead of racing by chance.
   defp concurrent_reviews(word_id) do

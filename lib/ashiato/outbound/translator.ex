@@ -30,6 +30,12 @@ defmodule Ashiato.Translator do
   @callback translate_page(lines :: [String.t()], opts :: keyword()) ::
               {:ok, [String.t()]} | {:error, term()}
 
+  @doc """
+  The stable label the translation cache keys rows by: short names on built-ins,
+  `inspect(__MODULE__)` by default.
+  """
+  @callback provider_name() :: String.t()
+
   @callback page_request(lines :: [String.t()], opts :: keyword()) ::
               {:ok, [String.t()]} | {:error, term()}
 
@@ -53,15 +59,30 @@ defmodule Ashiato.Translator do
   A provider only defines `page_request(lines, opts) :: {:ok, [String.t()]} |
   {:error, term()}` — the attempt to translate the whole page in one request — and
   this macro turns it into a full `translate_page/2` implementation with the
-  fallback rule applied.
+  fallback rule applied. `name:` declares the provider's stable cache label for
+  `Ashiato.TranslatorService`; without it the label is `inspect(__MODULE__)`.
   """
-  defmacro __using__(_opts) do
+  defmacro __using__(opts) do
+    name = Keyword.get(opts, :name)
+
+    provider_name =
+      if is_binary(name) do
+        Macro.escape(name)
+      else
+        quote(do: inspect(__MODULE__))
+      end
+
     quote do
       @behaviour Ashiato.Translator
 
       # Providers call the shared helpers by their short name (`Translator.langs/1`,
       # `Translator.http_post/2`), so the alias belongs in the macro, not in each file.
       alias Ashiato.Translator
+
+      @doc false
+      @impl Ashiato.Translator
+      @spec provider_name() :: String.t()
+      def provider_name, do: unquote(provider_name)
 
       @doc false
       @impl Ashiato.Translator

@@ -5,7 +5,7 @@ defmodule Ashiato.Translator.GoogleFree do
   Lines are joined with newlines for one page request. The nested segment array
   is unwrapped into plain text, then split back into lines and trimmed.
   """
-  use Ashiato.Translator
+  use Ashiato.Translator, name: "google_free"
 
   alias Ashiato.Utils
 

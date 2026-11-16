@@ -4,7 +4,7 @@ defmodule Ashiato.Translator.GoogleCloud do
   `google_free`. One request per page: the lines go out as a `q` array and the
   aligned `translations` array comes back.
   """
-  use Ashiato.Translator
+  use Ashiato.Translator, name: "google_cloud"
 
   @url "https://translation.googleapis.com/language/translate/v2"
 

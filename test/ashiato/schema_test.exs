@@ -20,6 +20,7 @@ defmodule Ashiato.SchemaTest do
     Ashiato.Schemas.Lexeme,
     Ashiato.Schemas.Setting,
     Ashiato.Schemas.DictCacheEntry,
+    Ashiato.Schemas.Translation,
     Ashiato.Schemas.Source,
     Ashiato.Schemas.Document,
     Ashiato.Schemas.Page,

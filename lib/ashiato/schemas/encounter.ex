@@ -9,9 +9,10 @@ defmodule Ashiato.Schemas.Encounter do
   same page row, so `(user_id, word_id, text_hash)` is the same test.
 
   `crop_key` is the permanent per-line crop (card front and OCR audit trail);
-  only the *page* image ever expires, which is why no page geometry is stored
-  here: it would die with the page, and the card shows the crop, not a box
-  drawn over the original.
+  nil means the page had embedded text and no OCR line geometry, so the card
+  renders text only. Only the *page* image ever expires, which is why no page
+  geometry is stored here: it would die with the page, and the card shows the
+  crop, not a box drawn over the original.
   `discarded_at` is a soft delete, so a bad OCR encounter never removes the
   word — which is also why identity lookups after a conflict always find the
   row. No timestamps: `seen_on` is the only date this table is about.
@@ -47,8 +48,10 @@ defmodule Ashiato.Schemas.Encounter do
   a duplicate arrives as `{:error, changeset}` rather than a raise, letting the
   ledger return the existing row.
 
-  `confirmed` and `crop_store` are optional: when absent they are omitted from
-  the insert, so the database defaults (`false` / `"local"`) apply.
+  `confirmed`, `crop_store`, and `crop_key` are optional: when absent they are
+  omitted from the insert, so the database defaults (`false` / `"local"` /
+  nil) apply. A nil `crop_key` is a page with embedded text and no OCR line
+  geometry.
   """
   def changeset(encounter, attrs) do
     encounter
@@ -63,7 +66,7 @@ defmodule Ashiato.Schemas.Encounter do
       :confirmed,
       :discarded_at
     ])
-    |> validate_required([:word_id, :page_id, :source_id, :text_hash, :crop_key, :seen_on])
+    |> validate_required([:word_id, :page_id, :source_id, :text_hash, :seen_on])
     # the index keeps Ecto's default name, so this one declaration matches the
     # name Postgres reports and the columns SQLite reports
     |> unique_constraint([:user_id, :word_id, :text_hash])

@@ -1,7 +1,7 @@
 defmodule Ashiato.OcrTest do
   @moduledoc """
-  Covers the socket round trip, clean errors, malformed-block rejection, and
-  the fake's canned and recorded behaviour.
+  Covers the socket round trip, clean errors, malformed-block rejection, the
+  exact reply-size cap, and the fake's canned and recorded behaviour.
   """
 
   # These tests write application env for `:ashiato, Ashiato.Ocr` and start a fake under a
@@ -14,8 +14,8 @@ defmodule Ashiato.OcrTest do
   alias Ashiato.OcrStub
 
   @lines [
-    %{bbox: [10, 20, 400, 80], text: "こんにちは", score: 0.98},
-    %{bbox: [10, 100, 400, 160], text: "世界", score: 0.9}
+    %{bbox: [10, 20, 400, 80], text: "こんにちは", score: 0.98, crop: "crop-bytes-1"},
+    %{bbox: [10, 100, 400, 160], text: "世界", score: 0.9, crop: "crop-bytes-2"}
   ]
 
   setup do
@@ -32,10 +32,40 @@ defmodule Ashiato.OcrTest do
     %{socket_path: path}
   end
 
+  describe "Ashiato.Ocr.recognise/1" do
+    test "delegates to impl()" do
+      Application.put_env(:ashiato, Ocr, impl: Fake)
+      start_supervised!(Fake)
+      locator = {:key, "pages/acceptance.png"}
+
+      assert {:ok, lines} = Ocr.recognise(locator)
+      assert is_list(lines) and length(lines) > 0
+      assert Fake.requests() == [locator]
+
+      Application.delete_env(:ashiato, Ocr)
+    end
+
+    test "accepts the {:key, key} locator shape the storage fake and local store return" do
+      start_supervised!(Ashiato.Storage.Fake)
+      assert {:ok, {:key, fake_key}} = Ashiato.Storage.Fake.locator("pages/fake.png", 300)
+      assert {:ok, {:key, local_key}} = Ashiato.Storage.Local.locator("pages/local.png", 300)
+
+      Application.put_env(:ashiato, Ocr, impl: Fake)
+      start_supervised!(Fake)
+
+      assert {:ok, lines} = Ocr.recognise({:key, fake_key})
+      assert is_list(lines) and length(lines) > 0
+      assert {:ok, _} = Ocr.recognise({:key, local_key})
+      assert Fake.requests() == [{:key, fake_key}, {:key, local_key}]
+
+      Application.delete_env(:ashiato, Ocr)
+    end
+  end
+
   describe "Ashiato.Ocr.Socket.recognise/1" do
     test "round trip: sends the locator and returns the validated lines", %{socket_path: path} do
       parent = self()
-      encoded = Enum.map(@lines, &stringify_keys/1)
+      encoded = Enum.map(@lines, &stub_line/1)
 
       start_supervised!(
         {OcrStub,
@@ -53,7 +83,7 @@ defmodule Ashiato.OcrTest do
     test "a url locator is sent as \"url\", not image bytes", %{socket_path: path} do
       parent = self()
       url = "https://example.test/pages/1.png"
-      line = stringify_keys(hd(@lines))
+      line = stub_line(hd(@lines))
 
       start_supervised!(
         {OcrStub,
@@ -68,9 +98,28 @@ defmodule Ashiato.OcrTest do
       assert_receive {:request, %{"op" => "ocr", "url" => ^url}}
     end
 
-    test "a locator that is not a path or url is refused, not raised" do
+    test "a key locator is sent as \"key\"", %{socket_path: path} do
+      parent = self()
+      key = "pages/2026/1.png"
+      line = stub_line(hd(@lines))
+
+      start_supervised!(
+        {OcrStub,
+         path: path,
+         handler: fn request ->
+           send(parent, {:request, request})
+           %{"lines" => [line]}
+         end}
+      )
+
+      assert {:ok, [_]} = Socket.recognise({:key, key})
+      assert_receive {:request, %{"op" => "ocr", "key" => ^key}}
+    end
+
+    test "a locator that is not a path, url, or key is refused, not raised" do
       assert Socket.recognise(nil) == {:error, :invalid_locator}
       assert Socket.recognise({:path, 123}) == {:error, :invalid_locator}
+      assert Socket.recognise({:key, 123}) == {:error, :invalid_locator}
       assert Socket.recognise("just-a-string") == {:error, :invalid_locator}
     end
 
@@ -89,19 +138,60 @@ defmodule Ashiato.OcrTest do
     end
 
     test "a block with a three-integer bbox is rejected, not passed on", %{socket_path: path} do
-      bad = %{"bbox" => [10, 20, 300], "text" => "こんにちは", "score" => 0.9}
-      reply = %{"lines" => [stringify_keys(hd(@lines)), bad]}
+      bad = stub_line(hd(@lines)) |> Map.put("bbox", [10, 20, 300])
+      reply = %{"lines" => [stub_line(hd(@lines)), bad]}
       start_supervised!({OcrStub, path: path, handler: fn _ -> reply end})
 
       assert {:error, {:invalid_line, 1}} = Socket.recognise({:path, path})
     end
 
     test "a block whose score is outside 0..1 is rejected", %{socket_path: path} do
-      bad = %{"bbox" => [10, 20, 300, 400], "text" => "こんにちは", "score" => 1.4}
+      bad = stub_line(hd(@lines)) |> Map.put("score", 1.4)
       reply = %{"lines" => [bad]}
       start_supervised!({OcrStub, path: path, handler: fn _ -> reply end})
 
       assert {:error, {:invalid_line, 0}} = Socket.recognise({:path, path})
+    end
+
+    test "a block without a crop is rejected", %{socket_path: path} do
+      bad = stub_line(hd(@lines)) |> Map.delete("crop")
+      reply = %{"lines" => [bad]}
+      start_supervised!({OcrStub, path: path, handler: fn _ -> reply end})
+
+      assert {:error, {:invalid_line, 0}} = Socket.recognise({:path, path})
+    end
+
+    test "a crop that is not valid base64 is rejected", %{socket_path: path} do
+      bad = stub_line(hd(@lines)) |> Map.put("crop", "!!!not base64!!!")
+      reply = %{"lines" => [bad]}
+      start_supervised!({OcrStub, path: path, handler: fn _ -> reply end})
+
+      assert {:error, {:invalid_line, 0}} = Socket.recognise({:path, path})
+    end
+
+    test "a crop that decodes to zero bytes is rejected", %{socket_path: path} do
+      bad = stub_line(hd(@lines)) |> Map.put("crop", Base.encode64(""))
+      reply = %{"lines" => [bad]}
+      start_supervised!({OcrStub, path: path, handler: fn _ -> reply end})
+
+      assert {:error, {:invalid_line, 0}} = Socket.recognise({:path, path})
+    end
+
+    test "a framed reply body of exactly 16_777_216 bytes is accepted", %{socket_path: path} do
+      start_supervised!(
+        {OcrStub, path: path, handler: fn _ -> {:raw, framed_body(16_777_216)} end}
+      )
+
+      assert {:ok, [%{crop: crop}]} = Socket.recognise({:path, path})
+      assert crop == "x"
+    end
+
+    test "a framed reply body of 16_777_217 bytes is rejected cleanly", %{socket_path: path} do
+      start_supervised!(
+        {OcrStub, path: path, handler: fn _ -> {:raw, framed_body(16_777_217)} end}
+      )
+
+      assert {:error, _reason} = Socket.recognise({:path, path})
     end
 
     test "a silent service hits the bounded timeout instead of hanging", %{socket_path: path} do
@@ -117,8 +207,10 @@ defmodule Ashiato.OcrTest do
       start_supervised!(Fake)
       locator = {:path, "/images/page-1.png"}
 
-      assert {:ok, [%{bbox: bbox, text: text, score: score} | _]} = Fake.recognise(locator)
-      assert is_integer(hd(bbox)) and is_binary(text) and is_float(score)
+      assert {:ok, [%{bbox: bbox, text: text, score: score, crop: crop} | _]} =
+               Fake.recognise(locator)
+
+      assert is_integer(hd(bbox)) and is_binary(text) and is_float(score) and byte_size(crop) > 0
       assert Fake.requests() == [locator]
     end
 
@@ -130,27 +222,31 @@ defmodule Ashiato.OcrTest do
       assert Fake.requests() == [locator]
     end
 
-    test "canned lines are configurable" do
-      lines = [%{bbox: [0, 0, 1000, 100], text: "テスト", score: 1.0}]
+    test "canned lines are configurable and key locators are recorded" do
+      lines = [%{bbox: [0, 0, 1000, 100], text: "テスト", score: 1.0, crop: "crop"}]
       start_supervised!({Fake, lines: lines})
 
       assert Fake.recognise({:path, "x"}) == {:ok, lines}
+      assert Fake.recognise({:key, "pages/1.png"}) == {:ok, lines}
+      assert Fake.requests() == [{:path, "x"}, {:key, "pages/1.png"}]
     end
   end
 
-  test "acceptance: Ocr.impl() behaviour through Fake" do
-    Application.put_env(:ashiato, Ashiato.Ocr, impl: Fake)
-    start_supervised!(Fake)
-    locator = {:path, "/images/acceptance.png"}
-
-    assert {:ok, lines} = Ocr.impl().recognise(locator)
-    assert is_list(lines) and length(lines) > 0
-    assert Fake.requests() == [locator]
-
-    Application.delete_env(:ashiato, Ashiato.Ocr)
+  defp stub_line(%{crop: crop} = line) do
+    line |> Map.put(:crop, Base.encode64(crop)) |> stringify_keys()
   end
 
   defp stringify_keys(line) do
     Map.new(line, fn {key, value} -> {Atom.to_string(key), value} end)
+  end
+
+  # Builds a framed reply body (stub adds the 4-byte length prefix) whose JSON
+  # payload is exactly `target` bytes: a valid line padded through an ignored
+  # top-level field.
+  defp framed_body(target) do
+    line = Jason.encode!(%{bbox: [0, 0, 10, 10], text: "あ", score: 1.0, crop: "eA=="})
+    base = "{\"lines\":[#{line}],\"pad\":\"\"}"
+    pad = String.duplicate("x", target - byte_size(base))
+    :binary.replace(base, "\"pad\":\"\"", "\"pad\":\"#{pad}\"")
   end
 end

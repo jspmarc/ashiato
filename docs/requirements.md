@@ -169,7 +169,7 @@ encounter.
 | R2.3 | M | Mark a word as already known while reading, so it never becomes a card. |
 | R2.4 | M | Attach a page to a named source, optionally with a chapter/episode. |
 | R2.5 | M | For any word, see every place it was met, with the crop for each. |
-| R2.6 | M | Store a per-line crop permanently; store the full page image with a 30-day TTL. |
+| R2.6 | M | Store a per-line crop permanently; store the full page image with a 30-day TTL. An embedded-text encounter carries no crop (`crop_key` is nullable) and is text-only — lemma, reading, meaning — until PDF line crops exist. |
 | R2.7 | S | Discard an individual encounter (bad OCR) without deleting the word. |
 | R2.8 | M | Encounters are recorded automatically but carry a `confirmed` flag. Unconfirmed encounters count toward nothing — no ranking, no queue entry, no coverage. Confirmation happens once per word, not per page. |
 | R2.9 | M | When a word becomes chrome-like, an existing card is suspended with reason `chrome`. History preserved, coverage still counts it, clearing the flag restores it. |
@@ -281,7 +281,7 @@ its own provider set, its own switch, and its own credentials.
 |---|---|---|
 | R7.1 | S | Mnemonic generation for a word or kanji. Stored, cached, user-editable. Regenerating over an edit requires confirmation and keeps the previous version. Records which model and prompt version produced each. |
 | R7.2 | S | Generate 1–3 example sentences per word. The prompt includes the user's own recorded meaning and the source sentence, so generated sentences match the sense actually learned. Validate the target word appears with the expected reading before displaying. |
-| R7.3 | S | Passage translation in one request per page, so cross-line context survives. The `llm` provider is asked for a **JSON object with a `translations` array of strings** and falls back to per-line if it does not parse; NMT providers return line-aligned text directly. Results cached per line by `(lang, line)`. Provider and gate: §7.5. |
+| R7.3 | S | Passage translation in one request per page, so cross-line context survives. The `llm` provider is asked for a **JSON object with a `translations` array of strings** and falls back to per-line if it does not parse; NMT providers return line-aligned text directly. Results cached per line by `(provider, lang, line)` with a 30-day TTL. Provider and gate: §7.5. |
 | R7.4 | M | Settings screen: choose the translation provider from all of them, toggle translation, and enter each provider's credentials. Each provider displays its readiness. No provider is privileged. |
 
 **Note:** the user's own encounters are the primary source of example sentences. Generated ones are
@@ -720,17 +720,24 @@ the same lines correctly. The recogniser's character set must match the material
 
 **Service shape.** `ashiato-ocr` is a **resident** process, not a per-image CLI: loading PP-OCRv6 medium
 costs seconds, and the 18-image batch took 137 s *with a single model load*. Load once at boot, then
-answer requests with `{"lines": [{"bbox": [x1,y1,x2,y2], "text": "...", "score": 0.98}]}` in the
-normalised 0–1000 contract.
+answer requests with
+`{"lines": [{"bbox": [x1,y1,x2,y2], "text": "...", "score": 0.98, "crop": "<base64 JPEG>"}]}` in the
+normalised 0–1000 contract. Every line carries a **required `crop`**: that line's image as
+base64-encoded JPEG. The client decodes it to raw bytes and requires a non-empty binary — it checks
+neither the JPEG signature nor decodes the image, and writes no storage. The framed reply is capped at
+exactly 16 MiB (`16_777_216` bytes, the length prefix excluded).
 
 **Transport is a Unix domain socket, not HTTP** — not for speed (a socket round trip is sub-millisecond
 against a 7.6 s call) but for simplicity: no published port, no bind address, no auth, nothing reachable
 off-host. Erlang has first-class support: `:gen_tcp.connect({:local, path}, 0, [:binary, packet: 4])`,
 with a 4-byte big-endian length prefix and one compact JSON object per frame.
 
-**Requests carry a locator, never image bytes.** With the `local` image store the request carries the
-shared-volume path; with `s3` the app presigns a GET and sends the URL. Base64 over the socket would
-inflate every image by a third and hold it in memory twice.
+**Requests carry a locator, never image bytes**: `{"op": "ocr", "path": ...}`,
+`{"op": "ocr", "url": ...}`, or `{"op": "ocr", "key": ...}`. With the `local` image store
+`Storage.locator/2` returns the object `key`, and the OCR service resolves it under its own configured
+image root on the shared volume, applying the same key-validation rules as the app; with `s3` the app
+presigns a GET and sends the URL. Base64 over the socket would inflate every image by a third and hold
+it in memory twice.
 
 **Deployment: pod `ashiato`, exactly two containers** — `ashiato-web` (Phoenix) and `ashiato-ocr`
 (resident PaddleOCR) — sharing a volume for the socket and one for page images. The dictionary service is
@@ -741,16 +748,10 @@ keeps **its own cgroup and restart policy**. That is the point: this OCR path cr
 development (SIGILL without AVX, then the oneDNN PIR failure), and an OCR OOM must not take the review UI
 with it.
 
-**Deployment mechanism: Quadlet** — `.pod` and `.container` units in `~/.config/containers/systemd/`,
-materialised into systemd user units on `daemon-reload`. Quadlet ships inside the `podman` package here
-(`/usr/lib/systemd/system-generators/podman-system-generator`); no extra package.
-
-```text
-~/.config/containers/systemd/
-├── ashiato.pod                 PublishPort=4000:4000  (web only)
-├── ashiato-web.container       Pod=ashiato.pod  Volume=ashiato-run:/run/ashiato
-└── ashiato-ocr.container       Pod=ashiato.pod  Volume=ashiato-run:/run/ashiato
-```
+**Deployment mechanism: deliberately unspecified.** The requirement is the topology above — two
+containers in one pod, one shared socket volume, one shared page-image volume — not a tool. Creating
+and supervising the pod is an operations choice; no orchestration product is mandated here or
+anywhere. The full service card lives in `docs/plan/ashiato-ocr.md`.
 
 **Accuracy is measured by a fixture corpus**, not by retained production output: a small set of
 screenshots with hand-checked transcriptions lives with the tests and every backend change runs against
@@ -812,8 +813,9 @@ shape; its choices are worth copying rather than rediscovering:
   phrase. In Ashiato it is a stage, because encounters are recorded from tokens. But tokenization and
   translation are **siblings, not a chain**: both depend only on `accepted_text`, so they run
   concurrently and neither waits for the other. Only OCR is a hard predecessor.
-- **Translation cached by `(lang, text)`**, each line translated separately so it can be **painted over
-  the line** on the page image. That overlay is the real reading aid (R1.11).
+- **Translation cached per line** — jp-reader keys it `(lang, text)`; Ashiato keys it
+  `(provider, lang, line)` with a 30-day TTL (§7.5) — each line translated separately so it can be
+  **painted over the line** on the page image. That overlay is the real reading aid (R1.11).
 - **Furigana comes from the tokenizer**, never read off the image.
 - **Per-line progress events**, published as each stage and each line completes.
 
@@ -821,7 +823,11 @@ shape; its choices are worth copying rather than rediscovering:
 
 Translation is one HTTP call, so it lives **in the Elixir app** using `Req`, not in a Python service.
 There is no local model to host and no reason to pay for a boundary. Results are cached per line by
-`(lang, line)` in the app's own database.
+`(provider, lang, line)` in the app's own database: `provider` is the selected provider's
+`provider_name/0`, so **switching provider never reads another provider's rows**. Rows carry a
+**30-day TTL** measured in whole seconds (`fetched_at >= now - 2_592_000` is fresh; older is expired),
+and a prune worker deletes expired rows **daily at 03:00 UTC in production** through Oban Cron;
+dev and test call the prune directly.
 
 `jp-reader`'s chain is not the model to copy. It calls Google through `deep_translator`, which uses the
 *free web endpoint* — no API key, which is exactly why it gets refused and why that module needs a

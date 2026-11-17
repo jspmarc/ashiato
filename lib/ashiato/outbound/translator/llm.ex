@@ -7,7 +7,7 @@ defmodule Ashiato.Translator.Llm do
   per-line fallback takes over. The endpoint comes from `OPENAI_BASE_URL`
   (default `https://api.openai.com/v1`) and the key from the `:api_key` option.
   """
-  use Ashiato.Translator
+  use Ashiato.Translator, name: "llm"
 
   @default_base_url "https://api.openai.com/v1"
   @default_model "gpt-4o-mini"

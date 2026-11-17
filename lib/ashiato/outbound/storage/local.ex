@@ -69,6 +69,20 @@ defmodule Ashiato.Storage.Local do
   end
 
   @impl true
+  @doc """
+  Returns the object key itself, for a consumer (the OCR service) that resolves
+  keys against the same shared volume root. The key is validated with the same
+  rules as `presigned_get/2`; the TTL is ignored and the object's existence is
+  not checked.
+  """
+  @spec locator(String.t(), pos_integer()) :: {:ok, {:key, String.t()}} | {:error, term()}
+  def locator(key, _ttl_seconds) do
+    with {:ok, _path} <- resolve_key(key) do
+      {:ok, {:key, key}}
+    end
+  end
+
+  @impl true
   @doc "Deletes the object at `key`. Idempotent: an absent key is `:ok`."
   @spec delete(String.t()) :: :ok | {:error, term()}
   def delete(key) do

@@ -7,6 +7,13 @@ defmodule Ashiato.Translator.Off do
   @behaviour Ashiato.Translator
 
   @doc """
+  Always `"off"` — the cache label for translation disabled.
+  """
+  @impl Ashiato.Translator
+  @spec provider_name() :: String.t()
+  def provider_name, do: "off"
+
+  @doc """
   Always `{:error, :disabled}` — callers treat it as the translation-is-off signal,
   not a failure.
   """

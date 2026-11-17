@@ -6,7 +6,7 @@ defmodule Ashiato.Translator.Deepl do
   A key ending in `:fx` is a free-tier key and uses `https://api-free.deepl.com`;
   every other key uses `https://api.deepl.com`.
   """
-  use Ashiato.Translator
+  use Ashiato.Translator, name: "deepl"
 
   @pro_url "https://api.deepl.com"
   @free_url "https://api-free.deepl.com"

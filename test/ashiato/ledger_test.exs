@@ -29,7 +29,7 @@ defmodule Ashiato.LedgerTest do
   import Ecto.Query, only: [from: 2]
 
   alias Ashiato.{Ledger, Repo, Srs}
-  alias Ashiato.Schemas.{Encounter, Lexeme, Page, ReviewEvent, WordState}
+  alias Ashiato.Schemas.{Encounter, Lexeme, Page, ReviewEvent, Word, WordState}
 
   describe "find_or_create_lexeme/3" do
     test "creates the lexeme the first time and returns the same row the second" do
@@ -97,6 +97,71 @@ defmodule Ashiato.LedgerTest do
                1
 
       assert Repo.aggregate(Lexeme, :count) == 1
+    end
+  end
+
+  describe "find_or_create_word/2" do
+    test "returns the same row for an existing word" do
+      user = user_fixture()
+      lexeme = lexeme_fixture()
+      word = word_fixture(user_id: user.id, lexeme_id: lexeme.id)
+
+      assert {:ok, found} = Ledger.find_or_create_word(user.id, lexeme.id)
+
+      assert found.id == word.id
+      assert Repo.aggregate(Word, :count) == 1
+    end
+
+    test "creates a new word and writes no word_states row" do
+      user = user_fixture()
+      lexeme = lexeme_fixture()
+
+      assert {:ok, word} = Ledger.find_or_create_word(user.id, lexeme.id)
+
+      assert word.id
+      assert word.user_id == user.id
+      assert word.lexeme_id == lexeme.id
+      assert Repo.aggregate(Word, :count) == 1
+      assert Repo.aggregate(WordState, :count) == 0
+    end
+
+    test "the returned id works with record_encounter/1" do
+      user = user_fixture()
+      lexeme = lexeme_fixture()
+      source = source_fixture(user_id: user.id)
+      page = page_fixture(user_id: user.id, source_id: source.id)
+
+      assert {:ok, word} = Ledger.find_or_create_word(user.id, lexeme.id)
+
+      assert {:ok, encounter} =
+               Ledger.record_encounter(%{
+                 user_id: user.id,
+                 word_id: word.id,
+                 page_id: page.id,
+                 source_id: source.id,
+                 text_hash: page.text_hash,
+                 crop_key: "crops/1.jpg",
+                 seen_on: ~D[2026-11-01]
+               })
+
+      assert encounter.word_id == word.id
+      assert Repo.aggregate(Encounter, :count) == 1
+    end
+
+    test "a missing user raises Ecto.ConstraintError" do
+      lexeme = lexeme_fixture()
+
+      assert_raise Ecto.ConstraintError, fn ->
+        Ledger.find_or_create_word(999_999_999, lexeme.id)
+      end
+    end
+
+    test "a missing lexeme raises Ecto.ConstraintError" do
+      user = user_fixture()
+
+      assert_raise Ecto.ConstraintError, fn ->
+        Ledger.find_or_create_word(user.id, 999_999_999)
+      end
     end
   end
 
@@ -309,6 +374,22 @@ defmodule Ashiato.LedgerTest do
 
       assert {:ok, _} = Ledger.record_encounter(second)
       assert Repo.aggregate(Encounter, :count) == 2
+    end
+
+    test "accepts a nil crop_key: embedded text has no line geometry", %{attrs: attrs} do
+      assert {:ok, encounter} = Ledger.record_encounter(%{attrs | crop_key: nil})
+
+      assert encounter.id
+      assert encounter.crop_key == nil
+      assert Repo.aggregate(Encounter, :count) == 1
+    end
+
+    test "still rejects a nil required field", %{attrs: attrs} do
+      assert {:error, %Ecto.Changeset{errors: errors}} =
+               Ledger.record_encounter(%{attrs | seen_on: nil})
+
+      assert errors[:seen_on]
+      assert Repo.aggregate(Encounter, :count) == 0
     end
   end
 

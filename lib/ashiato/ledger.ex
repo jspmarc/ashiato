@@ -117,9 +117,10 @@ defmodule Ashiato.Ledger do
   still there to find.
 
   `attrs` may be a map or keyword list with atom keys and must include
-  `user_id`, `word_id`, `page_id`, `source_id`, `text_hash`, `crop_key`,
-  `seen_on` (a `Date`), and optionally `confirmed` (default `false`) and
-  `bbox`. `user_id` is set programmatically, never cast.
+  `user_id`, `word_id`, `page_id`, `source_id`, `text_hash`, `seen_on` (a
+  `Date`), and optionally `crop_key` (nil is allowed: an embedded-text page
+  has no OCR line geometry), `confirmed` (default `false`), and `bbox`.
+  `user_id` is set programmatically, never cast.
   """
   @spec record_encounter(keyword() | map()) ::
           {:ok, Encounter.t()} | {:error, Ecto.Changeset.t()}
@@ -856,8 +857,19 @@ defmodule Ashiato.Ledger do
   # without `id`, and the winner's row is refetched. No constraint violation
   # occurs, so the refetch never runs inside an aborted PostgreSQL transaction.
   # `Word` has no changeset (both fields are set on the struct).
+  @doc """
+  Returns `{:ok, %Word{}}` for the user's copy of a lexeme, creating the
+  `words` row if it does not exist yet. It writes only `words`, never
+  `word_states`, so no card is queued.
+
+  Both ids must exist: `user_id` and `lexeme_id` refer to rows in `users` and
+  `lexemes`, and a missing user or lexeme raises `Ecto.ConstraintError` —
+  there is no `{:error, _}` tuple for a missing precondition row. Callers
+  that cannot guarantee existence must create or fetch the rows first (as
+  `introduce_words/3` does by construction).
+  """
   @spec find_or_create_word(integer(), integer()) :: {:ok, Word.t()}
-  defp find_or_create_word(user_id, lexeme_id) do
+  def find_or_create_word(user_id, lexeme_id) do
     case Repo.insert(%Word{user_id: user_id, lexeme_id: lexeme_id},
            on_conflict: :nothing,
            conflict_target: [:user_id, :lexeme_id]
